@@ -11,10 +11,13 @@ import {
 import { agent } from './agents/agent';
 import { startScheduleTool, stopScheduleTool } from './tools/schedule-tools';
 import { webFetchTool } from './tools/web-fetch-tool';
+import { MastraEditor } from '@mastra/editor'
+
 
 export const mastra = new Mastra({
   agents: { agent },
   tools: { startScheduleTool, stopScheduleTool, webFetchTool },
+  editor: new MastraEditor(),
   storage: new MastraCompositeStore({
     id: 'composite-storage',
     default: new LibSQLStore({

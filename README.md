@@ -9,6 +9,7 @@ This starter provides you with a general-purpose Mastra agent that can research 
 - A project-level `workspace/` for files and command execution
 - Approval gates for file changes, deletions, and shell commands
 - Conversation memory, generated thread titles, and task tracking
+- OpenCode Go inference
 - Google Gemini web search and direct web page fetching
 - Recurring schedules that persist across restarts
 - Local libSQL storage and DuckDB observability, with optional Turso storage
@@ -16,7 +17,9 @@ This starter provides you with a general-purpose Mastra agent that can research 
 
 ## Get started
 
-Set your `GOOGLE_GENERATIVE_AI_API_KEY` in `.env` or in your environment, then run:
+Set `OPENCODE_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` in `.env` or in your environment. Agent inference uses OpenCode Go.
+
+Then run:
 
 ```shell
 npm run dev

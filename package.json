@@ -17,13 +17,14 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@ai-sdk/google": "^3.0.91",
     "@mastra/core": "latest",
     "@mastra/duckdb": "latest",
+    "@mastra/editor": "^0.13.9",
     "@mastra/libsql": "latest",
     "@mastra/memory": "latest",
     "@mastra/observability": "latest",
-    "zod": "^4.4.3",
-    "@ai-sdk/google": "^3.0.91"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "latest",
