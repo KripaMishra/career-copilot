@@ -1,14 +1,15 @@
-# mastra-demo
+# career-copilot
 
-Welcome to your new [Mastra](https://mastra.ai) project! We're excited to see what you build.
-
-This starter provides you with a general-purpose Mastra agent that can research current information, manage multi-step tasks, work with local files, run approved shell commands, and create recurring schedules.
+A personal career assistant built with [Mastra](https://mastra.ai) for finding relevant jobs, personalizing resumes and application materials, and completing browser-assisted applications.
 
 ## Features
 
 - A project-level `workspace/` for files and command execution
 - Approval gates for file changes, deletions, and shell commands
 - Conversation memory, generated thread titles, and task tracking
+- Job discovery and role matching
+- Resume and application personalization without inventing qualifications
+- Approval before application submission or other irreversible actions
 - OpenCode Go inference
 - Google Gemini web search and direct web page fetching
 - Recurring schedules that persist across restarts
@@ -27,11 +28,11 @@ npm run dev
 
 Open [http://localhost:4111](http://localhost:4111) in your browser to access [Mastra Studio](https://mastra.ai/docs/studio/overview).
 
-Select **Agent** in Mastra Studio and try one of these prompts:
+Select **Career Copilot** in Mastra Studio and try one of these prompts:
 
-- `Get the weather forecast for Austin this weekend.`
-- `Create a landing page for a Japanese sakura festival.`
-- `Check the SPCX stock price now, then check it every minute.`
+- `Find software engineering roles that match my experience.`
+- `Tailor my resume for this job description without inventing qualifications.`
+- `Help me complete this application and ask before submitting it.`
 
 The agent asks for approval before it changes files or runs commands. When it creates a schedule, it returns an ID that you can use to pause the schedule.
 

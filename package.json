@@ -1,7 +1,7 @@
 {
-  "name": "mastra-demo",
+  "name": "career-copilot",
   "version": "1.0.0",
-  "description": "A general-purpose Mastra agent with a local workspace, shell tools, memory, task tracking, web access, and recurring schedules.",
+  "description": "A personal career assistant for job discovery, resume personalization, and browser-assisted applications.",
   "main": "index.js",
   "private": true,
   "scripts": {
