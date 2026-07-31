@@ -12,7 +12,9 @@ import { agent } from './agents/agent';
 import { startScheduleTool, stopScheduleTool } from './tools/schedule-tools';
 import { webFetchTool } from './tools/web-fetch-tool';
 import { MastraEditor } from '@mastra/editor'
+import { resolveRuntimeConfig } from './config/runtime';
 
+const runtimeConfig = resolveRuntimeConfig();
 
 export const mastra = new Mastra({
   agents: { agent },
@@ -22,7 +24,7 @@ export const mastra = new Mastra({
     id: 'composite-storage',
     default: new LibSQLStore({
       id: 'mastra-storage',
-      url: process.env.TURSO_DATABASE_URL || 'file:./mastra.db',
+      url: runtimeConfig.databaseUrl,
       authToken: process.env.TURSO_AUTH_TOKEN || undefined,
     }),
     domains: {

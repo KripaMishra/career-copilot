@@ -5,9 +5,10 @@
   "main": "index.js",
   "private": true,
   "scripts": {
-    "dev": "mastra dev",
-    "build": "mastra build",
-    "start": "mastra start"
+    "dev": "mastra dev --dir src",
+    "build": "mastra build --dir src",
+    "start": "mastra start",
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -17,18 +18,19 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
-    "@ai-sdk/google": "^3.0.91",
-    "@mastra/core": "latest",
-    "@mastra/duckdb": "latest",
-    "@mastra/editor": "^0.13.9",
-    "@mastra/libsql": "latest",
-    "@mastra/memory": "latest",
-    "@mastra/observability": "latest",
-    "zod": "^4.4.3"
+    "@ai-sdk/google": "3.0.103",
+    "@chat-adapter/telegram": "4.35.0",
+    "@mastra/core": "1.52.1",
+    "@mastra/duckdb": "1.5.1",
+    "@mastra/editor": "0.13.9",
+    "@mastra/libsql": "1.17.0",
+    "@mastra/memory": "1.24.0",
+    "@mastra/observability": "1.16.2",
+    "zod": "4.4.3"
   },
   "devDependencies": {
-    "@types/node": "latest",
-    "mastra": "latest",
-    "typescript": "^6.0.3"
+    "@types/node": "26.1.1",
+    "mastra": "1.20.1",
+    "typescript": "6.0.3"
   }
 }

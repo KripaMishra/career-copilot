@@ -9,8 +9,9 @@ import { Memory } from '@mastra/memory';
 
 import { webFetchTool } from '../tools/web-fetch-tool';
 import { startScheduleTool, stopScheduleTool } from '../tools/schedule-tools';
+import { resolveRuntimeConfig } from '../config/runtime';
 
-const workspacePath = 'workspace';
+const { workspacePath } = resolveRuntimeConfig();
 
 const workspace = new Workspace({
   id: 'agent-workspace',
@@ -24,9 +25,14 @@ const workspace = new Workspace({
   tools: {
     [WORKSPACE_TOOLS.FILESYSTEM.WRITE_FILE]: {
       requireReadBeforeWrite: true,
+      requireApproval: true,
     },
     [WORKSPACE_TOOLS.FILESYSTEM.EDIT_FILE]: {
       requireReadBeforeWrite: true,
+      requireApproval: true,
+    },
+    [WORKSPACE_TOOLS.SANDBOX.EXECUTE_COMMAND]: {
+      requireApproval: true,
     },
     [WORKSPACE_TOOLS.FILESYSTEM.DELETE]: {
       requireApproval: true,
@@ -48,7 +54,7 @@ For local file changes, end with a plain-text URL using ${pathToFileURL(`${works
   model: 'opencode-go/deepseek-v4-flash',
   defaultOptions: {
     maxSteps: 100,
-    autoResumeSuspendedTools: true,
+    autoResumeSuspendedTools: false,
   },
   memory: new Memory({
     options: {

@@ -1,5 +1,6 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
+import { assertJobUrl, assertSameJobSite } from './job-url';
 
 export const webFetchTool = createTool({
   id: 'web_fetch',
@@ -15,17 +16,19 @@ export const webFetchTool = createTool({
     text: z.string(),
   }),
   execute: async ({ url }: { url: string }) => {
-    const response = await fetch(url, {
+    const jobUrl = assertJobUrl(url);
+    const response = await fetch(jobUrl, {
       headers: {
         'user-agent': 'Mastra Workspace Agent/1.0',
         accept: 'text/html,text/plain,application/json,application/xml;q=0.9,*/*;q=0.8',
       },
       signal: AbortSignal.timeout(15_000),
     });
+    const finalUrl = assertSameJobSite(jobUrl, response.url);
     const text = await response.text();
 
     return {
-      url: response.url,
+      url: finalUrl.toString(),
       status: response.status,
       statusText: response.statusText,
       contentType: response.headers.get('content-type'),
