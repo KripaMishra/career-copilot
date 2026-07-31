@@ -1,24 +1,28 @@
 import { Mastra } from '@mastra/core/mastra';
-import { LibSQLStore } from '@mastra/libsql';
-import { DuckDBStore } from '@mastra/duckdb';
 import { MastraCompositeStore } from '@mastra/core/storage';
-import {
-  MastraStorageExporter,
-  MastraPlatformExporter,
-  Observability,
-  SensitiveDataFilter,
-} from '@mastra/observability';
-import { agent } from './agents/agent';
-import { startScheduleTool, stopScheduleTool } from './tools/schedule-tools';
-import { webFetchTool } from './tools/web-fetch-tool';
-import { MastraEditor } from '@mastra/editor'
-import { resolveRuntimeConfig } from './config/runtime';
+import { DuckDBStore } from '@mastra/duckdb';
+import { MastraEditor } from '@mastra/editor';
+import { LibSQLStore } from '@mastra/libsql';
+import { MastraPlatformExporter, MastraStorageExporter, Observability, SensitiveDataFilter } from '@mastra/observability';
+import { createAgent } from './agent';
+import { resolveRuntimeConfig } from './runtime-config';
+import { createCareerCopilotRuntime } from './career-runtime';
+import { startScheduleTool, stopScheduleTool } from './schedule-tools';
+import { webFetchTool } from './web-fetch-tool';
 
-const runtimeConfig = resolveRuntimeConfig();
+// Production startup is deliberately fail-closed. Tests/builds use explicit factories and never import this runtime.
+const runtimeConfig = resolveRuntimeConfig({ requireDeployment: true });
+export const careerCopilotRuntime = createCareerCopilotRuntime(runtimeConfig);
+export const telegramIngress = careerCopilotRuntime.handleTelegramUpdate;
+export const agent = createAgent(
+  runtimeConfig,
+  (update, reply) => careerCopilotRuntime.handleTelegramUpdate(update, reply).then(() => undefined),
+  careerCopilotRuntime.tools,
+);
 
 export const mastra = new Mastra({
   agents: { agent },
-  tools: { startScheduleTool, stopScheduleTool, webFetchTool },
+  tools: { startScheduleTool, stopScheduleTool, webFetchTool, ...careerCopilotRuntime.tools },
   editor: new MastraEditor(),
   storage: new MastraCompositeStore({
     id: 'composite-storage',
@@ -27,9 +31,7 @@ export const mastra = new Mastra({
       url: runtimeConfig.databaseUrl,
       authToken: process.env.TURSO_AUTH_TOKEN || undefined,
     }),
-    domains: {
-      observability: await new DuckDBStore().getStore('observability'),
-    },
+    domains: { observability: await new DuckDBStore().getStore('observability') },
   }),
   observability: new Observability({
     configs: {

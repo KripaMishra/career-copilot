@@ -4,7 +4,7 @@ import test from 'node:test';
 import {
   isAllowedTelegramRequest,
   parseNumericIdList,
-} from '../src/channels/telegram-auth.ts';
+} from '../src/telegram-auth.ts';
 
 const allowlist = {
   userIds: parseNumericIdList('12345'),
