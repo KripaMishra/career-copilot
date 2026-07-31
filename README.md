@@ -1,62 +1,116 @@
-# career-copilot
+# Career Copilot
 
-A personal career assistant built with [Mastra](https://mastra.ai) for finding relevant jobs, personalizing resumes and application materials, and completing browser-assisted applications.
+Career Copilot is a personal job-search assistant built with Mastra. It helps turn a job-search workflow into a repeatable, reviewable process: find relevant roles, prepare application materials, and keep work inside an approval-controlled local workspace.
 
-## Features
+> **Status:** active early-stage project. The core agent, workspace controls, web fetching, scheduling, persistence, and automated boundary tests are in place. Browser-assisted applications, Telegram delivery, and application tracking are being added incrementally.
 
-- A project-level `workspace/` for files and command execution
-- Approval gates for file changes, deletions, and shell commands
-- Conversation memory, generated thread titles, and task tracking
-- Job discovery and role matching
-- Resume and application personalization without inventing qualifications
-- Approval before application submission or other irreversible actions
-- OpenCode Go inference
-- Google Gemini web search and direct web page fetching
-- Recurring schedules that persist across restarts
-- Local libSQL storage and DuckDB observability, with optional Turso storage
-- A bundled Mastra skill that helps coding agents use current Mastra APIs
+## What it does today
 
-## Get started
+- Runs a **Career Copilot** Mastra agent with persistent memory.
+- Uses a local `workspace/` directory for agent-created files.
+- Requires approval before workspace writes, edits, deletes, or command execution.
+- Fetches web pages with URL validation and response-size limits.
+- Starts and pauses recurring agent schedules.
+- Persists memory, tasks, and schedules in libSQL/SQLite.
+- Records observability data in DuckDB and filters sensitive span output.
+- Supports OpenCode model inference and Google web search.
+- Keeps runtime data outside the source tree by default.
 
-Set `OPENCODE_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` in `.env` or in your environment. Agent inference uses OpenCode Go.
+The project intentionally does not invent qualifications or submit irreversible applications without explicit user approval.
 
-Then run:
+## Quick start
 
-```shell
+### Requirements
+
+- Node.js with npm
+- An OpenCode API key
+- A Google Generative AI API key for Google Search
+
+### Install
+
+```bash
+npm install
+cp .env.example .env
+```
+
+Set at least these values in `.env`:
+
+```dotenv
+OPENCODE_API_KEY=...
+GOOGLE_GENERATIVE_AI_API_KEY=...
+```
+
+`MASTRA_DATA_DIR` and `MASTRA_DATABASE_URL` are optional. If omitted, runtime state is stored under `.mastra/career-copilot/` in the project directory.
+
+### Run locally
+
+```bash
 npm run dev
 ```
 
-Open [http://localhost:4111](http://localhost:4111) in your browser to access [Mastra Studio](https://mastra.ai/docs/studio/overview).
+Open [http://localhost:4111](http://localhost:4111) to use the local Mastra editor.
 
-Select **Career Copilot** in Mastra Studio and try one of these prompts:
+Useful prompts:
 
 - `Find software engineering roles that match my experience.`
 - `Tailor my resume for this job description without inventing qualifications.`
-- `Help me complete this application and ask before submitting it.`
+- `Help me prepare this application and ask before making any irreversible change.`
 
-The agent asks for approval before it changes files or runs commands. When it creates a schedule, it returns an ID that you can use to pause the schedule.
+## Commands
 
-## Workspace safety
+| Command | Purpose |
+| --- | --- |
+| `npm run dev` | Start the Mastra development server with `src/` as the application directory |
+| `npm run build` | Build the Mastra application |
+| `npm start` | Start the built application |
+| `npm test` | Run the Node test suite |
+| `npm exec tsc -- --noEmit` | Type-check the source without emitting files |
 
-The local filesystem tools stay inside the project-level `workspace/` directory. Shell commands start in that directory, but `LocalSandbox` does not provide operating-system isolation by default. Review command approvals carefully, and do not expose this template through an unauthenticated public server.
+## Project layout
 
-## Storage
+```text
+src/
+├── agents/       # Career Copilot agent configuration
+├── channels/     # Channel-specific authentication boundaries
+├── config/       # Runtime paths and database configuration
+├── tools/        # Web fetching, URL validation, and schedules
+└── index.ts      # Mastra instance, storage, editor, and observability
 
-The default `file:./mastra.db` database stores agent memory, tasks, and schedules locally. To use Turso, set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in `.env`.
+test/             # Boundary and behavior tests
+workspace/        # Agent working files (created at runtime)
+```
 
-Recurring schedules continue to use model tokens until you pause them. Ask the agent to pause a schedule with the ID returned by `start_schedule`.
+## Runtime configuration
 
-## Making it yours
+Copy `.env.example` and keep secrets out of source control.
 
-- Edit `src/mastra/agents/agent.ts` to change the model, instructions, memory, workspace, or approval policy.
-- Edit `src/mastra/tools/` to customize web fetching and scheduling.
-- Edit `src/mastra/index.ts` to change storage and observability.
-- Add files or reusable skills under `workspace/` for the agent to use.
+| Variable | Purpose |
+| --- | --- |
+| `OPENCODE_API_KEY` | OpenCode model provider authentication |
+| `GOOGLE_GENERATIVE_AI_API_KEY` | Google Search tool authentication |
+| `MASTRA_DATA_DIR` | Absolute directory for database and workspace state |
+| `MASTRA_DATABASE_URL` | Absolute `file:` URL, `libsql:` URL, or HTTPS database URL |
+| `TURSO_AUTH_TOKEN` | Authentication when using a remote Turso/libSQL database |
 
-## Learn more
+The example file also documents planned channel, tracker, and private-profile settings. They are not required for the local Mastra agent and should only be configured when their corresponding integrations are enabled.
 
-To learn more about Mastra, visit our [documentation](https://mastra.ai/docs/). If you're new to AI agents, check out our [course](https://mastra.ai/learn) and [YouTube videos](https://youtube.com/@mastra-ai). You can also join our [Discord](https://discord.gg/BTYqqHKUrf) community to get help and share your projects.
+## Safety boundaries
 
-## Deploy to the Mastra platform
+- Treat the workspace as a controlled working area, not an operating-system sandbox.
+- Review approval prompts before allowing file changes or commands.
+- Do not expose the development server publicly without authentication.
+- Keep API keys, bot tokens, OAuth credentials, and personal profile data outside Git.
+- Pause recurring schedules when they are no longer needed; scheduled runs consume model tokens.
+- Review generated application content before sending or submitting it.
 
-The [Mastra platform](https://projects.mastra.ai) provides two products for deploying and managing AI applications built with the Mastra framework. Learn more in the [Mastra platform documentation](https://mastra.ai/docs/mastra-platform/overview).
+## Development notes
+
+The Mastra entrypoint is `src/index.ts`. Change the agent behavior in `src/agents/agent.ts`, add or modify tools in `src/tools/`, and keep runtime path validation in `src/config/runtime.ts`.
+
+Before opening a change for review, run:
+
+```bash
+npm test
+npm exec tsc -- --noEmit
+npm run build
+```
