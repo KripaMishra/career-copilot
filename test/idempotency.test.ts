@@ -8,7 +8,7 @@ import {
   SqliteIdempotencyStore,
   buildJobIdempotencyKey,
   normalizeJobIdentity,
-} from '../src/idempotency.ts';
+} from '../src/storage/idempotency.ts';
 
 test('canonical URL wins over fallback identity and normalizes safely', () => {
   assert.equal(

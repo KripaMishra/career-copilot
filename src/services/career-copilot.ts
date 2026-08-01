@@ -3,8 +3,8 @@ import {
   type TelegramAllowlist,
   type TelegramAuditWriter,
   type TelegramUpdate,
-} from './telegram-auth.ts';
-import { buildJobIdempotencyKey, type OutboxEntry } from './idempotency.ts';
+} from '../channels/telegram-auth.ts';
+import { buildJobIdempotencyKey, type OutboxEntry } from '../storage/idempotency.ts';
 
 export type CareerJob = { url: string; company?: string; title?: string; location?: string; description?: string; sourceHash?: string };
 

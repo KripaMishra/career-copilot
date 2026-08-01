@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { CareerJob } from './career-copilot.ts';
+import type { CareerJob } from '../services/career-copilot.ts';
 
 function realRoot(root: string): string {
   const absolute = path.resolve(root);

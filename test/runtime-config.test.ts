@@ -4,11 +4,11 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { resolveRuntimeConfig } from '../src/runtime-config.ts';
+import { resolveRuntimeConfig } from '../src/config/runtime.ts';
 
 test('derives absolute local database and workspace paths', () => {
   const dataDir = path.join('tmp', 'career-copilot');
-  const config = resolveRuntimeConfig({ dataDir });
+  const config = resolveRuntimeConfig({ dataDir, env: {} });
   const absoluteDataDir = path.resolve(dataDir);
 
   assert.equal(config.dataDir, absoluteDataDir);
@@ -20,7 +20,7 @@ test('creates the data directory for local storage', () => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-copilot-'));
   fs.rmSync(dataDir, { recursive: true });
 
-  resolveRuntimeConfig({ dataDir });
+  resolveRuntimeConfig({ dataDir, env: {} });
 
   assert.equal(fs.statSync(dataDir).isDirectory(), true);
   fs.rmSync(dataDir, { recursive: true });
@@ -30,7 +30,7 @@ test('keeps an explicitly configured database URL', () => {
   const databaseUrl = 'libsql://career-copilot.example.turso.io';
 
   assert.equal(
-    resolveRuntimeConfig({ dataDir: '/tmp/career-copilot', databaseUrl }).databaseUrl,
+    resolveRuntimeConfig({ dataDir: '/tmp/career-copilot', databaseUrl, env: {} }).databaseUrl,
     databaseUrl,
   );
 });
@@ -82,7 +82,7 @@ test('accepts explicit deployment configuration without reading process environm
 
 test('rejects relative file database URLs', () => {
   assert.throws(
-    () => resolveRuntimeConfig({ databaseUrl: 'file:./mastra.db' }),
+    () => resolveRuntimeConfig({ databaseUrl: 'file:./mastra.db', env: {} }),
     /absolute file URL/,
   );
 });

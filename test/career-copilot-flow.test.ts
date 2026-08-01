@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { CareerCopilotService } from '../src/career-copilot.ts';
+import { CareerCopilotService } from '../src/services/career-copilot.ts';
 
 const update = { update_id: 1, message: {
   message_id: 2, date: 1, from: { id: 123, is_bot: false, first_name: 'Owner' },

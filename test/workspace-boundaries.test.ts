@@ -7,7 +7,7 @@ import test from 'node:test';
 import {
   createCareerFilesystemBoundaries,
   assertSafeWorkspaceRoots,
-} from '../src/local-files.ts';
+} from '../src/integrations/local-files.ts';
 
 test('rejects overlapping workspace roots and symlink escapes', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-roots-'));

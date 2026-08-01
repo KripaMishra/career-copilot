@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { startScheduleTool } from '../src/schedule-tools.ts';
+import { startScheduleTool } from '../src/tools/schedule-tools.ts';
 
 test('creates schedules in Asia/Kolkata by default', async () => {
   let created: Record<string, unknown> | undefined;

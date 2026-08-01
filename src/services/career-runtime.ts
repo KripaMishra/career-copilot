@@ -1,11 +1,11 @@
 import crypto from 'node:crypto';
-import { assertJobUrl, assertSameJobSite } from './job-url.ts';
-import { createCareerFilesystemBoundaries } from './local-files.ts';
-import { GoogleOAuthRefreshProvider, GoogleSheetsBoundary, GoogleSheetsHttpApi, createGoogleSheetsTools, type SheetsApi } from './google-sheets.ts';
-import { SqliteIdempotencyStore } from './idempotency.ts';
+import { assertJobUrl, assertSameJobSite } from '../tools/job-url.ts';
+import { createCareerFilesystemBoundaries } from '../integrations/local-files.ts';
+import { GoogleOAuthRefreshProvider, GoogleSheetsBoundary, GoogleSheetsHttpApi, createGoogleSheetsTools, type SheetsApi } from '../integrations/google-sheets.ts';
+import { SqliteIdempotencyStore } from '../storage/idempotency.ts';
 import { CareerCopilotService, type CareerCopilotDependencies, type CareerJob } from './career-copilot.ts';
-import { createTelegramIngress } from './telegram-ingress.ts';
-import type { RuntimeConfig } from './runtime-config.ts';
+import { createTelegramIngress } from '../channels/telegram-ingress.ts';
+import type { RuntimeConfig } from '../config/runtime.ts';
 
 export type CareerCopilotRuntimeOverrides = Partial<CareerCopilotDependencies> & {
   sheetsApi?: SheetsApi;

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { assertJobUrl, assertSameJobSite } from '../src/job-url.ts';
+import { assertJobUrl, assertSameJobSite } from '../src/tools/job-url.ts';
 
 test('accepts HTTPS URLs for supported job sites', () => {
   const url = assertJobUrl('https://www.linkedin.com/jobs/view/123');

@@ -5,7 +5,7 @@ import {
   authorizeTelegramUpdate,
   parseJobCommand,
   deriveTelegramRequest,
-} from '../src/telegram-auth.ts';
+} from '../src/channels/telegram-auth.ts';
 
 const allowlist = {
   userIds: new Set(['12345']),

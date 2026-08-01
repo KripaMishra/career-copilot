@@ -1,4 +1,4 @@
-import { assertJobUrl } from './job-url.ts';
+import { assertJobUrl } from '../tools/job-url.ts';
 
 export type TelegramAllowlist = {
   userIds: ReadonlySet<string>;

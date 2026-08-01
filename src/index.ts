@@ -4,11 +4,11 @@ import { DuckDBStore } from '@mastra/duckdb';
 import { MastraEditor } from '@mastra/editor';
 import { LibSQLStore } from '@mastra/libsql';
 import { MastraPlatformExporter, MastraStorageExporter, Observability, SensitiveDataFilter } from '@mastra/observability';
-import { createAgent } from './agent';
-import { resolveRuntimeConfig } from './runtime-config';
-import { createCareerCopilotRuntime } from './career-runtime';
-import { startScheduleTool, stopScheduleTool } from './schedule-tools';
-import { webFetchTool } from './web-fetch-tool';
+import { createAgent } from './agents/agent';
+import { resolveRuntimeConfig } from './config/runtime';
+import { createCareerCopilotRuntime } from './services/career-runtime';
+import { startScheduleTool, stopScheduleTool } from './tools/schedule-tools';
+import { webFetchTool } from './tools/web-fetch-tool';
 
 // Production startup is deliberately fail-closed. Tests/builds use explicit factories and never import this runtime.
 const runtimeConfig = resolveRuntimeConfig({ requireDeployment: true });

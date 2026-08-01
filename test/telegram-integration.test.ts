@@ -4,9 +4,9 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createTelegramIngress } from '../src/telegram-ingress.ts';
-import { createCareerCopilotRuntime } from '../src/career-runtime.ts';
-import { resolveRuntimeConfig } from '../src/runtime-config.ts';
+import { createTelegramIngress } from '../src/channels/telegram-ingress.ts';
+import { createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
+import { resolveRuntimeConfig } from '../src/config/runtime.ts';
 
 const update = {
   update_id: 99,

@@ -1,17 +1,17 @@
 import { pathToFileURL } from 'node:url';
 
 import { google } from '@ai-sdk/google';
-import { CareerCopilotTelegramAdapter } from './telegram-ingress.ts';
+import { CareerCopilotTelegramAdapter } from '../channels/telegram-ingress.ts';
 import { Agent } from '@mastra/core/agent';
 import { TaskSignalProvider } from '@mastra/core/signals';
 import { askUserTool } from '@mastra/core/tools';
 import { LocalFilesystem, LocalSandbox, WORKSPACE_TOOLS, Workspace } from '@mastra/core/workspace';
 import { Memory } from '@mastra/memory';
 
-import { resolveRuntimeConfig, type RuntimeConfig } from './runtime-config';
-import type { TelegramUpdate } from './telegram-auth.ts';
-import { webFetchTool } from './web-fetch-tool';
-import { startScheduleTool, stopScheduleTool } from './schedule-tools';
+import { resolveRuntimeConfig, type RuntimeConfig } from '../config/runtime';
+import type { TelegramUpdate } from '../channels/telegram-auth.ts';
+import { webFetchTool } from '../tools/web-fetch-tool';
+import { startScheduleTool, stopScheduleTool } from '../tools/schedule-tools';
 
 export type TelegramUpdateHandler = (update: TelegramUpdate, reply: (text: string) => Promise<void>) => Promise<void>;
 

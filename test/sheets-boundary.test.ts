@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { GoogleSheetsBoundary } from '../src/google-sheets.ts';
+import { GoogleSheetsBoundary } from '../src/integrations/google-sheets.ts';
 
 test('binds every operation to configured tabs and runtime-only OAuth', async () => {
   const calls: Array<{ tab: string; operation: string; token?: string }> = [];
