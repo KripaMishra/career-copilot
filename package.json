@@ -9,7 +9,8 @@
     "build": "mastra build --dir src",
     "start": "mastra start",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "oauth:google": "node --experimental-strip-types scripts/google-oauth.ts"
+    "oauth:google": "node --experimental-strip-types scripts/google-oauth.ts",
+    "sheets:setup": "node --experimental-strip-types scripts/google-sheets-setup.ts"
   },
   "keywords": [],
   "author": "",
