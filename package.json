@@ -8,7 +8,8 @@
     "dev": "mastra dev --dir src",
     "build": "mastra build --dir src",
     "start": "mastra start",
-    "test": "node --experimental-strip-types --test test/*.test.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "oauth:google": "node --experimental-strip-types scripts/google-oauth.ts"
   },
   "keywords": [],
   "author": "",
