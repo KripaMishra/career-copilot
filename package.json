@@ -22,6 +22,7 @@
   "dependencies": {
     "@ai-sdk/google": "3.0.103",
     "@chat-adapter/telegram": "4.35.0",
+    "@mastra/agent-browser": "0.4.1",
     "@mastra/core": "1.52.1",
     "@mastra/duckdb": "1.5.1",
     "@mastra/editor": "0.13.9",
