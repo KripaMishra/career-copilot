@@ -166,7 +166,12 @@ test('due retry claims resume the same run with a higher generation', () => {
   database.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatched' WHERE command_id = ? AND queue_state = 'starting'").run(starting.commandId);
   database.close();
   assert.equal(store.markRunning(startingFence).applied, true);
-  assert.equal(store.releaseForRetry({ ...starting, sourceState: 'running' }, 0).applied, true);
+  assert.equal(store.scheduleRetry({ ...starting, sourceState: 'running' }, {
+    scheduleKey: 'command-retry:direct:1', stage: 'direct_acquisition',
+    failure: { class: 'transient', code: 'temporary_failure' },
+    policy: (() => { const calculatedAt = Date.now(); return { retry: true as const, delayMs: 20, attempt: 1, calculatedAt, policyTargetAt: calculatedAt + 20, source: 'jitter' as const }; })(),
+  }).applied, true);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
   const resuming = store.claimNextRunnable('worker-2')!;
   assert.deepEqual({ commandId: resuming.commandId, runId: resuming.runId, queueState: resuming.queueState, claimGeneration: resuming.claimGeneration }, {
     commandId: starting.commandId, runId: starting.runId, queueState: 'resuming', claimGeneration: starting.claimGeneration + 1,

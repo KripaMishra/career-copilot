@@ -63,14 +63,43 @@ export type PrincipalInput =
   | { channel: 'studio'; remoteAddress: string; conversationId: string }
   | { channel: 'stdio' }
   | { channel: 'api'; authenticatedIdentity?: string; conversationId: string };
-export type AuthorizationBinding = {
+export type AuthorizationBinding = Readonly<{
   resourceId: string;
   threadId: string;
   destination: string;
   channel: PrincipalInput['channel'];
   principalKey: string;
   authorizationRevision: number;
-};
+}>;
+
+type AuthorizationCapabilityMetadata = Readonly<{
+  scope: 'principal' | 'destination';
+  validate: () => AuthorizationBinding;
+}>;
+const authorizationCapabilities = new WeakMap<object, AuthorizationCapabilityMetadata>();
+export type OwnerAuthorizationCapability = AuthorizationBinding;
+export function isOwnerAuthorizationCapability(value: unknown): value is OwnerAuthorizationCapability {
+  return typeof value === 'object' && value !== null && authorizationCapabilities.has(value);
+}
+function sameAuthorization(left: AuthorizationBinding, right: AuthorizationBinding): boolean {
+  return left.resourceId === right.resourceId && left.threadId === right.threadId && left.destination === right.destination
+    && left.channel === right.channel && left.principalKey === right.principalKey
+    && left.authorizationRevision === right.authorizationRevision;
+}
+export function isCurrentlyValidPrincipalAuthorizationCapability(value: unknown): value is OwnerAuthorizationCapability {
+  if (!isOwnerAuthorizationCapability(value)) return false;
+  const metadata = authorizationCapabilities.get(value)!;
+  if (metadata.scope !== 'principal') return false;
+  try { return sameAuthorization(value, metadata.validate()); } catch { return false; }
+}
+export function assertCurrentlyValidPrincipalAuthorizationCapability(value: unknown): asserts value is OwnerAuthorizationCapability {
+  if (!isCurrentlyValidPrincipalAuthorizationCapability(value)) throw new Error('Current principal authorization is revoked or unavailable.');
+}
+function issueAuthorizationCapability(binding: AuthorizationBinding, metadata: AuthorizationCapabilityMetadata): OwnerAuthorizationCapability {
+  const capability = Object.freeze({ ...binding });
+  authorizationCapabilities.set(capability, metadata);
+  return capability;
+}
 
 function unauthorized(message = 'Unauthorized principal.'): never { throw new Error(message); }
 function safeCorrelation(value: string): string {
@@ -130,7 +159,8 @@ export class OwnerAuthorization {
         principalKey = `${destination}:${safeCorrelation(principal.conversationId)}`;
         break;
     }
-    return { resourceId: owner.resourceId, threadId, destination, channel: principal.channel, principalKey, authorizationRevision: owner.authorizationRevision };
+    const binding = { resourceId: owner.resourceId, threadId, destination, channel: principal.channel, principalKey, authorizationRevision: owner.authorizationRevision } as const;
+    return issueAuthorizationCapability(binding, { scope: 'principal', validate: () => this.authorize(principal) });
   }
 
   reauthorize(
@@ -172,7 +202,10 @@ export class OwnerAuthorization {
           destinationAllowed = false;
       }
       if (!destinationAllowed) unauthorized('Destination authorization is revoked.');
-      return binding;
+      if (!currentPrincipal) return issueAuthorizationCapability(binding, { scope: 'destination', validate: () => this.reauthorize(binding, boundary) });
+      const current = this.authorize(currentPrincipal);
+      if (!sameAuthorization(current, binding)) unauthorized();
+      return current;
     }
     if (!currentPrincipal) unauthorized('Trusted current principal context is required.');
     const current = this.authorize(currentPrincipal);

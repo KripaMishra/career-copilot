@@ -52,6 +52,7 @@ export const V0_DEFAULTS = {
     jitterBaseSeconds: 2,
     jitterCapSeconds: 60,
     retryAfterCap: 'remaining_command_deadline',
+    stageRepeatCaps: { directAcquisition: 2, browserConnection: 2, providerInference: 1, schemaRepair: 1, outcomeUnknownExternalEffect: 0 },
   },
   blocker: { suspensionExpirySeconds: 604_800, acceptedResponsesPerGeneration: 1 },
   dispatcher: {
@@ -184,6 +185,11 @@ export function isLegalQueueTransitionV0(from: unknown, to: unknown): boolean {
   const target = QueueStateV0Schema.safeParse(to);
   return source.success && target.success && (LEGAL_QUEUE_TRANSITIONS_V0[source.data] as readonly QueueStateV0[]).includes(target.data);
 }
+
+export const FailureClassV0Schema = z.enum(['transient', 'rate_limited', 'permanent', 'security', 'authorization', 'outcome_unknown']);
+export const RetryStageV0Schema = z.enum(['direct_acquisition', 'browser_connection', 'provider_inference', 'schema_repair', 'external_effect']);
+export type FailureClassV0 = z.infer<typeof FailureClassV0Schema>;
+export type RetryStageV0 = z.infer<typeof RetryStageV0Schema>;
 
 export const StartDispatchStateV0Schema = z.enum(['not_dispatched', 'dispatching', 'dispatched', 'start_unknown']);
 export const StageStateV0Schema = z.enum([

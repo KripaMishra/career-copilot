@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { OwnerAuthorization, isAllowedTelegramRequest, parseNumericIdList } from '../src/channels/telegram-auth.ts';
+import { OwnerAuthorization, isAllowedTelegramRequest, isCurrentlyValidPrincipalAuthorizationCapability, isOwnerAuthorizationCapability, parseNumericIdList } from '../src/channels/telegram-auth.ts';
 
 const configured = {
   resourceId: 'owner-v0', enabled: true, authorizationRevision: 7,
@@ -13,6 +13,23 @@ const authorization = () => new OwnerAuthorization(() => configured);
 test('configured owner context is available while intake authorization is disabled', () => {
   const auth = new OwnerAuthorization(() => ({ ...configured, enabled: false }));
   assert.deepEqual(auth.configuredOwnerContext(), { resourceId: configured.resourceId, authorizationRevision: 7 });
+  assert.throws(() => auth.authorize({ channel: 'telegram', userId: '12345', chatId: '67890', privateChat: true }), /revoked/i);
+});
+
+test('only successful live authorization issues an unforgeable capability', () => {
+  let current = configured;
+  const auth = new OwnerAuthorization(() => current);
+  const issued = auth.authorize({ channel: 'telegram', userId: '12345', chatId: '67890', privateChat: true });
+  assert.equal(isOwnerAuthorizationCapability(issued), true);
+  assert.equal(isCurrentlyValidPrincipalAuthorizationCapability(issued), true);
+  assert.equal(isOwnerAuthorizationCapability({ ...issued }), false);
+  const destinationOnly = auth.reauthorize(issued, 'delivery');
+  assert.equal(isCurrentlyValidPrincipalAuthorizationCapability(destinationOnly), false);
+  const principalIssued = auth.reauthorize(issued, 'delivery', { channel: 'telegram', userId: '12345', chatId: '67890', privateChat: true });
+  assert.equal(isCurrentlyValidPrincipalAuthorizationCapability(principalIssued), true);
+  current = { ...configured, enabled: false };
+  assert.equal(isCurrentlyValidPrincipalAuthorizationCapability(issued), false);
+  assert.throws(() => auth.reauthorize(issued, 'delivery'), /revoked/i);
   assert.throws(() => auth.authorize({ channel: 'telegram', userId: '12345', chatId: '67890', privateChat: true }), /revoked/i);
 });
 

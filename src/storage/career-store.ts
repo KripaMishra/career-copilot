@@ -2,8 +2,10 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
+import { assertCurrentlyValidPrincipalAuthorizationCapability, isOwnerAuthorizationCapability, type OwnerAuthorizationCapability } from '../channels/telegram-auth.ts';
 import { assertOperationalDatabaseUrl } from '../config/runtime.ts';
 import type { QueueStateV0 } from '../contracts/v0.ts';
+import { STAGE_REPEAT_CAPS, classifyFailure, computeRetrySchedule, type FailureClass, type RetryPolicyResult, type RetryStage, type SafeFailureCode } from '../workflows/retry-policy.ts';
 
 export type JobIdentity = { url?: string; company?: string; title?: string; location?: string };
 export type JobState = 'pending' | 'succeeded' | 'failed';
@@ -478,6 +480,258 @@ END;
 PRAGMA legacy_alter_table = OFF;
 `;
 
+const retryPolicySql = `
+ALTER TABLE career_commands ADD COLUMN automatic_repeats_used INTEGER NOT NULL DEFAULT 0 CHECK (automatic_repeats_used BETWEEN 0 AND 5 AND automatic_repeats_used + repeat_budget_remaining = 5);
+ALTER TABLE career_commands ADD COLUMN processing_budget_remaining_ms INTEGER NOT NULL DEFAULT 1800000 CHECK (processing_budget_remaining_ms BETWEEN 0 AND 1800000);
+ALTER TABLE career_commands ADD COLUMN suspension_started_at INTEGER CHECK (suspension_started_at IS NULL OR suspension_started_at >= processing_started_at);
+ALTER TABLE career_commands ADD COLUMN legacy_retry_wait_v4 INTEGER NOT NULL DEFAULT 0 CHECK (legacy_retry_wait_v4 IN (0, 1) AND (legacy_retry_wait_v4 = 0 OR queue_state = 'retry_wait'));
+UPDATE career_commands SET legacy_retry_wait_v4 = 1 WHERE queue_state = 'retry_wait';
+CREATE TABLE career_v5_backfill_guard (valid INTEGER NOT NULL CHECK (valid = 1)) STRICT;
+INSERT INTO career_v5_backfill_guard
+SELECT CASE WHEN count(*) = 0 THEN 1 ELSE 0 END FROM career_commands
+WHERE queue_state IN ('starting','running','retry_wait','resuming') AND (processing_deadline_at IS NULL OR updated_at IS NULL)
+   OR queue_state = 'suspended' AND (processing_started_at IS NULL OR updated_at IS NULL OR updated_at < processing_started_at);
+UPDATE career_commands SET
+  processing_budget_remaining_ms = min(1800000, max(0, processing_deadline_at - updated_at)),
+  processing_deadline_at = updated_at + min(1800000, max(0, processing_deadline_at - updated_at))
+WHERE queue_state IN ('starting','running','retry_wait','resuming');
+UPDATE career_commands SET processing_budget_remaining_ms = min(1800000, max(0, 1800000 - (updated_at - processing_started_at))),
+  suspension_started_at = updated_at, processing_deadline_at = NULL
+WHERE queue_state = 'suspended';
+DROP TABLE career_v5_backfill_guard;
+CREATE TABLE career_retry_schedules (
+  command_id TEXT NOT NULL REFERENCES career_commands(command_id) ON DELETE RESTRICT CHECK (length(command_id) BETWEEN 1 AND 200),
+  schedule_key TEXT NOT NULL CHECK (length(schedule_key) BETWEEN 1 AND 200),
+  run_id TEXT NOT NULL CHECK (length(run_id) BETWEEN 1 AND 200),
+  owner_resource_id TEXT NOT NULL CHECK (length(owner_resource_id) BETWEEN 1 AND 200),
+  lease_owner TEXT NOT NULL CHECK (length(lease_owner) BETWEEN 1 AND 200),
+  claim_generation INTEGER NOT NULL CHECK (claim_generation > 0),
+  stage_key TEXT NOT NULL CHECK (stage_key IN ('direct_acquisition', 'browser_connection', 'provider_inference', 'schema_repair', 'external_effect')),
+  stage_repeat INTEGER NOT NULL CHECK (stage_repeat BETWEEN 1 AND 2),
+  automatic_repeat_ordinal INTEGER NOT NULL CHECK (automatic_repeat_ordinal BETWEEN 1 AND 5),
+  policy_attempt INTEGER NOT NULL CHECK (policy_attempt > 0),
+  policy_source TEXT NOT NULL CHECK (policy_source IN ('jitter', 'retry_after')),
+  policy_calculated_at INTEGER NOT NULL CHECK (policy_calculated_at >= 0),
+  policy_delay_ms INTEGER NOT NULL CHECK (policy_delay_ms >= 0),
+  policy_target_at INTEGER NOT NULL CHECK (policy_target_at = policy_calculated_at + policy_delay_ms),
+  retry_after_value TEXT CHECK (retry_after_value IS NULL OR length(retry_after_value) BETWEEN 1 AND 128),
+  failure_class TEXT NOT NULL CHECK (failure_class IN ('transient', 'rate_limited')),
+  failure_code TEXT NOT NULL CHECK (length(failure_code) BETWEEN 1 AND 64 AND failure_code NOT GLOB '*[^a-z0-9_]*'),
+  safe_detail TEXT NOT NULL CHECK (
+    (failure_code IN ('temporarily_unavailable', 'temporary', 'temporary_failure') AND safe_detail = 'The operation is temporarily unavailable.')
+    OR (failure_code = 'invalid_shape' AND safe_detail = 'The schema needs repair.')
+    OR (failure_code = 'network_unavailable' AND safe_detail = 'The network is unavailable.')
+    OR (failure_code = 'rate_limited' AND safe_detail = 'The provider asked us to wait.')
+    OR (failure_code = 'fixture_retry' AND safe_detail = 'The fixture operation is temporarily unavailable.')
+  ),
+  scheduled_at INTEGER NOT NULL CHECK (scheduled_at >= 0),
+  due_at INTEGER NOT NULL CHECK (due_at = max(scheduled_at, policy_target_at)),
+  PRIMARY KEY (command_id, schedule_key),
+  FOREIGN KEY (command_id, run_id) REFERENCES career_commands(command_id, run_id) ON DELETE RESTRICT,
+  UNIQUE (command_id, stage_key, stage_repeat),
+  UNIQUE (command_id, automatic_repeat_ordinal)
+) STRICT;
+CREATE INDEX career_retry_schedules_due_idx ON career_retry_schedules(due_at, command_id);
+CREATE TRIGGER career_retry_schedules_insert_authority
+BEFORE INSERT ON career_retry_schedules
+WHEN COALESCE(NOT EXISTS (
+  SELECT 1 FROM career_commands c WHERE c.command_id = NEW.command_id AND c.run_id = NEW.run_id
+    AND c.owner_resource_id = NEW.owner_resource_id AND c.lease_owner = NEW.lease_owner
+    AND c.claim_generation = NEW.claim_generation AND c.queue_state = 'running'
+    AND c.lease_expires_at > NEW.scheduled_at AND c.processing_deadline_at > NEW.due_at
+    AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND NEW.policy_calculated_at <= NEW.scheduled_at
+    AND NEW.policy_target_at = NEW.policy_calculated_at + NEW.policy_delay_ms
+    AND NEW.due_at = max(NEW.scheduled_at, NEW.policy_target_at)
+    AND NEW.scheduled_at >= c.updated_at
+    AND NEW.scheduled_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.automatic_repeats_used < 5
+    AND NEW.automatic_repeat_ordinal = c.automatic_repeats_used + 1
+    AND NEW.stage_repeat = (SELECT count(*) + 1 FROM career_retry_schedules r WHERE r.command_id = c.command_id AND r.stage_key = NEW.stage_key)
+    AND NEW.policy_attempt = NEW.stage_repeat
+    AND NEW.stage_repeat <= CASE NEW.stage_key
+      WHEN 'direct_acquisition' THEN 2 WHEN 'browser_connection' THEN 2
+      WHEN 'provider_inference' THEN 1 WHEN 'schema_repair' THEN 1 ELSE 0 END
+    AND ((NEW.failure_class = 'transient' AND NEW.policy_source = 'jitter' AND NEW.retry_after_value IS NULL
+          AND NEW.failure_code IN ('temporarily_unavailable','temporary','temporary_failure','invalid_shape','network_unavailable','fixture_retry')
+          AND NEW.policy_delay_ms <= CASE WHEN NEW.policy_attempt = 1 THEN 2000 ELSE 4000 END)
+      OR (NEW.failure_class = 'rate_limited' AND NEW.failure_code = 'rate_limited'
+          AND NEW.policy_source = 'retry_after' AND NEW.retry_after_value IS NOT NULL
+          AND ((NEW.retry_after_value NOT GLOB '*[^0-9]*'
+                AND NEW.policy_delay_ms = CAST(NEW.retry_after_value AS INTEGER) * 1000)
+            OR (NEW.retry_after_value GLOB '???, ?? ??? ???? ??:??:?? GMT'
+              AND substr(NEW.retry_after_value,18,2) NOT GLOB '*[^0-9]*' AND CAST(substr(NEW.retry_after_value,18,2) AS INTEGER) BETWEEN 0 AND 23
+              AND substr(NEW.retry_after_value,21,2) NOT GLOB '*[^0-9]*' AND CAST(substr(NEW.retry_after_value,21,2) AS INTEGER) BETWEEN 0 AND 59
+              AND substr(NEW.retry_after_value,24,2) NOT GLOB '*[^0-9]*' AND CAST(substr(NEW.retry_after_value,24,2) AS INTEGER) BETWEEN 0 AND 59
+              AND substr(NEW.retry_after_value,1,3) = CASE strftime('%w',
+                substr(NEW.retry_after_value,13,4) || '-' || (CASE substr(NEW.retry_after_value,9,3)
+                  WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03' WHEN 'Apr' THEN '04'
+                  WHEN 'May' THEN '05' WHEN 'Jun' THEN '06' WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08'
+                  WHEN 'Sep' THEN '09' WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12' END)
+                  || '-' || substr(NEW.retry_after_value,6,2) || 'T' || substr(NEW.retry_after_value,18,8) || 'Z')
+                WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue' WHEN '3' THEN 'Wed'
+                WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri' WHEN '6' THEN 'Sat' END
+              AND strftime('%Y-%m-%dT%H:%M:%SZ',
+                substr(NEW.retry_after_value,13,4) || '-' || (CASE substr(NEW.retry_after_value,9,3)
+                  WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03' WHEN 'Apr' THEN '04'
+                  WHEN 'May' THEN '05' WHEN 'Jun' THEN '06' WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08'
+                  WHEN 'Sep' THEN '09' WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12' END)
+                  || '-' || substr(NEW.retry_after_value,6,2) || 'T' || substr(NEW.retry_after_value,18,8) || 'Z')
+                = substr(NEW.retry_after_value,13,4) || '-' || (CASE substr(NEW.retry_after_value,9,3)
+                  WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03' WHEN 'Apr' THEN '04'
+                  WHEN 'May' THEN '05' WHEN 'Jun' THEN '06' WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08'
+                  WHEN 'Sep' THEN '09' WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12' END)
+                  || '-' || substr(NEW.retry_after_value,6,2) || 'T' || substr(NEW.retry_after_value,18,8) || 'Z'
+              AND NEW.policy_delay_ms = max(0, unixepoch(substr(NEW.retry_after_value,13,4) || '-' || (CASE substr(NEW.retry_after_value,9,3)
+                WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03' WHEN 'Apr' THEN '04'
+                WHEN 'May' THEN '05' WHEN 'Jun' THEN '06' WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08'
+                WHEN 'Sep' THEN '09' WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12' END)
+                || '-' || substr(NEW.retry_after_value,6,2) || 'T' || substr(NEW.retry_after_value,18,8) || 'Z') * 1000 - NEW.policy_calculated_at)))))
+    AND ((NEW.failure_code = 'invalid_shape' AND NEW.stage_key = 'schema_repair')
+      OR (NEW.failure_code = 'network_unavailable' AND NEW.stage_key IN ('direct_acquisition','browser_connection'))
+      OR (NEW.failure_code = 'fixture_retry' AND NEW.stage_key = 'direct_acquisition')
+      OR (NEW.failure_code IN ('temporarily_unavailable','rate_limited') AND NEW.stage_key IN ('direct_acquisition','browser_connection','provider_inference'))
+      OR (NEW.failure_code IN ('temporary','temporary_failure') AND NEW.stage_key IN ('direct_acquisition','browser_connection','provider_inference','schema_repair')))
+), 1)
+BEGIN SELECT RAISE(ABORT, 'invalid retry schedule authority'); END;
+CREATE TRIGGER career_retry_schedules_apply_authority
+AFTER INSERT ON career_retry_schedules
+BEGIN
+  UPDATE career_commands SET queue_state = 'retry_wait', retry_due_at = NEW.due_at,
+    automatic_repeats_used = automatic_repeats_used + 1, repeat_budget_remaining = repeat_budget_remaining - 1,
+    processing_budget_remaining_ms = processing_deadline_at - NEW.scheduled_at,
+    error_class = NEW.failure_class, error_code = NEW.failure_code, last_safe_error = NEW.safe_detail,
+    lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = NEW.scheduled_at
+  WHERE command_id = NEW.command_id AND run_id = NEW.run_id AND owner_resource_id = NEW.owner_resource_id
+    AND lease_owner = NEW.lease_owner AND claim_generation = NEW.claim_generation AND queue_state = 'running';
+END;
+CREATE TRIGGER career_retry_schedules_update_immutable BEFORE UPDATE ON career_retry_schedules BEGIN
+  SELECT RAISE(ABORT, 'retry schedule is immutable');
+END;
+CREATE TRIGGER career_retry_schedules_delete_immutable BEFORE DELETE ON career_retry_schedules BEGIN
+  SELECT RAISE(ABORT, 'retry schedule is immutable');
+END;
+CREATE TRIGGER career_commands_retry_budget_insert_guard
+BEFORE INSERT ON career_commands
+WHEN NEW.automatic_repeats_used <> 0 OR NEW.repeat_budget_remaining <> 5
+BEGIN SELECT RAISE(ABORT, 'new command retry budget must be fresh'); END;
+CREATE TRIGGER career_commands_retry_authority_guard
+BEFORE UPDATE ON career_commands
+WHEN (OLD.queue_state = 'running' AND NEW.queue_state = 'retry_wait') OR NEW.automatic_repeats_used <> OLD.automatic_repeats_used OR NEW.repeat_budget_remaining <> OLD.repeat_budget_remaining
+BEGIN
+  SELECT CASE WHEN NOT (
+    OLD.queue_state = 'running' AND NEW.queue_state = 'retry_wait'
+    AND NEW.automatic_repeats_used = OLD.automatic_repeats_used + 1
+    AND NEW.repeat_budget_remaining = OLD.repeat_budget_remaining - 1
+    AND EXISTS (SELECT 1 FROM career_retry_schedules r WHERE r.command_id = OLD.command_id
+      AND r.run_id = OLD.run_id AND r.claim_generation = OLD.claim_generation
+      AND r.automatic_repeat_ordinal = NEW.automatic_repeats_used AND r.due_at = NEW.retry_due_at
+      AND r.scheduled_at = NEW.updated_at)
+  ) THEN RAISE(ABORT, 'retry transition requires schedule authority') END;
+END;
+CREATE TRIGGER career_commands_processing_time_authority
+BEFORE UPDATE ON career_commands
+WHEN NOT (NEW.processing_started_at IS OLD.processing_started_at)
+  OR NOT (NEW.processing_deadline_at IS OLD.processing_deadline_at)
+  OR NEW.processing_budget_remaining_ms <> OLD.processing_budget_remaining_ms
+  OR NOT (NEW.suspension_started_at IS OLD.suspension_started_at)
+BEGIN
+  SELECT CASE WHEN NOT (
+    (OLD.queue_state = 'queued' AND NEW.queue_state = 'starting'
+      AND OLD.processing_started_at IS NULL AND NEW.processing_started_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.updated_at = NEW.processing_started_at
+      AND NEW.processing_deadline_at = NEW.processing_started_at + NEW.processing_budget_remaining_ms
+      AND NEW.processing_budget_remaining_ms BETWEEN 1 AND 1800000 AND NEW.suspension_started_at IS NULL)
+    OR (OLD.queue_state = 'running' AND NEW.queue_state = 'retry_wait'
+      AND NEW.processing_started_at = OLD.processing_started_at AND NEW.processing_deadline_at = OLD.processing_deadline_at
+      AND NEW.processing_budget_remaining_ms = OLD.processing_deadline_at - NEW.updated_at AND NEW.suspension_started_at IS NULL
+      AND EXISTS (SELECT 1 FROM career_retry_schedules r WHERE r.command_id = OLD.command_id
+        AND r.automatic_repeat_ordinal = NEW.automatic_repeats_used AND r.scheduled_at = NEW.updated_at))
+    OR (OLD.queue_state = 'running' AND NEW.queue_state = 'suspended'
+      AND NEW.processing_started_at = OLD.processing_started_at
+      AND OLD.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND OLD.lease_owner IS NOT NULL AND OLD.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.claim_generation = OLD.claim_generation AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.processing_deadline_at IS NULL
+      AND NEW.processing_budget_remaining_ms = OLD.processing_deadline_at - CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.suspension_started_at = CAST(unixepoch('subsec') * 1000 AS INTEGER))
+    OR (OLD.queue_state = 'suspended' AND NEW.queue_state = 'resuming'
+      AND NEW.processing_started_at = OLD.processing_started_at AND OLD.processing_budget_remaining_ms > 0
+      AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms
+      AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.processing_deadline_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + OLD.processing_budget_remaining_ms
+      AND NEW.suspension_started_at IS NULL AND NEW.claim_generation = OLD.claim_generation + 1
+      AND NEW.lease_owner IS NOT NULL AND NEW.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      AND NEW.heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER))
+  ) THEN RAISE(ABORT, 'processing time mutation is unauthorized') END;
+END;
+CREATE TRIGGER career_commands_legacy_retry_wait_insert_guard
+BEFORE INSERT ON career_commands WHEN NEW.legacy_retry_wait_v4 <> 0
+BEGIN SELECT RAISE(ABORT, 'legacy retry wait marker is migration-owned'); END;
+CREATE TRIGGER career_commands_legacy_retry_wait_marker_guard
+BEFORE UPDATE OF legacy_retry_wait_v4 ON career_commands
+WHEN NEW.legacy_retry_wait_v4 <> OLD.legacy_retry_wait_v4 AND NOT (
+  OLD.legacy_retry_wait_v4 = 1 AND NEW.legacy_retry_wait_v4 = 0
+  AND OLD.queue_state = 'retry_wait' AND NEW.queue_state IN ('resuming', 'timed_out')
+)
+BEGIN SELECT RAISE(ABORT, 'legacy retry wait marker is migration-owned'); END;
+CREATE TRIGGER career_commands_retry_wait_projection_authority
+BEFORE UPDATE ON career_commands
+WHEN OLD.queue_state = 'retry_wait'
+BEGIN
+  SELECT CASE WHEN NOT (
+    (OLD.legacy_retry_wait_v4 = 0 AND NEW.legacy_retry_wait_v4 = 0
+      AND EXISTS (SELECT 1 FROM career_retry_schedules r WHERE r.command_id = OLD.command_id
+        AND r.automatic_repeat_ordinal = OLD.automatic_repeats_used AND r.due_at = OLD.retry_due_at
+        AND r.failure_class = OLD.error_class AND r.failure_code = OLD.error_code AND r.safe_detail = OLD.last_safe_error
+        AND OLD.processing_budget_remaining_ms = OLD.processing_deadline_at - r.scheduled_at)
+      AND (
+        (NEW.queue_state = 'retry_wait' AND NEW.retry_due_at = OLD.retry_due_at
+          AND NEW.automatic_repeats_used = OLD.automatic_repeats_used AND NEW.repeat_budget_remaining = OLD.repeat_budget_remaining
+          AND NEW.error_class = OLD.error_class AND NEW.error_code = OLD.error_code AND NEW.last_safe_error = OLD.last_safe_error
+          AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms)
+        OR (NEW.queue_state = 'resuming' AND OLD.retry_due_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND OLD.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.retry_due_at IS NULL AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.claim_generation = OLD.claim_generation + 1 AND NEW.lease_owner IS NOT NULL
+          AND NEW.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.automatic_repeats_used = OLD.automatic_repeats_used AND NEW.repeat_budget_remaining = OLD.repeat_budget_remaining
+          AND NEW.error_class = OLD.error_class AND NEW.error_code = OLD.error_code AND NEW.last_safe_error = OLD.last_safe_error
+          AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms)
+        OR (NEW.queue_state = 'timed_out' AND OLD.processing_deadline_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.retry_due_at IS NULL AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.automatic_repeats_used = OLD.automatic_repeats_used AND NEW.repeat_budget_remaining = OLD.repeat_budget_remaining
+          AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms
+          AND NEW.error_class = 'deadline' AND NEW.error_code = 'processing_deadline_expired'
+          AND NEW.last_safe_error = 'The automatic processing deadline expired.')))
+    OR (OLD.legacy_retry_wait_v4 = 1 AND NEW.legacy_retry_wait_v4 = 0
+      AND NEW.automatic_repeats_used = OLD.automatic_repeats_used AND NEW.repeat_budget_remaining = OLD.repeat_budget_remaining
+      AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms
+      AND NEW.error_class IS OLD.error_class AND NEW.error_code IS OLD.error_code AND NEW.last_safe_error IS OLD.last_safe_error
+      AND (
+        (NEW.queue_state = 'resuming' AND OLD.retry_due_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND OLD.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.retry_due_at IS NULL AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.claim_generation = OLD.claim_generation + 1 AND NEW.lease_owner IS NOT NULL
+          AND NEW.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER))
+        OR (NEW.queue_state = 'timed_out' AND OLD.processing_deadline_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND NEW.retry_due_at IS NULL AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER))
+      ))
+  ) THEN RAISE(ABORT, 'retry wait projection mutation is unauthorized') END;
+END;
+CREATE TRIGGER career_commands_suspended_budget_immutable
+BEFORE UPDATE ON career_commands
+WHEN OLD.queue_state = 'suspended' AND NEW.queue_state = 'suspended' AND COALESCE(NOT (
+  NEW.processing_started_at = OLD.processing_started_at
+  AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms
+  AND NEW.processing_deadline_at IS NULL AND NEW.suspension_started_at = OLD.suspension_started_at
+), 1)
+BEGIN SELECT RAISE(ABORT, 'suspended processing budget is immutable'); END;
+`;
+
 const normalizedIntakeSql = `
 ALTER TABLE career_inbound_events ADD COLUMN intent_kind TEXT CHECK (intent_kind IS NULL OR intent_kind IN ('rejected', 'save_job', 'parked_job'));
 ALTER TABLE career_inbound_events ADD COLUMN canonical_url TEXT;
@@ -578,6 +832,7 @@ export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
   Object.freeze({ version: 3, name: 'queue_fencing', sql: queueFencingSql, checksum: 'befa6ba8eec3fcca3fe235e29c6f162ad83482b6f268d073a45534b43ba73d09' }),
   Object.freeze({ version: 4, name: 'normalized_authorized_intake', sql: normalizedIntakeSql, checksum: 'f4a09f69f4cd9c6c777d5d2a1264a70ca6ad55d1df5a4cd155722681e3b7851b' }),
+  Object.freeze({ version: 5, name: 'durable_retry_policy', sql: retryPolicySql, checksum: '025bad062c801c0d130eeeb481355ce662e8a6917d38961856d27689a21ccb38' }),
 ]);
 
 const LEDGER_SQL = `
@@ -665,6 +920,7 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
       expected.exec(queueFencingSql);
     }
     if (version >= 4) expected.exec(normalizedIntakeSql);
+    if (version >= 5) expected.exec(retryPolicySql);
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -742,6 +998,7 @@ export type EnqueueCommandInput = {
   threadId: string;
   originChannel: string;
   originDestination: string;
+  authorizationRevision?: number;
 };
 
 type AtomicIntakeCommon = {
@@ -864,6 +1121,15 @@ export type WorkerFence = {
 };
 
 export type WorkerWriteResult = { applied: true; updatedAt: number } | { applied: false; reason: 'lease_lost' };
+export type RetryScheduleInput = {
+  scheduleKey: string;
+  stage: RetryStage;
+  failure: { class: FailureClass; code: SafeFailureCode };
+  policy: RetryPolicyResult;
+};
+export type RetryScheduleResult =
+  | { applied: true; duplicate: boolean; automaticRepeatsUsed: number; stageRepeatsUsed: number }
+  | { applied: false; reason: 'invalid' | 'lease_lost' | 'deadline_expired' | 'budget_exhausted' | 'stage_cap_exhausted' | 'non_retryable' };
 
 export class CareerStore {
   private readonly database: DatabaseSync;
@@ -875,6 +1141,9 @@ export class CareerStore {
     const verifiedUrl = assertOperationalDatabaseUrl(databaseUrl);
     this.leaseMs = options.leaseMs ?? 120_000;
     this.processingDeadlineMs = options.processingDeadlineMs ?? 1_800_000;
+    if (!Number.isSafeInteger(this.processingDeadlineMs) || this.processingDeadlineMs <= 0 || this.processingDeadlineMs > 1_800_000) {
+      throw new Error('Processing deadline must be a positive integer no greater than 30 minutes.');
+    }
     this.database = new DatabaseSync(fileURLToPath(verifiedUrl));
     try {
       this.verifyCommittedChecksums();
@@ -1060,11 +1329,11 @@ export class CareerStore {
       this.database.prepare(`
         INSERT INTO career_commands (
           command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id,
-          thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+          thread_id, origin_channel, origin_destination, authorization_revision, queue_state, created_at, updated_at, queued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
       `).run(
         input.commandId, input.attemptId, input.requestId, input.canonicalJobKey, input.canonicalUrl,
-        input.ownerResourceId, input.threadId, input.originChannel, input.originDestination, now, now, now,
+        input.ownerResourceId, input.threadId, input.originChannel, input.originDestination, input.authorizationRevision ?? null, now, now, now,
       );
       const row = this.database.prepare('SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ?').get(input.commandId) as { queueSequence: number };
       const position = Number((this.database.prepare("SELECT count(*) AS count FROM career_commands WHERE queue_state = 'queued' AND queue_sequence <= ?").get(row.queueSequence) as { count: number }).count);
@@ -1102,7 +1371,6 @@ export class CareerStore {
         return null;
       }
 
-      const leaseExpiresAt = now + this.leaseMs;
       let nextState: 'starting' | 'running' | 'resuming';
       let runId = current.runId;
       let result;
@@ -1112,31 +1380,44 @@ export class CareerStore {
         result = this.database.prepare(`
           UPDATE career_commands
           SET queue_state = 'starting', run_id = ?, claim_generation = claim_generation + 1,
-              lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, processing_started_at = ?,
-              processing_deadline_at = ?, updated_at = ?
+              lease_owner = ?, lease_expires_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
+              heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+              processing_started_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+              processing_deadline_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
+              processing_budget_remaining_ms = ?, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
           WHERE command_id = ? AND owner_resource_id = ? AND queue_state = 'queued'
-        `).run(runId, leaseOwner, leaseExpiresAt, now, now, now + this.processingDeadlineMs, now, current.commandId, current.ownerResourceId);
+        `).run(runId, leaseOwner, this.leaseMs, this.processingDeadlineMs, this.processingDeadlineMs, current.commandId, current.ownerResourceId);
       } else if (current.queueState === 'retry_wait') {
         nextState = 'resuming';
         result = this.database.prepare(`
           UPDATE career_commands
           SET queue_state = 'resuming', claim_generation = claim_generation + 1, lease_owner = ?,
-              lease_expires_at = ?, heartbeat_at = ?, retry_due_at = NULL, updated_at = ?
-          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = 'retry_wait' AND retry_due_at <= ? AND processing_deadline_at > ?
-        `).run(leaseOwner, leaseExpiresAt, now, now, current.commandId, current.ownerResourceId, now, now);
+              lease_expires_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
+              heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER), retry_due_at = NULL,
+              legacy_retry_wait_v4 = 0, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = 'retry_wait'
+            AND retry_due_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+            AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        `).run(leaseOwner, this.leaseMs, current.commandId, current.ownerResourceId);
       } else {
         if (!['starting', 'running', 'resuming'].includes(current.queueState)) throw new Error('Selected queue state is not claimable.');
         nextState = current.queueState as 'starting' | 'running' | 'resuming';
         result = this.database.prepare(`
           UPDATE career_commands
-          SET claim_generation = claim_generation + 1, lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
-          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = ? AND lease_expires_at <= ? AND processing_deadline_at > ?
-        `).run(leaseOwner, leaseExpiresAt, now, now, current.commandId, current.ownerResourceId, current.queueState, now, now);
+          SET claim_generation = claim_generation + 1, lease_owner = ?,
+              lease_expires_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
+              heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER), updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = ?
+            AND lease_expires_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+            AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        `).run(leaseOwner, this.leaseMs, current.commandId, current.ownerResourceId, current.queueState);
       }
       if (Number(result.changes) !== 1 || runId === null) throw new Error('Atomic queue claim lost unexpectedly.');
-      const generation = Number((this.database.prepare('SELECT claim_generation AS generation FROM career_commands WHERE command_id = ?').get(current.commandId) as { generation: number }).generation);
+      const persisted = this.database.prepare(`SELECT claim_generation AS generation, lease_expires_at AS leaseExpiresAt,
+        heartbeat_at AS heartbeatAt FROM career_commands WHERE command_id = ?`).get(current.commandId) as { generation: number; leaseExpiresAt: number; heartbeatAt: number };
       this.database.exec('COMMIT');
-      return { commandId: current.commandId, runId, ownerResourceId: current.ownerResourceId, queueState: nextState, leaseOwner, claimGeneration: generation, leaseExpiresAt, heartbeatAt: now };
+      return { commandId: current.commandId, runId, ownerResourceId: current.ownerResourceId, queueState: nextState, leaseOwner,
+        claimGeneration: Number(persisted.generation), leaseExpiresAt: persisted.leaseExpiresAt, heartbeatAt: persisted.heartbeatAt };
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
@@ -1144,65 +1425,239 @@ export class CareerStore {
   }
 
   private workerWrite(sql: string, fence: WorkerFence): WorkerWriteResult {
-    const now = this.databaseNow();
-    const result = this.database.prepare(sql).run(
-      now, fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner,
-      fence.claimGeneration, fence.sourceState, now, now,
-    );
-    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+    const result = this.database.prepare(sql).get(
+      fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration, fence.sourceState,
+    ) as { updatedAt: number } | undefined;
+    return result ? { applied: true, updatedAt: Number(result.updatedAt) } : { applied: false, reason: 'lease_lost' };
   }
 
   renewClaim(fence: WorkerFence): WorkerWriteResult {
-    const now = this.databaseNow();
     const result = this.database.prepare(`
-      UPDATE career_commands SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+      UPDATE career_commands
+      SET lease_expires_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
+          heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+          updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
       WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
-        AND claim_generation = ? AND queue_state = ? AND lease_expires_at > ? AND processing_deadline_at > ?
-    `).run(
-      now + this.leaseMs, now, now, fence.commandId, fence.runId, fence.ownerResourceId,
-      fence.leaseOwner, fence.claimGeneration, fence.sourceState, now, now,
-    );
-    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+        AND claim_generation = ? AND queue_state = ?
+        AND lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      RETURNING updated_at AS updatedAt
+    `).get(
+      this.leaseMs, fence.commandId, fence.runId, fence.ownerResourceId,
+      fence.leaseOwner, fence.claimGeneration, fence.sourceState,
+    ) as { updatedAt: number } | undefined;
+    return result ? { applied: true, updatedAt: Number(result.updatedAt) } : { applied: false, reason: 'lease_lost' };
   }
 
   markRunning(fence: WorkerFence): WorkerWriteResult {
     if (fence.sourceState !== 'starting' && fence.sourceState !== 'resuming') return { applied: false, reason: 'lease_lost' };
     return this.workerWrite(`
-      UPDATE career_commands SET queue_state = 'running', blocker_id = NULL, updated_at = ?
+      UPDATE career_commands
+      SET queue_state = 'running', blocker_id = NULL, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
       WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ? AND claim_generation = ? AND queue_state = ?
-        AND lease_expires_at > ? AND processing_deadline_at > ? AND start_dispatch_state = 'dispatched'
+        AND lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND start_dispatch_state = 'dispatched'
+      RETURNING updated_at AS updatedAt
     `, fence);
   }
 
-  releaseForRetry(fence: WorkerFence, retryDelayMs: number): WorkerWriteResult {
-    if (fence.sourceState !== 'running' || !Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0) return { applied: false, reason: 'lease_lost' };
-    const now = this.databaseNow();
-    const result = this.database.prepare(`
-      UPDATE career_commands
-      SET queue_state = 'retry_wait', retry_due_at = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
-      WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
-        AND claim_generation = ? AND queue_state = 'running' AND lease_expires_at > ? AND processing_deadline_at > ?
-    `).run(
-      now + retryDelayMs, now, fence.commandId, fence.runId, fence.ownerResourceId,
-      fence.leaseOwner, fence.claimGeneration, now, now,
-    );
-    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+  scheduleRetry(fence: WorkerFence, input: RetryScheduleInput): RetryScheduleResult {
+    const safeId = /^[A-Za-z0-9_.:@-]{1,200}$/;
+    if (!fence || typeof fence !== 'object'
+      || ![fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner].every((value) => typeof value === 'string' && safeId.test(value))
+      || !Number.isSafeInteger(fence.claimGeneration) || fence.claimGeneration < 1 || fence.sourceState !== 'running'
+      || !input || typeof input !== 'object'
+      || Object.keys(input).some((key) => !['scheduleKey', 'stage', 'failure', 'policy'].includes(key))) {
+      return { applied: false, reason: 'invalid' };
+    }
+    const policy = input.policy;
+    let failure;
+    try {
+      failure = classifyFailure({ kind: input?.failure?.class, stage: input?.stage, code: input?.failure?.code,
+        ...(policy?.source === 'retry_after' ? { retryAfter: policy.retryAfter } : {}) });
+    } catch {
+      return { applied: false, reason: 'invalid' };
+    }
+    const ceiling = Number.isSafeInteger(policy?.attempt) && policy.attempt > 0
+      ? Math.min(60_000, 2_000 * (2 ** (policy.attempt - 1))) : -1;
+    let retryAfterValid = true;
+    if (policy?.source === 'retry_after') {
+      try {
+        const recomputed = computeRetrySchedule({ failure, attempt: policy.attempt, processingDeadlineAt: Number.MAX_SAFE_INTEGER,
+          clock: () => policy.calculatedAt, rng: () => 0 });
+        retryAfterValid = recomputed.retry && recomputed.delayMs === policy.delayMs && recomputed.source === policy.source;
+      } catch { retryAfterValid = false; }
+    }
+    if (!input.failure || typeof input.failure !== 'object' || Object.keys(input.failure).some((key) => !['class', 'code'].includes(key))
+      || !policy || typeof policy !== 'object' || Object.keys(policy).some((key) => !['retry', 'delayMs', 'attempt', 'calculatedAt', 'policyTargetAt', 'source', 'retryAfter'].includes(key))
+      || policy.retry !== true || !safeId.test(input.scheduleKey)
+      || !Number.isSafeInteger(policy.delayMs) || policy.delayMs < 0
+      || !Number.isSafeInteger(policy.calculatedAt) || policy.calculatedAt < 0
+      || !Number.isSafeInteger(policy.policyTargetAt) || policy.policyTargetAt !== policy.calculatedAt + policy.delayMs
+      || !Number.isSafeInteger(policy.attempt) || policy.attempt < 1
+      || (policy.source === 'jitter' && (failure.class !== 'transient' || policy.delayMs > ceiling || Object.hasOwn(policy, 'retryAfter')))
+      || (policy.source === 'retry_after' && (failure.class !== 'rate_limited' || !retryAfterValid))
+      || !['transient', 'rate_limited'].includes(failure.class)) {
+      return { applied: false, reason: failure.class === 'transient' || failure.class === 'rate_limited' ? 'invalid' : 'non_retryable' };
+    }
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.database.prepare(`
+        SELECT r.command_id AS commandId, r.run_id AS runId, r.owner_resource_id AS ownerResourceId,
+          r.stage_key AS stage, r.failure_class AS failureClass, r.failure_code AS failureCode, r.safe_detail AS safeDetail,
+          r.stage_repeat AS stageRepeatsUsed, r.automatic_repeat_ordinal AS automaticRepeatsUsed,
+          r.policy_attempt AS policyAttempt, r.policy_source AS policySource, r.policy_calculated_at AS calculatedAt,
+          r.policy_delay_ms AS delayMs, r.policy_target_at AS policyTargetAt, r.retry_after_value AS retryAfter,
+          r.lease_owner AS leaseOwner, r.claim_generation AS claimGeneration
+        FROM career_retry_schedules r WHERE r.command_id = ? AND r.schedule_key = ?
+      `).get(fence.commandId, input.scheduleKey) as Record<string, string | number | null> | undefined;
+      if (existing) {
+        if (existing.runId !== fence.runId || existing.ownerResourceId !== fence.ownerResourceId
+          || existing.leaseOwner !== fence.leaseOwner || existing.claimGeneration !== fence.claimGeneration) {
+          this.database.exec('COMMIT');
+          return { applied: false, reason: 'lease_lost' };
+        }
+        const same = existing.commandId === fence.commandId && existing.stage === input.stage
+          && existing.failureClass === failure.class && existing.failureCode === failure.code && existing.safeDetail === failure.safeDetail
+          && existing.policyAttempt === policy.attempt && existing.policySource === policy.source
+          && existing.calculatedAt === policy.calculatedAt && existing.delayMs === policy.delayMs
+          && existing.policyTargetAt === policy.policyTargetAt
+          && existing.retryAfter === (policy.source === 'retry_after' ? policy.retryAfter : null);
+        this.database.exec('COMMIT');
+        return same
+          ? { applied: true, duplicate: true, automaticRepeatsUsed: Number(existing.automaticRepeatsUsed), stageRepeatsUsed: Number(existing.stageRepeatsUsed) }
+          : { applied: false, reason: 'invalid' };
+      }
+      const now = this.databaseNow();
+      if (policy.calculatedAt > now) { this.database.exec('COMMIT'); return { applied: false, reason: 'invalid' }; }
+      const command = this.database.prepare(`
+        SELECT automatic_repeats_used AS used, processing_deadline_at AS deadline
+        FROM career_commands WHERE command_id = ? AND run_id = ? AND owner_resource_id = ?
+          AND lease_owner = ? AND claim_generation = ? AND queue_state = 'running' AND lease_expires_at > ?
+      `).get(fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration, now) as { used: number; deadline: number } | undefined;
+      if (!command) { this.database.exec('COMMIT'); return { applied: false, reason: 'lease_lost' }; }
+      const dueAt = Math.max(now, policy.policyTargetAt);
+      if (!Number.isSafeInteger(dueAt) || command.deadline <= now || dueAt >= command.deadline) { this.database.exec('COMMIT'); return { applied: false, reason: 'deadline_expired' }; }
+      if (command.used >= 5) { this.database.exec('COMMIT'); return { applied: false, reason: 'budget_exhausted' }; }
+      const stageUsed = Number((this.database.prepare('SELECT count(*) AS count FROM career_retry_schedules WHERE command_id = ? AND stage_key = ?').get(fence.commandId, input.stage) as { count: number }).count);
+      if (stageUsed >= STAGE_REPEAT_CAPS[input.stage]) { this.database.exec('COMMIT'); return { applied: false, reason: 'stage_cap_exhausted' }; }
+      if (policy.attempt !== stageUsed + 1) { this.database.exec('COMMIT'); return { applied: false, reason: 'invalid' }; }
+      this.database.prepare(`
+        INSERT INTO career_retry_schedules (
+          command_id, schedule_key, run_id, owner_resource_id, lease_owner, claim_generation,
+          stage_key, stage_repeat, automatic_repeat_ordinal, policy_attempt, policy_source, policy_calculated_at,
+          policy_delay_ms, policy_target_at, retry_after_value, failure_class, failure_code, safe_detail, scheduled_at, due_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(fence.commandId, input.scheduleKey, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration,
+        input.stage, stageUsed + 1, command.used + 1, policy.attempt, policy.source, policy.calculatedAt,
+        policy.delayMs, policy.policyTargetAt, policy.source === 'retry_after' ? policy.retryAfter : null,
+        failure.class, failure.code, failure.safeDetail, now, dueAt);
+      this.database.exec('COMMIT');
+      return { applied: true, duplicate: false, automaticRepeatsUsed: command.used + 1, stageRepeatsUsed: stageUsed + 1 };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      if (/invalid retry schedule authority|processing time mutation is unauthorized|retry wait projection mutation is unauthorized|CHECK constraint|UNIQUE constraint/i.test(String((error as Error)?.message))) {
+        return { applied: false, reason: 'invalid' };
+      }
+      throw error;
+    }
+  }
+
+  createLinkedTerminalRetry(input: {
+    parentCommandId: string; commandId: string; attemptId: string; requestId: string;
+    freshAuthorization: OwnerAuthorizationCapability;
+  }): { commandId: string; queueSequence: number; state: 'queued' } {
+    const authorization = input?.freshAuthorization;
+    const safeId = /^[A-Za-z0-9_.:@-]{1,200}$/;
+    if (!isOwnerAuthorizationCapability(authorization)
+      || Object.keys(authorization).some((key) => !['resourceId', 'threadId', 'destination', 'channel', 'principalKey', 'authorizationRevision'].includes(key))
+      || !['telegram', 'studio', 'stdio', 'api'].includes(authorization.channel)
+      || !Number.isSafeInteger(authorization.authorizationRevision) || authorization.authorizationRevision < 0
+      || ![input.parentCommandId, input.commandId, input.attemptId, input.requestId, authorization.resourceId,
+        authorization.threadId, authorization.destination, authorization.principalKey].every((value) => typeof value === 'string' && safeId.test(value))) {
+      throw new Error('Terminal retry requires complete fresh server authorization correlation.');
+    }
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const parent = this.database.prepare(`
+        WITH RECURSIVE lineage(command_id) AS (
+          SELECT ?
+          UNION
+          SELECT c.parent_command_id FROM career_commands c JOIN lineage l ON c.command_id = l.command_id
+          WHERE c.parent_command_id IS NOT NULL
+          LIMIT 101
+        ), provenance AS (
+          SELECT i.principal_key AS principal_key
+          FROM lineage l
+          JOIN career_commands root ON root.command_id = l.command_id AND root.parent_command_id IS NULL
+          JOIN career_inbound_events i ON i.command_id = root.command_id
+            AND i.result = 'accepted' AND i.intent_kind = 'save_job'
+            AND root.request_id = i.channel || ':' || i.transport_event_id
+            AND root.owner_resource_id = i.owner_resource_id AND root.thread_id = i.thread_id
+            AND root.origin_channel = i.channel AND root.origin_destination = i.origin_destination
+            AND root.authorization_revision = i.authorization_revision
+        )
+        SELECT c.request_id AS requestId, c.canonical_job_key AS canonicalJobKey, c.canonical_url AS canonicalUrl,
+          c.owner_resource_id AS ownerResourceId, c.thread_id AS threadId, c.origin_channel AS originChannel,
+          c.origin_destination AS originDestination, c.authorization_revision AS authorizationRevision,
+          (SELECT count(*) FROM lineage) AS lineageCount,
+          (SELECT count(*) FROM lineage l JOIN career_commands ancestor ON ancestor.command_id = l.command_id
+            WHERE ancestor.owner_resource_id <> c.owner_resource_id OR ancestor.thread_id <> c.thread_id
+              OR ancestor.origin_channel <> c.origin_channel OR ancestor.origin_destination <> c.origin_destination
+              OR ancestor.canonical_job_key <> c.canonical_job_key OR ancestor.canonical_url <> c.canonical_url) AS inconsistentCount,
+          (SELECT count(*) FROM provenance) AS provenanceCount,
+          (SELECT min(principal_key) FROM provenance) AS principalKey
+        FROM career_commands c
+        WHERE c.command_id = ? AND c.queue_state IN ('failed', 'timed_out')
+      `).get(input.parentCommandId, input.parentCommandId) as { requestId: string; canonicalJobKey: string; canonicalUrl: string; ownerResourceId: string; threadId: string; originChannel: string; originDestination: string; authorizationRevision: number | null; lineageCount: number; inconsistentCount: number; provenanceCount: number; principalKey: string | null } | undefined;
+      if (!parent) throw new Error('Terminal retry parent must be terminal failed or timed out.');
+      if (parent.lineageCount >= 100 || parent.inconsistentCount !== 0 || parent.provenanceCount !== 1 || parent.principalKey === null) {
+        throw new Error('Terminal retry lineage has no unique consistent accepted save provenance.');
+      }
+      if (parent.ownerResourceId !== authorization.resourceId) throw new Error('Terminal retry owner does not match the parent resource.');
+      if (parent.threadId !== authorization.threadId || parent.originChannel !== authorization.channel
+        || parent.originDestination !== authorization.destination || parent.principalKey !== authorization.principalKey) {
+        throw new Error('Terminal retry authorization correlation does not match the accepted principal and destination.');
+      }
+      if (parent.authorizationRevision === null || authorization.authorizationRevision < parent.authorizationRevision) {
+        throw new Error('Terminal retry authorization revision is stale or unavailable.');
+      }
+      const now = this.databaseNow();
+      assertCurrentlyValidPrincipalAuthorizationCapability(authorization);
+      this.database.prepare(`
+        INSERT INTO career_commands (
+          command_id, attempt_id, parent_command_id, request_id, canonical_job_key, canonical_url,
+          owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision,
+          queue_state, created_at, updated_at, queued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+      `).run(input.commandId, input.attemptId, input.parentCommandId, input.requestId, parent.canonicalJobKey, parent.canonicalUrl,
+        parent.ownerResourceId, parent.threadId, parent.originChannel, parent.originDestination, authorization.authorizationRevision, now, now, now);
+      const child = this.database.prepare('SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ?').get(input.commandId) as { queueSequence: number };
+      this.database.exec('COMMIT');
+      return { commandId: input.commandId, queueSequence: child.queueSequence, state: 'queued' };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   completeClaim(fence: WorkerFence, outcome: 'succeeded' | 'failed'): WorkerWriteResult {
     if (fence.sourceState !== 'running') return { applied: false, reason: 'lease_lost' };
-    const now = this.databaseNow();
     const result = this.database.prepare(`
       UPDATE career_commands
       SET queue_state = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
-          terminal_generation = terminal_generation + 1, completed_at = ?, resolved_at = ?, updated_at = ?
+          terminal_generation = terminal_generation + 1,
+          completed_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+          resolved_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+          updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
       WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
-        AND claim_generation = ? AND queue_state = 'running' AND lease_expires_at > ? AND processing_deadline_at > ?
-    `).run(
-      outcome, now, now, now, fence.commandId, fence.runId, fence.ownerResourceId,
-      fence.leaseOwner, fence.claimGeneration, now, now,
-    );
-    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+        AND claim_generation = ? AND queue_state = 'running'
+        AND lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      RETURNING updated_at AS updatedAt
+    `).get(outcome, fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration) as { updatedAt: number } | undefined;
+    return result ? { applied: true, updatedAt: Number(result.updatedAt) } : { applied: false, reason: 'lease_lost' };
   }
 
   authorizeExternalEffect(guard: WorkerFence & {
@@ -1213,7 +1668,6 @@ export class CareerStore {
     expectedRowVersion: number | null;
   }): { authorized: true; stageRecordId: string } | { authorized: false; reason: 'lease_lost' | 'stage_guard_failed' } {
     if (guard.sourceState !== 'running' && guard.sourceState !== 'resuming') return { authorized: false, reason: 'stage_guard_failed' };
-    const now = this.databaseNow();
     const authorization = this.database.prepare(`
       SELECT s.stage_record_id AS stageRecordId
       FROM career_commands c
@@ -1222,10 +1676,12 @@ export class CareerStore {
         AND s.stage_key = ? AND s.stage_version = ? AND s.state = 'applying'
         AND s.idempotency_key = ? AND s.expected_sheet_fingerprint IS ? AND s.expected_row_version IS ?
       WHERE c.command_id = ? AND c.run_id = ? AND c.owner_resource_id = ? AND c.lease_owner = ?
-        AND c.claim_generation = ? AND c.queue_state = ? AND c.lease_expires_at > ? AND c.processing_deadline_at > ?
+        AND c.claim_generation = ? AND c.queue_state = ?
+        AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
     `).get(
       guard.stageKey, guard.stageVersion, guard.idempotencyKey, guard.expectedSheetFingerprint, guard.expectedRowVersion,
-      guard.commandId, guard.runId, guard.ownerResourceId, guard.leaseOwner, guard.claimGeneration, guard.sourceState, now, now,
+      guard.commandId, guard.runId, guard.ownerResourceId, guard.leaseOwner, guard.claimGeneration, guard.sourceState,
     ) as { stageRecordId: string | null } | undefined;
     if (!authorization) return { authorized: false, reason: 'lease_lost' };
     return authorization.stageRecordId === null
@@ -1234,15 +1690,19 @@ export class CareerStore {
   }
 
   expireProcessingDeadlines(): { transitioned: number } {
-    const now = this.databaseNow();
     const result = this.database.prepare(`
       UPDATE career_commands
       SET queue_state = 'timed_out', lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
           retry_due_at = NULL, blocker_id = NULL, terminal_generation = terminal_generation + 1,
-          error_class = 'deadline', error_code = 'processing_deadline_expired',
-          last_safe_error = 'The automatic processing deadline expired.', completed_at = ?, resolved_at = ?, updated_at = ?
-      WHERE queue_state IN ('starting', 'running', 'resuming', 'retry_wait') AND processing_deadline_at <= ?
-    `).run(now, now, now, now);
+          error_class = CASE WHEN legacy_retry_wait_v4 = 1 THEN error_class ELSE 'deadline' END,
+          error_code = CASE WHEN legacy_retry_wait_v4 = 1 THEN error_code ELSE 'processing_deadline_expired' END,
+          last_safe_error = CASE WHEN legacy_retry_wait_v4 = 1 THEN last_safe_error ELSE 'The automatic processing deadline expired.' END,
+          legacy_retry_wait_v4 = 0,
+          completed_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
+          resolved_at = CAST(unixepoch('subsec') * 1000 AS INTEGER), updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      WHERE queue_state IN ('starting', 'running', 'resuming', 'retry_wait')
+        AND processing_deadline_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    `).run();
     return { transitioned: Number(result.changes) };
   }
 
@@ -1285,11 +1745,14 @@ export class CareerStore {
     processingDeadlineAt: number | null;
     retryDueAt: number | null;
     terminalGeneration: number;
+    automaticRepeatsUsed: number;
+    processingBudgetRemainingMs: number;
   } | undefined {
     return this.database.prepare(`
       SELECT command_id AS commandId, queue_state AS queueState, claim_generation AS claimGeneration,
         lease_owner AS leaseOwner, lease_expires_at AS leaseExpiresAt, heartbeat_at AS heartbeatAt,
-        processing_deadline_at AS processingDeadlineAt, retry_due_at AS retryDueAt, terminal_generation AS terminalGeneration
+        processing_deadline_at AS processingDeadlineAt, retry_due_at AS retryDueAt, terminal_generation AS terminalGeneration,
+        automatic_repeats_used AS automaticRepeatsUsed, processing_budget_remaining_ms AS processingBudgetRemainingMs
       FROM career_commands WHERE command_id = ?
     `).get(commandId) as ReturnType<CareerStore['getCommand']>;
   }
