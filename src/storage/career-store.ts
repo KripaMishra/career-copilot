@@ -1,5 +1,7 @@
 import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
+import { existsSync, realpathSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { assertCurrentlyValidPrincipalAuthorizationCapability, isOwnerAuthorizationCapability, type OwnerAuthorizationCapability } from '../channels/telegram-auth.ts';
@@ -1160,6 +1162,126 @@ BEGIN
 END;
 `;
 
+const terminalCommandColumns=['queue_sequence','command_id','schema_version','attempt_id','parent_command_id','request_id','canonical_job_key','canonical_url',
+  'owner_resource_id','thread_id','origin_channel','origin_destination','queue_state','workflow_version','workflow_attempt','run_id',
+  'start_dispatch_state','claim_generation','lease_owner','lease_expires_at','heartbeat_at','repeat_budget_remaining','processing_started_at',
+  'processing_deadline_at','retry_due_at','error_class','error_code','last_safe_error','suspension_generation','blocker_id','terminal_generation',
+  'created_at','updated_at','queued_at','started_at','completed_at','resolved_at','retention_deadline_at','authorization_revision',
+  'automatic_repeats_used','processing_budget_remaining_ms','suspension_started_at','legacy_retry_wait_v4','terminal_authority_version'] as const;
+const terminalCommandNewValues=terminalCommandColumns.map(column=>`NEW.${column}`).join(',');
+
+const lifecycleTerminalProjectionSql = `
+DROP TRIGGER career_commands_terminal_immutable;
+ALTER TABLE career_commands ADD COLUMN terminal_authority_version INTEGER NOT NULL DEFAULT 0 CHECK (terminal_authority_version IN (-1,0,1));
+UPDATE career_commands SET terminal_authority_version=-1 WHERE queue_state IN ('succeeded','failed','timed_out');
+CREATE TABLE career_terminal_snapshot_observations (
+  command_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  resource_id TEXT NOT NULL,
+  lease_owner TEXT NOT NULL,
+  claim_generation INTEGER NOT NULL CHECK (claim_generation > 0),
+  source_state TEXT NOT NULL CHECK (source_state IN ('starting','running','resuming')),
+  status TEXT NOT NULL CHECK (status IN ('success','failed','tripwire','canceled','bailed','skipped')),
+  workflow_name TEXT NOT NULL CHECK (workflow_name='save-job-v1'),
+  workflow_version INTEGER NOT NULL CHECK (workflow_version=1),
+  observed_at INTEGER NOT NULL CHECK (observed_at >= 0),
+  auth_tag TEXT NOT NULL CHECK (length(auth_tag)=64 AND auth_tag NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY (command_id, run_id, resource_id, claim_generation),
+  FOREIGN KEY (command_id, run_id) REFERENCES career_commands(command_id, run_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TRIGGER career_terminal_snapshot_observation_authority
+BEFORE INSERT ON career_terminal_snapshot_observations
+WHEN career_verify_terminal_observation(NEW.command_id,NEW.run_id,NEW.resource_id,NEW.lease_owner,NEW.claim_generation,
+    NEW.source_state,NEW.status,NEW.workflow_name,NEW.workflow_version,NEW.observed_at,NEW.auth_tag)<>1
+  OR NOT EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=NEW.command_id AND c.run_id=NEW.run_id
+  AND c.owner_resource_id=NEW.resource_id AND c.lease_owner=NEW.lease_owner AND c.workflow_version=NEW.workflow_version
+  AND NEW.workflow_name='save-job-v1' AND c.claim_generation=NEW.claim_generation AND c.queue_state=NEW.source_state
+  AND c.lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+  AND c.processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+  AND NEW.observed_at BETWEEN c.heartbeat_at AND CAST(unixepoch('subsec')*1000 AS INTEGER))
+BEGIN SELECT RAISE(ABORT,'terminal snapshot observation authority denied'); END;
+CREATE TRIGGER career_terminal_snapshot_observation_immutable
+BEFORE UPDATE ON career_terminal_snapshot_observations
+BEGIN SELECT RAISE(ABORT,'terminal snapshot observation is immutable'); END;
+CREATE TRIGGER career_terminal_snapshot_observation_delete_immutable
+BEFORE DELETE ON career_terminal_snapshot_observations
+BEGIN SELECT RAISE(ABORT,'terminal snapshot observation is immutable'); END;
+CREATE TABLE career_terminal_command_attestations (
+  command_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  terminal_generation INTEGER NOT NULL CHECK (terminal_generation>0),
+  authority_kind TEXT NOT NULL CHECK (authority_kind IN ('legacy_migration','workflow_snapshot','processing_timeout','suspension_timeout','evidence_invalidation','application_terminal')),
+  authority_version INTEGER NOT NULL CHECK (authority_version=1),
+  command_payload TEXT NOT NULL,
+  auth_tag TEXT NOT NULL CHECK (length(auth_tag)=64 AND auth_tag NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY(command_id,run_id,terminal_generation),
+  FOREIGN KEY(command_id,run_id) REFERENCES career_commands(command_id,run_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TRIGGER career_terminal_command_attestation_authority
+BEFORE INSERT ON career_terminal_command_attestations
+WHEN career_verify_terminal_command_attestation(NEW.authority_kind,NEW.authority_version,NEW.command_payload,NEW.auth_tag)<>1
+BEGIN SELECT RAISE(ABORT,'terminal command attestation authority denied'); END;
+CREATE TRIGGER career_terminal_command_attestation_immutable
+BEFORE UPDATE ON career_terminal_command_attestations
+BEGIN SELECT RAISE(ABORT,'terminal command attestation is immutable'); END;
+CREATE TRIGGER career_terminal_command_attestation_delete_immutable
+BEFORE DELETE ON career_terminal_command_attestations
+BEGIN SELECT RAISE(ABORT,'terminal command attestation is immutable'); END;
+DROP TRIGGER career_commands_legal_queue_transition;
+CREATE TRIGGER career_commands_legal_queue_transition
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state <> NEW.queue_state AND NOT (
+  (OLD.queue_state = 'queued' AND NEW.queue_state = 'starting') OR
+  (OLD.queue_state = 'starting' AND NEW.queue_state IN ('running', 'timed_out')) OR
+  (OLD.queue_state = 'running' AND NEW.queue_state IN ('retry_wait', 'suspended', 'timed_out')) OR
+  (OLD.queue_state = 'retry_wait' AND NEW.queue_state IN ('resuming', 'timed_out')) OR
+  (OLD.queue_state = 'suspended' AND NEW.queue_state IN ('resuming', 'failed', 'timed_out')) OR
+  (OLD.queue_state = 'resuming' AND NEW.queue_state IN ('running', 'timed_out')) OR
+  (OLD.queue_state IN ('starting','running','resuming') AND NEW.queue_state IN ('succeeded','failed')
+    AND NEW.terminal_authority_version=1
+    AND EXISTS (SELECT 1 FROM career_terminal_snapshot_observations o WHERE o.command_id=OLD.command_id AND o.run_id=OLD.run_id
+      AND o.resource_id=OLD.owner_resource_id AND o.lease_owner=OLD.lease_owner
+      AND o.workflow_name='save-job-v1' AND o.workflow_version=OLD.workflow_version
+      AND o.claim_generation=OLD.claim_generation AND o.source_state=OLD.queue_state
+      AND ((NEW.queue_state='succeeded' AND o.status IN ('success','skipped'))
+        OR (NEW.queue_state='failed' AND o.status IN ('failed','tripwire','canceled','bailed'))))
+    AND (OLD.queue_state<>'starting' OR EXISTS (SELECT 1 FROM career_start_dispatch_journal j WHERE j.command_id=OLD.command_id
+      AND j.run_id=OLD.run_id AND j.resource_id=OLD.owner_resource_id AND j.claim_generation=OLD.claim_generation
+      AND j.dispatch_state='dispatched' AND EXISTS (SELECT 1 FROM career_terminal_snapshot_observations o
+        WHERE o.command_id=j.command_id AND o.run_id=j.run_id AND o.resource_id=j.resource_id
+          AND o.workflow_name='save-job-v1' AND o.workflow_version=OLD.workflow_version
+          AND o.claim_generation=j.claim_generation AND o.status=j.observed_run_status)))
+    AND (OLD.queue_state<>'resuming' OR EXISTS (SELECT 1 FROM career_suspensions s WHERE s.command_id=OLD.command_id
+      AND s.run_id=OLD.run_id AND s.generation=OLD.suspension_generation AND s.blocker_state='applied'
+      AND EXISTS (SELECT 1 FROM career_terminal_snapshot_observations o WHERE o.command_id=s.command_id AND o.run_id=s.run_id
+        AND o.resource_id=OLD.owner_resource_id AND o.workflow_name='save-job-v1' AND o.workflow_version=OLD.workflow_version
+        AND o.claim_generation=OLD.claim_generation AND o.status=s.resume_observed_status))))
+)
+BEGIN SELECT RAISE(ABORT, 'illegal queue transition'); END;
+CREATE TRIGGER career_commands_terminal_attestation_projection
+AFTER UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state NOT IN ('succeeded','failed','timed_out') AND NEW.queue_state IN ('succeeded','failed','timed_out')
+BEGIN
+  INSERT INTO career_terminal_command_attestations(command_id,run_id,terminal_generation,authority_kind,authority_version,command_payload,auth_tag)
+  VALUES(NEW.command_id,NEW.run_id,NEW.terminal_generation,
+    CASE WHEN NEW.terminal_authority_version=1 THEN 'workflow_snapshot'
+      WHEN NEW.queue_state='timed_out' AND NEW.error_code='suspension_expired' THEN 'suspension_timeout'
+      WHEN NEW.queue_state='timed_out' THEN 'processing_timeout'
+      WHEN NEW.queue_state='failed' AND NEW.error_code='linked_attempt_required' THEN 'evidence_invalidation'
+      ELSE 'application_terminal' END,
+    1,career_terminal_command_payload(${terminalCommandNewValues}),
+    career_terminal_command_tag(CASE WHEN NEW.terminal_authority_version=1 THEN 'workflow_snapshot'
+      WHEN NEW.queue_state='timed_out' AND NEW.error_code='suspension_expired' THEN 'suspension_timeout'
+      WHEN NEW.queue_state='timed_out' THEN 'processing_timeout'
+      WHEN NEW.queue_state='failed' AND NEW.error_code='linked_attempt_required' THEN 'evidence_invalidation'
+      ELSE 'application_terminal' END,1,${terminalCommandNewValues}));
+END;
+CREATE TRIGGER career_commands_terminal_immutable
+BEFORE UPDATE ON career_commands
+WHEN OLD.queue_state IN ('succeeded', 'failed', 'timed_out')
+BEGIN SELECT RAISE(ABORT, 'terminal command is immutable'); END;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: 'legacy_idempotency_compatibility', sql: legacyCompatibilitySql, checksum: '606b96f6bea28639b2f8699634873cfeb02a1f6ef549bc0b676e2f6c7a8cbd28' }),
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
@@ -1168,6 +1290,7 @@ export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 5, name: 'durable_retry_policy', sql: retryPolicySql, checksum: '025bad062c801c0d130eeeb481355ce662e8a6917d38961856d27689a21ccb38' }),
   Object.freeze({ version: 6, name: 'first_start_dispatch_journal', sql: firstStartDispatchJournalSql, checksum: '1987c52f737eae28f1c87f0e74df062f94a6fb08b961df3d24e404153df2389e' }),
   Object.freeze({ version: 7, name: 'generation_bound_suspension_resume', sql: generationBoundSuspensionSql, checksum: 'ad1b40ce226beed2096c6d62b72233d079fea4ae6e53275d5c7659ca8c0515fa' }),
+  Object.freeze({ version: 8, name: 'lifecycle_terminal_projection', sql: lifecycleTerminalProjectionSql, checksum: '7d6431f5da50d5c814926d61d46920f1a6350237b4fb07c6e443b3fb9b19374b' }),
 ]);
 
 const LEDGER_SQL = `
@@ -1258,6 +1381,7 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
     if (version >= 5) expected.exec(retryPolicySql);
     if (version >= 6) expected.exec(firstStartDispatchJournalSql);
     if (version >= 7) expected.exec(generationBoundSuspensionSql);
+    if (version >= 8) expected.exec(lifecycleTerminalProjectionSql);
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -1457,6 +1581,54 @@ export type WorkerFence = {
   sourceState: 'starting' | 'running' | 'resuming';
 };
 
+const terminalStatuses = ['success','failed','tripwire','canceled','bailed','skipped'] as const;
+type TerminalStatus = typeof terminalStatuses[number];
+type TerminalObservationAuthority = WorkerFence & { status:TerminalStatus; workflowName:'save-job-v1'; workflowVersion:1; observedAt:number; store:object };
+const terminalObservationCapabilities=new WeakMap<object,TerminalObservationAuthority>();
+declare const terminalSnapshotCapabilityBrand: unique symbol;
+export type TerminalSnapshotCapability = Readonly<{ [terminalSnapshotCapabilityBrand]:true }>;
+export type WorkflowTerminalSnapshotPort = { getWorkflowRunById(runId:string):Promise<{
+  runId:string;resourceId:string;status:unknown;workflowName:string;workflowVersion:number
+}|null> };
+
+function terminalObservationTag(key:Buffer,authority:Omit<TerminalObservationAuthority,'store'>):string {
+  return createHmac('sha256',key).update(JSON.stringify(['career-terminal-observation-v2',authority.commandId,
+    authority.runId,authority.ownerResourceId,authority.leaseOwner,authority.claimGeneration,authority.sourceState,authority.status,
+    authority.workflowName,authority.workflowVersion,authority.observedAt])).digest('hex');
+}
+function terminalCommandPayload(values:unknown[]):string|null {
+  if(values.length!==terminalCommandColumns.length||values.some(value=>value!==null&&!['string','number'].includes(typeof value)))return null;
+  return JSON.stringify(['career-terminal-command-row-v1',...values]);
+}
+function terminalCommandAttestationTag(key:Buffer,authorityKind:string,authorityVersion:number,payload:string):string {
+  return createHmac('sha256',key).update(JSON.stringify(['career-terminal-command-attestation-v1',authorityKind,authorityVersion,payload])).digest('hex');
+}
+function verifyTerminalCommandAttestation(key:Buffer|undefined,...values:unknown[]):number {
+  if(values.length!==4)return 0;
+  const [authorityKind,authorityVersion,payload,tag]=values;
+  if(!key||typeof authorityKind!=='string'||authorityVersion!==1||typeof payload!=='string'||typeof tag!=='string')return 0;
+  return safeTagEqual(terminalCommandAttestationTag(key,authorityKind,1,payload),tag)?1:0;
+}
+
+function issueTerminalObservationCapability(authority:TerminalObservationAuthority):TerminalSnapshotCapability {
+  const capability=Object.freeze({}) as TerminalSnapshotCapability;
+  terminalObservationCapabilities.set(capability,authority);
+  return capability;
+}
+function terminalObservationFunction(key:Buffer|undefined,...values:unknown[]):number {
+  try {
+    if(!key||values.length!==11)return 0;
+    const [commandId,runId,ownerResourceId,leaseOwner,generation,sourceState,status,workflowName,workflowVersion,observedAt,tag]=values;
+    if(typeof commandId!=='string'||typeof runId!=='string'||typeof ownerResourceId!=='string'||typeof leaseOwner!=='string'
+      ||typeof generation!=='number'||!Number.isSafeInteger(generation)||typeof sourceState!=='string'||typeof status!=='string'
+      ||workflowName!=='save-job-v1'||workflowVersion!==1||typeof observedAt!=='number'||!Number.isSafeInteger(observedAt)
+      ||typeof tag!=='string'||!terminalStatuses.includes(status as TerminalStatus))return 0;
+    const expected=terminalObservationTag(key,{commandId,runId,ownerResourceId,leaseOwner,claimGeneration:generation,
+      sourceState:sourceState as WorkerFence['sourceState'],status:status as TerminalStatus,workflowName,workflowVersion,observedAt});
+    return safeTagEqual(expected,tag)?1:0;
+  } catch { return 0; }
+}
+
 export type WorkerWriteResult = { applied: true; updatedAt: number } | { applied: false; reason: 'lease_lost' };
 export type FirstStartJournal = {
   commandId: string;
@@ -1530,20 +1702,41 @@ export class CareerStore {
   private readonly database: DatabaseSync;
   private readonly leaseMs: number;
   private readonly processingDeadlineMs: number;
+  private readonly reconciliationMs: number;
+  private readonly terminalObservationKey?:Buffer;
   private migrationsVerified = false;
+  private closed = false;
 
-  constructor(databaseUrl: string, options: { leaseMs?: number; processingDeadlineMs?: number } = {}) {
+  constructor(databaseUrl: string, options: { leaseMs?: number; processingDeadlineMs?: number; reconciliationMs?: number; terminalObservationRootKey?:string } = {}) {
     const verifiedUrl = assertOperationalDatabaseUrl(databaseUrl);
+    const databasePath=fileURLToPath(verifiedUrl);
+    if(options.terminalObservationRootKey!==undefined){
+      if(Buffer.byteLength(options.terminalObservationRootKey,'utf8')<32)throw new Error('Terminal observation root key must contain at least 32 bytes.');
+      const canonicalIdentity=existsSync(databasePath)?realpathSync(databasePath):join(realpathSync(dirname(databasePath)),basename(databasePath));
+      this.terminalObservationKey=createHmac('sha256',options.terminalObservationRootKey)
+        .update(JSON.stringify(['career-terminal-store-key-v1',canonicalIdentity])).digest();
+    }
     this.leaseMs = options.leaseMs ?? 120_000;
+    this.reconciliationMs = options.reconciliationMs ?? 30_000;
     this.processingDeadlineMs = options.processingDeadlineMs ?? 1_800_000;
+    if (!Number.isSafeInteger(this.leaseMs) || this.leaseMs < 1 || this.leaseMs > 120_000) throw new Error('Lease must be between 1 and 120000 milliseconds.');
+    if (!Number.isSafeInteger(this.reconciliationMs) || this.reconciliationMs < 1 || this.reconciliationMs > 30_000) throw new Error('Reconciliation cadence must be between 1 and 30000 milliseconds.');
     if (!Number.isSafeInteger(this.processingDeadlineMs) || this.processingDeadlineMs <= 0 || this.processingDeadlineMs > 1_800_000) {
       throw new Error('Processing deadline must be a positive integer no greater than 30 minutes.');
     }
-    this.database = new DatabaseSync(fileURLToPath(verifiedUrl));
+    this.database = new DatabaseSync(databasePath);
+    this.database.function('career_verify_terminal_observation',{deterministic:true,varargs:true},(...values)=>terminalObservationFunction(this.terminalObservationKey,...values));
+    this.database.function('career_terminal_command_payload',{deterministic:true,varargs:true},(...values)=>terminalCommandPayload(values));
+    this.database.function('career_terminal_command_tag',{deterministic:true,varargs:true},(authorityKind,authorityVersion,...values)=>{
+      const payload=terminalCommandPayload(values);return this.terminalObservationKey&&typeof authorityKind==='string'&&authorityVersion===1&&payload
+        ?terminalCommandAttestationTag(this.terminalObservationKey,authorityKind,1,payload):null;
+    });
+    this.database.function('career_verify_terminal_command_attestation',{deterministic:true,varargs:true},(...values)=>
+      verifyTerminalCommandAttestation(this.terminalObservationKey,...values));
     try {
       this.verifyCommittedChecksums();
       this.database.exec('PRAGMA busy_timeout = 5000;');
-      this.database.exec('BEGIN');
+      this.database.exec('BEGIN IMMEDIATE');
       try {
         inspectBeforeMutation(this.database);
         this.database.exec('COMMIT');
@@ -1563,6 +1756,7 @@ export class CareerStore {
       }
       if (journalMode.journal_mode.toLowerCase() !== 'wal') throw new Error('Operational database journal mode verification failed.');
       this.migrate();
+      this.verifyTerminalIntegrity();
     } catch (error) {
       this.database.close();
       throw error;
@@ -1576,52 +1770,129 @@ export class CareerStore {
     }
   }
 
-  private migrate(): void {
-    while (!this.migrationsVerified) {
-      const appliedCount = ledgerExists(this.database)
-        ? Number((this.database.prepare('SELECT count(*) AS count FROM schema_migrations').get() as { count: number }).count)
-        : 0;
-      const rebuildingCommands = appliedCount === 2;
-      if (rebuildingCommands) this.database.exec('PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;');
-      this.database.exec('BEGIN IMMEDIATE');
-      try {
-        if (!ledgerExists(this.database)) {
-          const baseline = recognizeUnledgered(this.database);
-          if (baseline === 'empty') this.database.exec(emptyCompatibilityBaselineSql);
-          this.database.exec(LEDGER_SQL);
-          const migration = MIGRATIONS[0];
-          this.database.exec(migration.sql);
-          this.database.prepare('INSERT INTO schema_migrations (version, name, checksum, applied_at, legacy_outbox_preserved) VALUES (?, ?, ?, ?, ?)').run(migration.version, migration.name, migration.checksum, Date.now(), baseline === 'legacy' ? 1 : 0);
-          this.database.exec('COMMIT');
-          continue;
-        }
-
-        const applied = this.database.prepare('SELECT version, name, checksum, legacy_outbox_preserved FROM schema_migrations ORDER BY version').all() as LedgerRow[];
-        verifyLedger(applied);
-        if (applied.length === MIGRATIONS.length) {
-          verifyInstalledSchema(this.database, applied.length, applied[0].legacy_outbox_preserved === 1);
-          this.database.exec('COMMIT');
-          this.migrationsVerified = true;
-          continue;
-        }
-        if (applied.length === 0) throw new Error('Unsupported empty schema migration ledger.');
-        verifyInstalledSchema(this.database, applied.length, applied[0].legacy_outbox_preserved === 1);
-        const migration = MIGRATIONS[applied.length];
-        this.database.exec(migration.sql);
-        if ((this.database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length !== 0) throw new Error('Queue migration introduced a foreign key violation.');
-        this.database.prepare('INSERT INTO schema_migrations (version, name, checksum, applied_at, legacy_outbox_preserved) VALUES (?, ?, ?, ?, 0)').run(migration.version, migration.name, migration.checksum, Date.now());
-        this.database.exec('COMMIT');
-      } catch (error) {
-        this.database.exec('ROLLBACK');
-        throw error;
-      } finally {
-        if (rebuildingCommands) this.database.exec('PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;');
+  private verifyTerminalIntegrity():void {
+    try {
+      const observations=this.database.prepare(`SELECT o.command_id AS commandId,o.run_id AS runId,o.resource_id AS ownerResourceId,
+        o.lease_owner AS leaseOwner,o.claim_generation AS claimGeneration,o.source_state AS sourceState,o.status,
+        o.workflow_name AS workflowName,o.workflow_version AS workflowVersion,o.observed_at AS observedAt,o.auth_tag AS authTag,
+        c.workflow_version AS commandWorkflowVersion
+        FROM career_terminal_snapshot_observations o LEFT JOIN career_commands c ON c.command_id=o.command_id AND c.run_id=o.run_id`).all() as Array<{
+          commandId:string;runId:string;ownerResourceId:string;leaseOwner:string;claimGeneration:number;sourceState:WorkerFence['sourceState'];
+          status:TerminalStatus;workflowName:string;workflowVersion:number;observedAt:number;authTag:string;commandWorkflowVersion:number|null
+        }>;
+      if(observations.length>0&&!this.terminalObservationKey)throw new Error('Terminal observation integrity requires configured root authority.');
+      const accepted=new Map<string,TerminalStatus>();
+      for(const row of observations){
+        if(row.workflowName!=='save-job-v1'||row.workflowVersion!==1||row.commandWorkflowVersion!==1||!terminalStatuses.includes(row.status))
+          throw new Error('Terminal observation workflow integrity failed.');
+        const expected=terminalObservationTag(this.terminalObservationKey!,{commandId:row.commandId,runId:row.runId,
+          ownerResourceId:row.ownerResourceId,leaseOwner:row.leaseOwner,claimGeneration:Number(row.claimGeneration),sourceState:row.sourceState,
+          status:row.status,workflowName:'save-job-v1',workflowVersion:1,observedAt:Number(row.observedAt)});
+        if(!safeTagEqual(expected,row.authTag))throw new Error('Terminal observation signature integrity failed.');
+        accepted.set(`${row.commandId}\u0000${row.runId}\u0000${row.ownerResourceId}\u0000${row.claimGeneration}`,row.status);
       }
+      const attestations=this.database.prepare(`SELECT command_id AS commandId,run_id AS runId,terminal_generation AS terminalGeneration,
+        authority_kind AS authorityKind,authority_version AS authorityVersion,command_payload AS commandPayload,auth_tag AS authTag
+        FROM career_terminal_command_attestations`).all() as Array<{commandId:string;runId:string;terminalGeneration:number;
+          authorityKind:string;authorityVersion:number;commandPayload:string;authTag:string}>;
+      if(attestations.length>0&&!this.terminalObservationKey)throw new Error('Terminal command integrity requires configured root authority.');
+      const attested=new Map<string,typeof attestations[number]>();
+      for(const row of attestations){
+        if(!verifyTerminalCommandAttestation(this.terminalObservationKey,row.authorityKind,row.authorityVersion,row.commandPayload,row.authTag))
+          throw new Error('Terminal command attestation signature integrity failed.');
+        attested.set(`${row.commandId}\u0000${row.runId}\u0000${row.terminalGeneration}`,row);
+      }
+      const terminal=this.database.prepare(`SELECT ${terminalCommandColumns.join(',')} FROM career_commands
+        WHERE queue_state IN ('succeeded','failed','timed_out') ORDER BY command_id`).all() as Array<Record<string,unknown>>;
+      if(terminal.length>0&&!this.terminalObservationKey)throw new Error('Terminal command integrity requires configured root authority.');
+      for(const row of terminal){
+        const values=terminalCommandColumns.map(column=>row[column]);
+        const payload=terminalCommandPayload(values);
+        const key=`${row.command_id}\u0000${row.run_id}\u0000${row.terminal_generation}`;
+        const authority=attested.get(key);
+        if(!payload||!authority||authority.commandPayload!==payload)throw new Error('Terminal command row attestation integrity failed.');
+        if(authority.authorityKind==='legacy_migration'&&row.terminal_authority_version!==-1)
+          throw new Error('Legacy terminal command authority integrity failed.');
+        if(authority.authorityKind==='workflow_snapshot'){
+          const status=accepted.get(`${row.command_id}\u0000${row.run_id}\u0000${row.owner_resource_id}\u0000${row.claim_generation}`);
+          const valid=row.terminal_authority_version===1&&(row.queue_state==='succeeded'?status==='success'||status==='skipped'
+            :status!==undefined&&['failed','tripwire','canceled','bailed'].includes(status));
+          if(!valid)throw new Error('Workflow terminal command observation integrity failed.');
+        }
+      }
+      if(attested.size!==terminal.length)throw new Error('Terminal command attestation cardinality integrity failed.');
+    }catch(error){
+      if(/integrity|required configured root authority/i.test(String((error as Error).message)))throw error;
+      throw new Error('Terminal observation integrity verification failed.',{cause:error});
+    }
+  }
+
+  private backfillLegacyTerminalAttestations():void {
+    const rows=this.database.prepare(`SELECT ${terminalCommandColumns.join(',')} FROM career_commands
+      WHERE queue_state IN ('succeeded','failed','timed_out') ORDER BY command_id`).all() as Array<Record<string,unknown>>;
+    if(rows.length>0&&!this.terminalObservationKey)throw new Error('Legacy terminal migration requires configured root authority.');
+    const insert=this.database.prepare(`INSERT INTO career_terminal_command_attestations
+      (command_id,run_id,terminal_generation,authority_kind,authority_version,command_payload,auth_tag) VALUES (?,?,?,?,?,?,?)`);
+    for(const row of rows){
+      const payload=terminalCommandPayload(terminalCommandColumns.map(column=>row[column]));
+      if(!payload)throw new Error('Legacy terminal migration row is not canonical.');
+      insert.run(String(row.command_id),String(row.run_id),Number(row.terminal_generation),'legacy_migration',1,payload,
+        terminalCommandAttestationTag(this.terminalObservationKey!,'legacy_migration',1,payload));
+    }
+  }
+
+  private migrate(): void {
+    this.database.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      while (!this.migrationsVerified) {
+        let rebuildingCommands = false;
+        this.database.exec('BEGIN IMMEDIATE');
+        try {
+          if (!ledgerExists(this.database)) {
+            const baseline = recognizeUnledgered(this.database);
+            if (baseline === 'empty') this.database.exec(emptyCompatibilityBaselineSql);
+            this.database.exec(LEDGER_SQL);
+            const migration = MIGRATIONS[0];
+            this.database.exec(migration.sql);
+            this.database.prepare('INSERT INTO schema_migrations (version, name, checksum, applied_at, legacy_outbox_preserved) VALUES (?, ?, ?, ?, ?)').run(migration.version, migration.name, migration.checksum, Date.now(), baseline === 'legacy' ? 1 : 0);
+            this.database.exec('COMMIT');
+            continue;
+          }
+
+          const applied = this.database.prepare('SELECT version, name, checksum, legacy_outbox_preserved FROM schema_migrations ORDER BY version').all() as LedgerRow[];
+          verifyLedger(applied);
+          const appliedCount = applied.length;
+          rebuildingCommands = appliedCount === 2;
+          if (rebuildingCommands) this.database.exec('PRAGMA legacy_alter_table = ON;');
+          if (appliedCount === MIGRATIONS.length) {
+            verifyInstalledSchema(this.database, appliedCount, applied[0].legacy_outbox_preserved === 1);
+            this.database.exec('COMMIT');
+            this.migrationsVerified = true;
+            continue;
+          }
+          if (appliedCount === 0) throw new Error('Unsupported empty schema migration ledger.');
+          verifyInstalledSchema(this.database, appliedCount, applied[0].legacy_outbox_preserved === 1);
+          const migration = MIGRATIONS[appliedCount];
+          this.database.exec(migration.sql);
+          if(migration.version===8)this.backfillLegacyTerminalAttestations();
+          if ((this.database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length !== 0) throw new Error('Queue migration introduced a foreign key violation.');
+          this.database.prepare('INSERT INTO schema_migrations (version, name, checksum, applied_at, legacy_outbox_preserved) VALUES (?, ?, ?, ?, 0)').run(migration.version, migration.name, migration.checksum, Date.now());
+          this.database.exec('COMMIT');
+        } catch (error) {
+          this.database.exec('ROLLBACK');
+          throw error;
+        } finally {
+          if (rebuildingCommands) this.database.exec('PRAGMA legacy_alter_table = OFF;');
+        }
+      }
+    } finally {
+      this.database.exec('PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;');
     }
     if ((this.database.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1) throw new Error('Installed schema verification failed: foreign keys are disabled.');
   }
 
   migrationStatus(): { currentVersion: number; verified: boolean } {
+    this.verifyTerminalIntegrity();
     return { currentVersion: MIGRATIONS.length, verified: this.migrationsVerified };
   }
 
@@ -1757,7 +2028,10 @@ export class CareerStore {
         WHERE
           queue_state = 'queued'
           OR (queue_state = 'retry_wait' AND retry_due_at <= ? AND processing_deadline_at > ?)
-          OR ((queue_state IN ('starting', 'running') OR (queue_state='resuming' AND blocker_id IS NULL)) AND lease_expires_at <= ? AND processing_deadline_at > ?)
+          OR (((queue_state='starting' AND start_dispatch_state<>'start_unknown') OR queue_state='running'
+                OR (queue_state='resuming' AND blocker_id IS NULL))
+              AND lease_expires_at <= ? AND processing_deadline_at > ?
+              AND NOT EXISTS (SELECT 1 FROM career_stage_journal s WHERE s.command_id=career_commands.command_id AND s.state='outcome_unknown'))
         ORDER BY queue_sequence
         LIMIT 1
       `).get(now, now, now, now) as { commandId: string; ownerResourceId: string; queueState: QueueStateV0; workflowAttempt: number; runId: string | null } | undefined;
@@ -1803,8 +2077,11 @@ export class CareerStore {
               lease_expires_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + ?,
               heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER), updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
           WHERE command_id = ? AND owner_resource_id = ? AND queue_state = ?
+            AND (queue_state<>'starting' OR start_dispatch_state<>'start_unknown')
+            AND (queue_state<>'resuming' OR blocker_id IS NULL)
             AND lease_expires_at <= CAST(unixepoch('subsec') * 1000 AS INTEGER)
             AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+            AND NOT EXISTS (SELECT 1 FROM career_stage_journal s WHERE s.command_id=career_commands.command_id AND s.state='outcome_unknown')
         `).run(leaseOwner, this.leaseMs, current.commandId, current.ownerResourceId, current.queueState);
       }
       if (Number(result.changes) !== 1 || runId === null) throw new Error('Atomic queue claim lost unexpectedly.');
@@ -2084,6 +2361,7 @@ export class CareerStore {
     parentCommandId: string; commandId: string; attemptId: string; requestId: string;
     freshAuthorization: OwnerAuthorizationCapability;
   }): { commandId: string; queueSequence: number; state: 'queued' } {
+    this.verifyTerminalIntegrity();
     const authorization = input?.freshAuthorization;
     const safeId = /^[A-Za-z0-9_.:@-]{1,200}$/;
     if (!isOwnerAuthorizationCapability(authorization)
@@ -2159,11 +2437,15 @@ export class CareerStore {
   }
 
   completeClaim(fence: WorkerFence, outcome: 'succeeded' | 'failed'): WorkerWriteResult {
+    this.verifyTerminalIntegrity();
     if (fence.sourceState !== 'running') return { applied: false, reason: 'lease_lost' };
     const result = this.database.prepare(`
       UPDATE career_commands
       SET queue_state = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
-          terminal_generation = terminal_generation + 1,
+          terminal_generation = terminal_generation + 1,terminal_authority_version=1,
+          error_class=CASE WHEN ?='failed' THEN 'workflow_execution' ELSE NULL END,
+          error_code=CASE WHEN ?='failed' THEN 'terminal_snapshot_failed' ELSE NULL END,
+          last_safe_error=CASE WHEN ?='failed' THEN 'Workflow reached a non-success terminal state.' ELSE NULL END,
           completed_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
           resolved_at = CAST(unixepoch('subsec') * 1000 AS INTEGER),
           updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
@@ -2171,8 +2453,13 @@ export class CareerStore {
         AND claim_generation = ? AND queue_state = 'running'
         AND lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
         AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+        AND EXISTS (SELECT 1 FROM career_terminal_snapshot_observations o WHERE o.command_id=career_commands.command_id
+          AND o.run_id=career_commands.run_id AND o.resource_id=career_commands.owner_resource_id AND o.lease_owner=career_commands.lease_owner
+          AND o.workflow_name='save-job-v1' AND o.workflow_version=career_commands.workflow_version
+          AND o.claim_generation=career_commands.claim_generation AND o.source_state='running'
+          AND ((?='succeeded' AND o.status IN ('success','skipped')) OR (?='failed' AND o.status IN ('failed','tripwire','canceled','bailed'))))
       RETURNING updated_at AS updatedAt
-    `).get(outcome, fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration) as { updatedAt: number } | undefined;
+    `).get(outcome,outcome,outcome,outcome,fence.commandId,fence.runId,fence.ownerResourceId,fence.leaseOwner,fence.claimGeneration,outcome,outcome) as { updatedAt: number } | undefined;
     return result ? { applied: true, updatedAt: Number(result.updatedAt) } : { applied: false, reason: 'lease_lost' };
   }
 
@@ -2481,6 +2768,159 @@ export class CareerStore {
     }
   }
 
+  nextRunnableDueAt(): number | null {
+    const now = this.databaseNow();
+    const row = this.database.prepare(`SELECT min(due_at) AS dueAt FROM (
+      SELECT CASE WHEN queue_state='queued' THEN ? WHEN queue_state='retry_wait' THEN retry_due_at ELSE ? END AS due_at
+      FROM career_commands
+      WHERE queue_state='queued'
+        OR (queue_state='retry_wait' AND processing_deadline_at>?)
+        OR (((queue_state='starting' AND start_dispatch_state<>'start_unknown') OR queue_state='running'
+              OR (queue_state='resuming' AND blocker_id IS NULL))
+            AND lease_expires_at<=? AND processing_deadline_at>?
+            AND NOT EXISTS (SELECT 1 FROM career_stage_journal s WHERE s.command_id=career_commands.command_id AND s.state='outcome_unknown'))
+    )`).get(now, now, now, now, now) as { dueAt: number | null };
+    return row.dueAt === null ? null : Number(row.dueAt);
+  }
+
+  nextRunnableDelayMs(maximumMs: number): number {
+    if (!Number.isSafeInteger(maximumMs) || maximumMs < 0 || maximumMs > 5_000) throw new Error('Runnable delay maximum is invalid.');
+    const now = this.databaseNow();
+    const due = this.nextRunnableDueAt();
+    return due === null ? maximumMs : Math.min(maximumMs, Math.max(0, due - now));
+  }
+
+  reconcileLifecycle(): {
+    processingTimeouts: number; suspensionExpiries: number; expiredLeases: number; expiredLeaseCycles: number;
+    orphanedStarting: number; startUnknown: number; resumeUnknown: number; outcomeUnknownEffects: number;
+  } {
+    this.verifyTerminalIntegrity();
+    const processingTimeouts = this.expireProcessingDeadlines().transitioned;
+    const suspensionExpiries = this.expireSuspensions().transitioned;
+    const now = this.databaseNow();
+    const stuckBefore = now - (this.reconciliationMs * 2);
+    const row = this.database.prepare(`SELECT
+      sum(CASE WHEN queue_state IN ('starting','running','resuming') AND lease_expires_at<=? THEN 1 ELSE 0 END) AS expiredLeases,
+      sum(CASE WHEN queue_state IN ('starting','running','resuming') AND lease_expires_at<=? THEN 1 ELSE 0 END) AS stuckLeases,
+      sum(CASE WHEN queue_state='starting' AND NOT EXISTS (SELECT 1 FROM career_start_dispatch_journal j WHERE j.command_id=career_commands.command_id) THEN 1 ELSE 0 END) AS orphanedStarting,
+      sum(CASE WHEN queue_state='starting' AND start_dispatch_state='start_unknown' THEN 1 ELSE 0 END) AS startUnknown,
+      sum(CASE WHEN queue_state='resuming' AND EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=career_commands.blocker_id AND s.resume_call_state='resume_unknown') THEN 1 ELSE 0 END) AS resumeUnknown,
+      (SELECT count(*) FROM career_stage_journal WHERE state='outcome_unknown') AS outcomeUnknownEffects
+      FROM career_commands`).get(now, stuckBefore) as Record<string, number | null>;
+    const expiredLeases = Number(row.expiredLeases ?? 0);
+    const expiredLeaseCycles = Number(row.stuckLeases ?? 0) > 0 ? 2 : expiredLeases > 0 ? 1 : 0;
+    return { processingTimeouts, suspensionExpiries, expiredLeases, expiredLeaseCycles,
+      orphanedStarting: Number(row.orphanedStarting ?? 0), startUnknown: Number(row.startUnknown ?? 0),
+      resumeUnknown: Number(row.resumeUnknown ?? 0), outcomeUnknownEffects: Number(row.outcomeUnknownEffects ?? 0) };
+  }
+
+  lifecycleHealth(): {
+    queueDepth: number; oldestRunnableAgeMs: number; dueRetries: number; suspensions: number;
+    expiredLeases: number; stuckLeases: number; startUnknown: number; resumeUnknown: number; outcomeUnknownEffects: number;
+  } {
+    this.verifyTerminalIntegrity();
+    const now = this.databaseNow();
+    const stuckBefore = now - (this.reconciliationMs * 2);
+    const row = this.database.prepare(`SELECT
+      sum(CASE WHEN queue_state='queued' OR (queue_state='retry_wait' AND retry_due_at<=? AND processing_deadline_at>?) THEN 1 ELSE 0 END) AS queueDepth,
+      max(0, ?-coalesce(min(CASE WHEN queue_state='queued' THEN queued_at WHEN queue_state='retry_wait' AND retry_due_at<=? AND processing_deadline_at>? THEN retry_due_at END),?)) AS oldestRunnableAgeMs,
+      sum(CASE WHEN queue_state='retry_wait' AND retry_due_at<=? AND processing_deadline_at>? THEN 1 ELSE 0 END) AS dueRetries,
+      sum(CASE WHEN queue_state='suspended' THEN 1 ELSE 0 END) AS suspensions,
+      sum(CASE WHEN queue_state IN ('starting','running','resuming') AND lease_expires_at<=? THEN 1 ELSE 0 END) AS expiredLeases,
+      sum(CASE WHEN queue_state IN ('starting','running','resuming') AND lease_expires_at<=? THEN 1 ELSE 0 END) AS stuckLeases,
+      sum(CASE WHEN queue_state='starting' AND start_dispatch_state='start_unknown' THEN 1 ELSE 0 END) AS startUnknown,
+      sum(CASE WHEN queue_state='resuming' AND EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=career_commands.blocker_id AND s.resume_call_state='resume_unknown') THEN 1 ELSE 0 END) AS resumeUnknown,
+      (SELECT count(*) FROM career_stage_journal WHERE state='outcome_unknown') AS outcomeUnknownEffects
+      FROM career_commands`).get(now,now,now,now,now,now,now,now,now,stuckBefore) as Record<string, number | null>;
+    return { queueDepth:Number(row.queueDepth??0),oldestRunnableAgeMs:Number(row.oldestRunnableAgeMs??0),dueRetries:Number(row.dueRetries??0),
+      suspensions:Number(row.suspensions??0),expiredLeases:Number(row.expiredLeases??0),stuckLeases:Number(row.stuckLeases??0),
+      startUnknown:Number(row.startUnknown??0),resumeUnknown:Number(row.resumeUnknown??0),outcomeUnknownEffects:Number(row.outcomeUnknownEffects??0) };
+  }
+
+  async observeWorkflowTerminalSnapshot(fence:WorkerFence,adapter:WorkflowTerminalSnapshotPort):Promise<TerminalSnapshotCapability|null> {
+    if(!['starting','running','resuming'].includes(fence?.sourceState))return null;
+    const snapshot=await adapter.getWorkflowRunById(fence.runId);
+    if(!snapshot||snapshot.runId!==fence.runId||snapshot.resourceId!==fence.ownerResourceId||snapshot.workflowName!=='save-job-v1'
+      ||snapshot.workflowVersion!==1||!terminalStatuses.includes(snapshot.status as TerminalStatus))return null;
+    if(!this.terminalObservationKey)throw new Error('Terminal observation root authority is not configured.');
+    const status=snapshot.status as TerminalStatus;
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.verifyTerminalIntegrity();
+      const existing=this.database.prepare(`SELECT lease_owner AS leaseOwner,source_state AS sourceState,status,
+        workflow_name AS workflowName,workflow_version AS workflowVersion,observed_at AS observedAt
+        FROM career_terminal_snapshot_observations WHERE command_id=? AND run_id=? AND resource_id=? AND claim_generation=?`).get(
+          fence.commandId,fence.runId,fence.ownerResourceId,fence.claimGeneration) as {leaseOwner:string;sourceState:string;status:string;workflowName:string;workflowVersion:number;observedAt:number}|undefined;
+      if(existing){
+        this.database.exec('COMMIT');
+        if(existing.leaseOwner!==fence.leaseOwner||existing.sourceState!==fence.sourceState||existing.status!==status
+          ||existing.workflowName!=='save-job-v1'||existing.workflowVersion!==1)return null;
+        return issueTerminalObservationCapability({...fence,status,workflowName:'save-job-v1',workflowVersion:1,observedAt:Number(existing.observedAt),store:this});
+      }
+      const observedAt=this.databaseNow();
+      const authority={...fence,status,workflowName:'save-job-v1' as const,workflowVersion:1 as const,observedAt};
+      const result=this.database.prepare(`INSERT INTO career_terminal_snapshot_observations
+        (command_id,run_id,resource_id,lease_owner,claim_generation,source_state,status,workflow_name,workflow_version,observed_at,auth_tag)
+        SELECT command_id,run_id,owner_resource_id,lease_owner,claim_generation,queue_state,?,'save-job-v1',workflow_version,?,?
+        FROM career_commands WHERE command_id=? AND run_id=? AND owner_resource_id=? AND lease_owner=? AND claim_generation=? AND queue_state=?
+          AND workflow_version=1 AND lease_expires_at>? AND processing_deadline_at>?`).run(status,observedAt,terminalObservationTag(this.terminalObservationKey,authority),
+          fence.commandId,fence.runId,fence.ownerResourceId,fence.leaseOwner,fence.claimGeneration,fence.sourceState,observedAt,observedAt);
+      this.database.exec('COMMIT');
+      return Number(result.changes)===1?issueTerminalObservationCapability({...authority,store:this}):null;
+    }catch(error){
+      this.database.exec('ROLLBACK');
+      if(/terminal snapshot observation authority denied|constraint failed/i.test(String((error as Error).message)))return null;
+      throw error;
+    }
+  }
+
+  loadTerminalSnapshotObservation(fence:WorkerFence):TerminalSnapshotCapability|null {
+    this.verifyTerminalIntegrity();
+    const row=this.database.prepare(`SELECT status,workflow_name AS workflowName,workflow_version AS workflowVersion,observed_at AS observedAt
+      FROM career_terminal_snapshot_observations o
+      WHERE o.command_id=? AND o.run_id=? AND o.resource_id=? AND o.lease_owner=? AND o.claim_generation=? AND o.source_state=?
+        AND o.workflow_name='save-job-v1' AND o.workflow_version=1
+        AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=o.command_id AND c.run_id=o.run_id AND c.owner_resource_id=o.resource_id
+          AND c.lease_owner=o.lease_owner AND c.claim_generation=o.claim_generation AND c.queue_state=o.source_state
+          AND c.lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER) AND c.processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER))`).get(
+      fence.commandId,fence.runId,fence.ownerResourceId,fence.leaseOwner,fence.claimGeneration,fence.sourceState) as {status:TerminalStatus;workflowName:'save-job-v1';workflowVersion:1;observedAt:number}|undefined;
+    return row?issueTerminalObservationCapability({...fence,status:row.status,workflowName:row.workflowName,workflowVersion:row.workflowVersion,
+      observedAt:Number(row.observedAt),store:this}):null;
+  }
+
+  projectWorkflowTerminal(fence: WorkerFence, capability: TerminalSnapshotCapability, _safeError?: string): WorkerWriteResult {
+    this.verifyTerminalIntegrity();
+    if(typeof capability!=='object'||capability===null)return {applied:false,reason:'lease_lost'};
+    const authority=terminalObservationCapabilities.get(capability);
+    if(!authority||authority.store!==this||authority.commandId!==fence.commandId||authority.runId!==fence.runId
+      ||authority.ownerResourceId!==fence.ownerResourceId||authority.leaseOwner!==fence.leaseOwner
+      ||authority.claimGeneration!==fence.claimGeneration||authority.sourceState!==fence.sourceState
+      ||authority.workflowName!=='save-job-v1'||authority.workflowVersion!==1)return {applied:false,reason:'lease_lost'};
+    const terminalStatus=authority.status;
+    const outcome = terminalStatus === 'success' || terminalStatus === 'skipped' ? 'succeeded' : 'failed';
+    const boundedError = 'Workflow reached a non-success terminal state.';
+    const row = this.database.prepare(`UPDATE career_commands SET queue_state=?,lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+      blocker_id=NULL,terminal_generation=terminal_generation+1,terminal_authority_version=1,error_class=?,error_code=?,last_safe_error=?,
+      completed_at=CAST(unixepoch('subsec')*1000 AS INTEGER),resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER),updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+      WHERE command_id=? AND run_id=? AND owner_resource_id=? AND lease_owner=? AND claim_generation=? AND queue_state=?
+        AND lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER) AND processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+        AND start_dispatch_state='dispatched'
+        AND EXISTS (SELECT 1 FROM career_terminal_snapshot_observations o WHERE o.command_id=career_commands.command_id
+          AND o.run_id=career_commands.run_id AND o.resource_id=career_commands.owner_resource_id AND o.lease_owner=career_commands.lease_owner
+          AND o.workflow_name='save-job-v1' AND o.workflow_version=career_commands.workflow_version
+          AND o.claim_generation=career_commands.claim_generation AND o.source_state=career_commands.queue_state AND o.status=?)
+        AND (?<>'starting' OR EXISTS (SELECT 1 FROM career_start_dispatch_journal j WHERE j.command_id=career_commands.command_id
+          AND j.run_id=career_commands.run_id AND j.resource_id=career_commands.owner_resource_id
+          AND j.claim_generation=career_commands.claim_generation AND j.dispatch_state='dispatched' AND j.observed_run_status=?))
+        AND (?<>'resuming' OR EXISTS (SELECT 1 FROM career_suspensions s WHERE s.command_id=career_commands.command_id
+          AND s.run_id=career_commands.run_id AND s.generation=career_commands.suspension_generation
+          AND s.blocker_state='applied' AND s.resume_observed_status=?)) RETURNING updated_at AS updatedAt`).get(
+      outcome,outcome==='failed'?'workflow_execution':null,outcome==='failed'?'terminal_snapshot_failed':null,outcome==='failed'?boundedError:null,
+      fence.commandId,fence.runId,fence.ownerResourceId,fence.leaseOwner,fence.claimGeneration,fence.sourceState,terminalStatus,
+      fence.sourceState,terminalStatus,fence.sourceState,terminalStatus) as {updatedAt:number}|undefined;
+    return row ? {applied:true,updatedAt:Number(row.updatedAt)} : {applied:false,reason:'lease_lost'};
+  }
+
   getCommand(commandId: string): {
     commandId: string;
     queueState: QueueStateV0;
@@ -2494,6 +2934,7 @@ export class CareerStore {
     automaticRepeatsUsed: number;
     processingBudgetRemainingMs: number;
   } | undefined {
+    this.verifyTerminalIntegrity();
     return this.database.prepare(`
       SELECT command_id AS commandId, queue_state AS queueState, claim_generation AS claimGeneration,
         lease_owner AS leaseOwner, lease_expires_at AS leaseExpiresAt, heartbeat_at AS heartbeatAt,
@@ -2570,6 +3011,6 @@ export class CareerStore {
   }
 
   close(): void {
-    this.database.close();
+    if (!this.closed) { this.closed = true; this.database.close(); }
   }
 }

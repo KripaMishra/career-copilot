@@ -29,7 +29,15 @@ import {
   withOperationDeadline,
 } from '../src/workflows/retry-policy.ts';
 import { CareerCopilotService, CareerResumeCoordinator, createInstalledMastraResumeAdapter } from '../src/services/career-copilot.ts';
-import { CareerWorker, FirstStartCrashError, type SaveJobWorkflowPort } from '../src/services/career-worker.ts';
+import {
+  CareerWorker,
+  CareerWorkerLifecycle,
+  GlobalResourceMutex,
+  WorkerWakeSignal,
+  FirstStartCrashError,
+  type SaveJobWorkflowPort,
+  type LifecycleTimer,
+} from '../src/services/career-worker.ts';
 import { createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 import { SAVE_JOB_WORKFLOW_VERSION, saveJobWorkflow } from '../src/workflows/save-job.ts';
 
@@ -52,6 +60,11 @@ const primaryMemoryConfig = {
   workingMemory: { enabled: false },
   observationalMemory: false,
 };
+
+const verifiedBootstrap = Object.freeze({ configurationValidated: true, storeOpened: true, migrationsVerified: true } as const);
+const terminalObservationRootKey='career-terminal-observation-test-root-key-v1';
+const terminalSnapshot=(runId:string,resourceId:string,status:'success'|'failed'|'tripwire'|'canceled'|'bailed'|'skipped',workflowName='save-job-v1',workflowVersion=1)=>
+  ({runId,resourceId,status,workflowName,workflowVersion});
 
 const browserToolIds = [
   'browser_back',
@@ -211,8 +224,8 @@ const task5Update = (id: number, text = '/save https://linkedin.com/jobs/1', use
 function withTask5(run: (fixture: { store: CareerStore; secondStore: CareerStore; service: CareerCopilotService; secondService: CareerCopilotService; databasePath: string }) => Promise<void> | void) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-task5-'));
   const databasePath = path.join(dir, 'state.db');
-  const store = new CareerStore(`file:${databasePath}`);
-  const secondStore = new CareerStore(`file:${databasePath}`);
+  const store = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
+  const secondStore = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
   const service = (target: CareerStore) => new CareerCopilotService({ authorization: new OwnerAuthorization(() => task5Owner), store: target, intakeHashKey: 'k'.repeat(32) });
   return Promise.resolve(run({ store, secondStore, service: service(store), secondService: service(secondStore), databasePath }))
     .finally(() => { secondStore.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
@@ -300,8 +313,8 @@ async function withTask8(run: (fixture: { store: CareerStore; secondStore: Caree
 async function withTask7(run: (fixture: { store: CareerStore; secondStore: CareerStore; workflow: Task7Workflow; claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>; databasePath: string }) => Promise<void>, options: { leaseMs?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-task7-'));
   const databasePath = path.join(dir, 'state.db');
-  const store = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs });
-  const secondStore = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs });
+  const store = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs,terminalObservationRootKey });
+  const secondStore = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs,terminalObservationRootKey });
   const workflow = new Task7Workflow();
   try {
     store.enqueueCommand({ commandId: 'task7-command', attemptId: 'task7-attempt', requestId: 'task7-request', canonicalJobKey: 'url:https://example.com/job',
@@ -346,12 +359,12 @@ const rows: AcceptanceRow[] = [
       const forgedBytes = JSON.stringify({schemaVersion:1,kind:'confirmation',value:'ready'});
       const forgedHash = `sha256:${createHash('sha256').update(forgedBytes).digest('hex')}`;
       const now = Number(direct.prepare("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER) now").get()!.now);
-      direct.prepare(`UPDATE career_suspensions SET blocker_state='accepted',accepted_input_generation=generation,accepted_input_hash=?,accepted_at=?,resume_payload=?,
+      assert.throws(()=>direct.prepare(`UPDATE career_suspensions SET blocker_state='accepted',accepted_input_generation=generation,accepted_input_hash=?,accepted_at=?,resume_payload=?,
         resume_claim_generation=2,resume_lease_owner='forged-resumer',resume_lease_expires_at=?,resume_processing_deadline_at=?,acceptance_nonce='forged-acceptance-nonce',
         acceptance_authority_tag=?,current_resume_claim_generation=2,current_resume_lease_owner='forged-resumer',current_resume_lease_expires_at=?,updated_at=?
-        WHERE suspension_id='forged-blocker'`).run(forgedHash,now,forgedBytes,now+120000,now+store.getCommand('forged-command')!.processingBudgetRemainingMs,copiedTag,now+120000,now);
-      assert.equal(store.getCommand('forged-command')!.queueState,'resuming');
-      assert.throws(() => store.loadAcceptedResume(capability,'forged-blocker',task8AcceptanceKey),/authority|inconsistent/i,'copied valid tag cannot authorize another row');
+        WHERE suspension_id='forged-blocker'`).run(forgedHash,now,forgedBytes,now+120000,now+store.getCommand('forged-command')!.processingBudgetRemainingMs,copiedTag,now+120000,now),
+        /career_terminal_command_|attestation/i,'raw copied authority cannot bypass terminal attestation');
+      assert.equal(store.getCommand('forged-command')!.queueState,'suspended');
       for (const sql of [
         "UPDATE career_suspensions SET resume_payload='null' WHERE suspension_id='task8-blocker'",
         "UPDATE career_suspensions SET accepted_input_hash=NULL WHERE suspension_id='task8-blocker'",
@@ -443,7 +456,7 @@ const rows: AcceptanceRow[] = [
             await assert.rejects(coordinator.acceptAndResume(capability,input,'resume-worker',(point) => {
               if (point === crashPoint) throw new Error(`crash:${point}`);
             }), new RegExp(`crash:${crashPoint}`));
-            const reopenedStore = new CareerStore(`file:${databasePath}`);
+            const reopenedStore = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
             try {
               const reopened = new CareerResumeCoordinator(reopenedStore, adapter, task8AcceptanceKey);
               let recovered = await reopened.recoverAcceptedResume(capability, token.suspensionId);
@@ -542,7 +555,7 @@ const rows: AcceptanceRow[] = [
           safe_payload,payload_hash,source_hash,profile_hash,prompt_version,prompt_hash,resume_schema_version,resume_schema_hash,allowed_response,issued_at,expires_at,created_at,updated_at)
           VALUES ('expired-blocker','expired-task8','expired-run','save-job-skeleton-v1','clarification_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',?,?,?,?)`).run(hash,hash,hash,hash,hash,now-604800100,now-100,now-604800100,now-604800100);
         database.close();
-        const store = new CareerStore(`file:${databasePath}`);
+        const store = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
         assert.deepEqual(store.expireSuspensions(),{ transitioned:1 });
         const command = store.getCommand('expired-task8')!;
         assert.equal(command.queueState,'timed_out');
@@ -715,6 +728,7 @@ const rows: AcceptanceRow[] = [
           'schema_migrations', 'career_inbound_events', 'career_commands', 'career_stage_journal',
           'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries',
           'career_turn_inbox', 'career_structured_events', 'career_deletion_tombstones', 'career_start_dispatch_journal',
+          'career_terminal_snapshot_observations','career_terminal_command_attestations',
         ]) assert.ok(tables.includes(table), `missing ${table}`);
         assert.equal(tables.includes('career_outbox'), false);
         const indexes = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>).map(({ name }) => name);
@@ -733,7 +747,7 @@ const rows: AcceptanceRow[] = [
         for (const column of ['queue_sequence', 'workflow_attempt', 'processing_started_at', 'retention_deadline_at', 'authorization_revision']) assert.ok(commandColumns.includes(column), `missing command.${column}`);
         const deliveryColumns = (database.prepare('PRAGMA table_info(career_deliveries)').all() as Array<{ name: string }>).map(({ name }) => name);
         for (const column of ['source_kind', 'envelope_id', 'turn_delivery_id', 'claim_generation', 'claim_owner', 'claim_expires_at', 'heartbeat_at', 'attempt_count', 'first_attempt_at', 'next_attempt_at', 'retry_deadline_at', 'provider', 'provider_outcome', 'retention_deadline_at']) assert.ok(deliveryColumns.includes(column), `missing delivery.${column}`);
-        for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries', 'career_start_dispatch_journal']) {
+        for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries', 'career_start_dispatch_journal', 'career_terminal_snapshot_observations', 'career_terminal_command_attestations']) {
           assert.ok(database.prepare(`PRAGMA foreign_key_list(${table})`).all().length > 0, `missing foreign key on ${table}`);
         }
         const ledger = (database.prepare('SELECT version, name, checksum FROM schema_migrations ORDER BY version').all() as Array<{ version: number; name: string; checksum: string }>).map((row) => ({ ...row }));
@@ -753,6 +767,7 @@ const rows: AcceptanceRow[] = [
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-v2-preservation-'));
       const databasePath = path.join(dir, 'operational.db');
       const expectedPath = path.join(dir, 'expected-v3.db');
+      const replayPath = path.join(dir, 'replay.db');
       try {
         const hash = `sha256:${'a'.repeat(64)}`;
         const completion = fixture(contractFixtures(V0Contracts), 'CompletionEnvelopeV1Schema');
@@ -789,8 +804,16 @@ const rows: AcceptanceRow[] = [
         const tables = ['career_commands', 'career_stage_journal', 'career_suspensions', 'career_completion_outbox', 'career_deliveries', 'career_evidence_records', 'career_structured_events'];
         const before = Object.fromEntries(tables.map((table) => [table, database.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row }))]));
         database.close();
+        fs.copyFileSync(databasePath,replayPath);
+        assert.throws(()=>new CareerStore(`file:${replayPath}`),/legacy terminal migration.*root authority/i,
+          'legacy terminal migration fails closed without stable root authority');
+        const rolledBack=new DatabaseSync(replayPath,{readOnly:true});
+        assert.equal(rolledBack.prepare('SELECT max(version) version FROM schema_migrations').get()!.version,7);
+        assert.equal(rolledBack.prepare("SELECT count(*) count FROM pragma_table_info('career_commands') WHERE name='terminal_authority_version'").get()!.count,0,
+          'failed v8 backfill rolls back schema and marker changes');rolledBack.close();
+        const retried=new CareerStore(`file:${replayPath}`,{terminalObservationRootKey});retried.close();
 
-        const store = new CareerStore(`file:${databasePath}`);
+        const store = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
         store.close();
         const expectedStore = new CareerStore(`file:${expectedPath}`);
         expectedStore.close();
@@ -807,7 +830,8 @@ const rows: AcceptanceRow[] = [
                 ? Math.max(0, 1_800_000 - (Number(row.updated_at) - Number(row.processing_started_at)))
                 : ['starting', 'running', 'retry_wait', 'resuming'].includes(String(row.queue_state))
                   ? Math.min(1_800_000, Math.max(0, Number(row.processing_deadline_at) - Number(row.updated_at))) : 1_800_000,
-              suspension_started_at: row.queue_state === 'suspended' ? row.updated_at : null }))
+              suspension_started_at: row.queue_state === 'suspended' ? row.updated_at : null,
+              terminal_authority_version:['succeeded','failed','timed_out'].includes(String(row.queue_state))?-1:0 }))
             : table === 'career_suspensions'
               ? (before[table] as Array<Record<string, unknown>>).map((row) => ({ ...row, owner_resource_id:'v2-owner', evidence_hash:row.payload_hash,
                 resume_payload:null,resume_call_state:'not_called',invalidation_reason:null,issuance_claim_generation:null,issuance_lease_owner:null,
@@ -839,6 +863,39 @@ const rows: AcceptanceRow[] = [
             { from: 'terminal_generation', to: 'terminal_generation' },
           ],
         );
+        assert.equal(upgraded.prepare('SELECT count(*) count FROM career_terminal_command_attestations').get()!.count,1);
+        const sourceTag=String(upgraded.prepare("SELECT auth_tag tag FROM career_terminal_command_attestations WHERE command_id='v2-parent-command'").get()!.tag);
+        const replayTrusted=new CareerStore(`file:${replayPath}`,{terminalObservationRootKey});
+        const replayRaw=new DatabaseSync(replayPath);
+        const replayImmutable=String(replayRaw.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='career_terminal_command_attestation_immutable'").get()!.sql);
+        replayRaw.exec('DROP TRIGGER career_terminal_command_attestation_immutable');
+        replayRaw.prepare("UPDATE career_terminal_command_attestations SET auth_tag=? WHERE command_id='v2-parent-command'").run(sourceTag);
+        replayRaw.exec(replayImmutable);replayRaw.close();
+        assert.throws(()=>replayTrusted.getCommand('v2-parent-command'),/terminal command attestation.*integrity/i,'terminal attestation cannot replay across databases');
+        replayTrusted.close();
+
+        const mutationStore=new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
+        const mutationRaw=new DatabaseSync(databasePath);mutationRaw.exec('PRAGMA foreign_keys=OFF; PRAGMA ignore_check_constraints=ON;');
+        const commandTriggers=mutationRaw.prepare("SELECT name,sql FROM sqlite_schema WHERE type='trigger' AND tbl_name='career_commands' ORDER BY name").all() as Array<{name:string;sql:string}>;
+        const dropCommandTriggers=()=>{for(const trigger of commandTriggers)mutationRaw.exec(`DROP TRIGGER IF EXISTS ${trigger.name}`);};
+        const restoreCommandTriggers=()=>{for(const trigger of commandTriggers)mutationRaw.exec(trigger.sql);};
+        const original={...mutationRaw.prepare("SELECT * FROM career_commands WHERE command_id='v2-parent-command'").get()!} as Record<string,unknown>;
+        const columnTypes=new Map((mutationRaw.prepare("PRAGMA table_info('career_commands')").all() as Array<{name:string;type:string}>).map(column=>[column.name,column.type]));
+        for(const [column,value] of Object.entries(original)){
+          const changed=typeof value==='number'?value+1000:value===null?(columnTypes.get(column)==='INTEGER'?1:'mutated')
+            :column==='queue_state'?'succeeded':`${value}-mutated`;
+          dropCommandTriggers();mutationRaw.prepare(`UPDATE career_commands SET ${column}=? WHERE queue_sequence=?`).run(changed,value===original.queue_sequence?original.queue_sequence:original.queue_sequence);restoreCommandTriggers();
+          assert.throws(()=>mutationStore.getCommand('v2-parent-command'),/terminal command.*integrity|integrity.*terminal command/i,`full terminal row field ${column}`);
+          dropCommandTriggers();mutationRaw.prepare(`UPDATE career_commands SET ${column}=? WHERE queue_sequence=?`).run(value,
+            column==='queue_sequence'?changed:original.queue_sequence);restoreCommandTriggers();
+        }
+        dropCommandTriggers();mutationRaw.prepare("UPDATE career_commands SET canonical_job_key='job:forged',canonical_url='https://example.com/forged' WHERE command_id='v2-parent-command'").run();restoreCommandTriggers();
+        assert.throws(()=>mutationStore.createLinkedTerminalRetry({parentCommandId:'v2-parent-command',commandId:'forged-linked-child',attemptId:'forged-linked-attempt',requestId:'forged-linked-request',freshAuthorization:{} as any}),/integrity/i,
+          'linked retry never inherits unauthenticated terminal provenance');
+        dropCommandTriggers();mutationRaw.prepare('UPDATE career_commands SET canonical_job_key=?,canonical_url=? WHERE command_id=?').run(
+          original.canonical_job_key as string,original.canonical_url as string,'v2-parent-command');restoreCommandTriggers();
+        assert.equal(mutationStore.getCommand('v2-parent-command')!.queueState,'failed');
+        mutationRaw.close();mutationStore.close();
         upgraded.close();
         expected.close();
       } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -880,7 +937,7 @@ const rows: AcceptanceRow[] = [
         add('legacy-oversized', now + 10_000_000, now + 9_000_000);
         database.close();
 
-        const store = new CareerStore(`file:${databasePath}`);
+        const store = new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
         const migrated = new DatabaseSync(databasePath);
         assert.deepEqual(migrated.prepare(`SELECT command_id id, legacy_retry_wait_v4 marker,
           automatic_repeats_used used, repeat_budget_remaining remaining, error_code errorCode
@@ -1027,6 +1084,47 @@ const rows: AcceptanceRow[] = [
         fs.writeFileSync(toctouGoPath, '');
         await Promise.all([toctouChild, toctouPeer]);
 
+        const v2BarrierPath=path.join(dir,'v2-barrier.db');
+        const barrierReady=path.join(dir,'v2-barrier-ready');
+        const v1=new DatabaseSync(v2BarrierPath);
+        v1.exec(exactLegacySql);
+        v1.exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY CHECK (version > 0),
+          name TEXT NOT NULL UNIQUE,
+          checksum TEXT NOT NULL CHECK (length(checksum) = 64),
+          applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
+          legacy_outbox_preserved INTEGER NOT NULL CHECK (legacy_outbox_preserved IN (0, 1) AND (version = 1 OR legacy_outbox_preserved = 0))
+        ) STRICT;`);
+        v1.exec(MIGRATIONS[0].sql);
+        v1.prepare('INSERT INTO schema_migrations VALUES (1,?,?,?,1)').run(MIGRATIONS[0].name,MIGRATIONS[0].checksum,Date.now());
+        v1.exec('PRAGMA journal_mode=WAL;');v1.close();
+        const v2Writer=new DatabaseSync(v2BarrierPath);v2Writer.exec('PRAGMA busy_timeout=5000; PRAGMA foreign_keys=OFF; BEGIN IMMEDIATE;');
+        const barrierProgram=`
+          import fs from 'node:fs';
+          import { DatabaseSync } from 'node:sqlite';
+          const exec=DatabaseSync.prototype.exec;
+          let waiting=false;
+          DatabaseSync.prototype.exec=function(sql){
+            if(!waiting&&sql==='BEGIN IMMEDIATE'){waiting=true;fs.writeFileSync(${JSON.stringify(barrierReady)},'');}
+            return exec.call(this,sql);
+          };
+          const {CareerStore}=await import(${JSON.stringify(moduleUrl)});
+          const store=new CareerStore(${JSON.stringify(`file:${v2BarrierPath}`)});store.close();
+        `;
+        const barrierChild=runNode(barrierProgram);
+        await waitFor(()=>fs.existsSync(barrierReady),'migration barrier child did not reach BEGIN IMMEDIATE');
+        v2Writer.exec(MIGRATIONS[1].sql);
+        v2Writer.prepare('INSERT INTO schema_migrations VALUES (2,?,?,?,0)').run(MIGRATIONS[1].name,MIGRATIONS[1].checksum,Date.now());
+        v2Writer.exec('COMMIT');v2Writer.close();
+        await barrierChild;
+        const barrierVerified=new CareerStore(`file:${v2BarrierPath}`);
+        assert.deepEqual(barrierVerified.migrationStatus(),{currentVersion:MIGRATIONS.length,verified:true});
+        barrierVerified.close();
+        const barrierLedger=new DatabaseSync(v2BarrierPath,{readOnly:true});
+        assert.deepEqual(barrierLedger.prepare('SELECT version,name,checksum FROM schema_migrations ORDER BY version').all().map(row=>({...row})),
+          MIGRATIONS.map(({version,name,checksum})=>({version,name,checksum})));
+        barrierLedger.close();
+
         const lockedDatabasePath = path.join(dir, 'locked-operational.db');
         const readyPath = path.join(dir, 'child-ready');
         const goPath = path.join(dir, 'child-go');
@@ -1068,7 +1166,7 @@ const rows: AcceptanceRow[] = [
       const databasePath = path.join(dir, 'operational.db');
       try {
         const store = new CareerStore(`file:${databasePath}`); store.close();
-        const db = new DatabaseSync(databasePath);
+        const db = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(db);
         const hash = `sha256:${'a'.repeat(64)}`;
         assert.throws(() => db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run('a'.repeat(64)), /constraint/i);
         db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run(hash);
@@ -1113,7 +1211,7 @@ const rows: AcceptanceRow[] = [
         }));
         assert.throws(() => db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, suspension_generation, suspension_id, envelope_json, state, created_at, updated_at) VALUES ('env-bad','c4','run-4','suspension',1,'blocker-1',?,'pending',20,20)").run(badSuspensionEnvelope), /constraint/i);
         assert.throws(() => db.exec("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, turn_delivery_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, rendered_bytes, rendered_hash, attempt_count, first_attempt_at, retry_deadline_at, created_at, updated_at) VALUES ('d-unknown','key-unknown','turn','turn-unknown','telegram','chat','owner','thread','telegram','chat',0,'send_unknown',x'01','sha256:" + 'b'.repeat(64) + "',1,2,100,1,2)"), /constraint/i);
-        assert.throws(() => db.exec("UPDATE career_suspensions SET blocker_state='accepted' WHERE suspension_id='blocker-1'"), /constraint/i);
+        assert.throws(() => db.exec("UPDATE career_suspensions SET blocker_state='accepted' WHERE suspension_id='blocker-1'"), /constraint|career_terminal_command_/i);
         db.exec("INSERT INTO career_stage_journal (stage_record_id, command_id, run_id, stage_key, stage_version, state, idempotency_key, created_at, updated_at) VALUES ('stage-1','c4','run-4','acquire',1,'planned','stage-key',20,20)");
         assert.throws(() => db.exec("UPDATE career_stage_journal SET resolved_at=30, retention_deadline_at=40 WHERE stage_record_id='stage-1'"), /constraint/i);
         assert.throws(() => db.exec("INSERT INTO career_turn_inbox (event_key,event_kind,owner_resource_id,thread_id,safe_payload,created_at) VALUES ('bad-json','user','owner','thread','not-json',1)"), /constraint/i);
@@ -1783,9 +1881,10 @@ const rows: AcceptanceRow[] = [
         }
       }
       withQueueStore(({ databasePath }) => {
-        const database = new DatabaseSync(databasePath);
+        const database = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(database);
         database.exec('PRAGMA ignore_check_constraints = ON');
         for (const from of states) {
+          if(['succeeded','failed','timed_out'].includes(from))continue;// terminal immutability has dedicated direct coverage
           for (const to of states) {
             if (from === to) continue;
             const id = `trigger-${from}-${to}`;
@@ -1795,10 +1894,11 @@ const rows: AcceptanceRow[] = [
               : from === 'suspended' && to === 'resuming'
                 ? database.prepare("UPDATE career_commands SET queue_state='resuming', processing_deadline_at=1800001 WHERE command_id=?").run(id)
                 : database.prepare('UPDATE career_commands SET queue_state = ? WHERE command_id = ?').run(to, id);
-            const authorityTransition = (from === 'running' && ['retry_wait', 'suspended'].includes(to))
-              || (from === 'suspended' && ['resuming','failed'].includes(to)) || (from === 'retry_wait' && ['resuming', 'timed_out'].includes(to));
+            const authorityTransition = ['succeeded','failed','timed_out'].includes(to)
+              || (from === 'running' && ['retry_wait', 'suspended'].includes(to))
+              || (from === 'suspended' && to==='resuming') || (from === 'retry_wait' && to==='resuming');
             if (expected[from].includes(to as never) && !authorityTransition) assert.doesNotThrow(update, `${from} -> ${to}`);
-            else assert.throws(update, /illegal queue transition|terminal command is immutable|schedule authority|processing time|projection|suspension transition requires blocker authority|resume transition requires accepted blocker authority|linked attempt failure requires invalidated blocker/i, `${from} -/-> ${to}`);
+            else assert.throws(update, /illegal queue transition|terminal command is immutable|terminal command attestation|constraint|schedule authority|processing time|projection|suspension transition requires blocker authority|resume transition requires accepted blocker authority|linked attempt failure requires invalidated blocker/i, `${from} -/-> ${to}`);
           }
         }
         database.close();
@@ -1930,18 +2030,18 @@ const rows: AcceptanceRow[] = [
       assert.equal(second.commandId, first.commandId);
       assert.equal(second.claimGeneration, first.claimGeneration + 1);
       assert.deepEqual(store.completeClaim({ ...first, sourceState: 'running' }, 'succeeded'), { applied: false, reason: 'lease_lost' });
-      assert.equal(store.completeClaim({ ...second, sourceState: 'running' }, 'succeeded').applied, true);
+      assert.equal((await completeObserved(store,{ ...second, sourceState: 'running' },'succeeded')).applied,true);
     }, { leaseMs: 10 }),
   },
   {
     id: 'P1-terminal-immutable',
-    run: () => withQueueStore(({ store, databasePath }) => {
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
       store.enqueueCommand(queueInput('terminal-command'));
       const claim = store.claimNextRunnable('worker-a')!;
       assert.equal(dispatchAndMarkRunning(store, databasePath, claim).applied, true);
-      assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'succeeded').applied, true);
+      assert.equal((await completeObserved(store,{ ...claim, sourceState: 'running' },'succeeded')).applied,true);
       assert.deepEqual(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed'), { applied: false, reason: 'lease_lost' });
-      const database = new DatabaseSync(databasePath);
+      const database = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(database);
       assert.throws(() => database.exec("UPDATE career_commands SET queue_state='queued' WHERE command_id='terminal-command'"), /terminal command is immutable/i);
       database.close();
     }),
@@ -2008,7 +2108,7 @@ const rows: AcceptanceRow[] = [
   {
     id: 'P1-historical-suspension-retry-resume',
     run: () => withQueueStore(({ store, databasePath }) => {
-      const database = new DatabaseSync(databasePath);
+      const database = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(database);
       const now = Number(database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get()!.now);
       database.prepare(`
         INSERT INTO career_commands (
@@ -2100,7 +2200,7 @@ const rows: AcceptanceRow[] = [
   },
   {
     id: 'P9-retry-schedule-audit-idempotency-and-immutability',
-    run: () => withQueueStore(({ store, databasePath }) => {
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
       store.enqueueCommand(queueInput('schedule-a'));
       let claim = store.claimNextRunnable('worker-schedule')!;
       dispatchAndMarkRunning(store, databasePath, claim);
@@ -2119,12 +2219,12 @@ const rows: AcceptanceRow[] = [
 
       const finishSecond = store.claimNextRunnable('worker-finish-second')!;
       assert.equal(store.markRunning({ ...finishSecond, sourceState: 'resuming' }).applied, true);
-      assert.equal(store.completeClaim({ ...finishSecond, sourceState: 'running' }, 'succeeded').applied, true);
+      assert.equal((await completeObserved(store,{ ...finishSecond, sourceState: 'running' },'succeeded')).applied,true);
       store.enqueueCommand(queueInput('schedule-b'));
       const other = store.claimNextRunnable('worker-other')!;
       dispatchAndMarkRunning(store, databasePath, other);
       assert.equal(store.scheduleRetry({ ...other, sourceState: 'running' }, first).applied, true, 'another command may reuse the same schedule key');
-      const db = new DatabaseSync(databasePath);
+      const db = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(db);
       const audit = db.prepare("SELECT policy_attempt policyAttempt, policy_source policySource, automatic_repeat_ordinal ordinal FROM career_retry_schedules WHERE command_id='schedule-a' AND schedule_key='second-key'").get();
       assert.deepEqual({ ...audit! }, { policyAttempt: 1, policySource: 'retry_after', ordinal: 2 });
       const immediate = db.prepare("SELECT scheduled_at scheduledAt, due_at dueAt, policy_delay_ms delayMs, retry_after_value retryAfter FROM career_retry_schedules WHERE command_id='schedule-a' AND schedule_key='second-key'").get()!;
@@ -2155,7 +2255,7 @@ const rows: AcceptanceRow[] = [
       assert.deepEqual(store.scheduleRetry({ ...claim, sourceState: 'running' }, null as never), { applied: false, reason: 'invalid' });
       const futurePolicyTime = Date.now() + 60_000;
       assert.deepEqual(store.scheduleRetry({ ...claim, sourceState: 'running' }, { ...validInput, policy: { ...validInput.policy, calculatedAt: futurePolicyTime, policyTargetAt: futurePolicyTime } } as never), { applied: false, reason: 'invalid' });
-      const db = new DatabaseSync(databasePath);
+      const db = new DatabaseSync(databasePath);registerForgedTerminalSqlFunctions(db);
       assert.throws(() => db.exec("UPDATE career_commands SET queue_state='retry_wait', retry_due_at=updated_at WHERE command_id='sql-authority'"), /schedule authority/i);
       assert.throws(() => db.exec("UPDATE career_commands SET automatic_repeats_used=1, repeat_budget_remaining=4 WHERE command_id='sql-authority'"), /schedule authority/i);
       assert.throws(() => db.exec(`INSERT INTO career_commands
@@ -2237,7 +2337,7 @@ const rows: AcceptanceRow[] = [
   },
   {
     id: 'P10-policy-target-persistence-does-not-add-elapsed-time',
-    run: () => withQueueStore(({ store, databasePath }) => {
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
       store.enqueueCommand(queueInput('elapsed-policy'));
       const elapsedClaim = store.claimNextRunnable('elapsed-worker')!;
       dispatchAndMarkRunning(store, databasePath, elapsedClaim);
@@ -2253,7 +2353,7 @@ const rows: AcceptanceRow[] = [
       db.close();
       const elapsedResume = store.claimNextRunnable('elapsed-finish')!;
       assert.equal(store.markRunning({ ...elapsedResume, sourceState: 'resuming' }).applied, true);
-      assert.equal(store.completeClaim({ ...elapsedResume, sourceState: 'running' }, 'succeeded').applied, true);
+      assert.equal((await completeObserved(store,{ ...elapsedResume, sourceState: 'running' },'succeeded')).applied,true);
 
       store.enqueueCommand(queueInput('date-policy'));
       const dateClaim = store.claimNextRunnable('date-worker')!;
@@ -2285,7 +2385,7 @@ const rows: AcceptanceRow[] = [
       const parentCommandId = intake.commandId;
       const claim = store.claimNextRunnable('worker-terminal')!;
       dispatchAndMarkRunning(store, databasePath, claim);
-      assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...claim, sourceState: 'running' },'failed')).applied,true);
       const oldAuthorization = authorization.authorize({ channel: 'telegram', userId: '123', chatId: '456', privateChat: true });
       const forged = { ...oldAuthorization };
       assert.throws(() => store.createLinkedTerminalRetry({ parentCommandId, commandId: 'forged-child', attemptId: 'forged-attempt', requestId: 'forged-request', freshAuthorization: forged }), /authorization/i);
@@ -2303,7 +2403,7 @@ const rows: AcceptanceRow[] = [
       assert.equal(child.state, 'queued');
       const childClaim = store.claimNextRunnable('worker-terminal-child')!;
       dispatchAndMarkRunning(store, databasePath, childClaim);
-      assert.equal(store.completeClaim({ ...childClaim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...childClaim, sourceState: 'running' },'failed')).applied,true);
       assert.throws(() => store.createLinkedTerminalRetry({ parentCommandId: 'terminal-child', commandId: 'forged-grandchild', attemptId: 'forged-grandchild:attempt-1', requestId: 'forged-grandchild:request', freshAuthorization: { ...freshAuthorization } }), /authorization/i);
       assert.throws(() => store.createLinkedTerminalRetry({ parentCommandId: 'terminal-child', commandId: 'wrong-grandchild', attemptId: 'wrong-grandchild:attempt-1', requestId: 'wrong-grandchild:request', freshAuthorization: wrongPrincipal }), /principal/i);
       const grandchild = store.createLinkedTerminalRetry({ parentCommandId: 'terminal-child', commandId: 'terminal-grandchild', attemptId: 'terminal-grandchild:attempt-1', requestId: 'terminal-grandchild:request', freshAuthorization });
@@ -2318,11 +2418,11 @@ const rows: AcceptanceRow[] = [
       db.close();
       const grandchildClaim = store.claimNextRunnable('worker-terminal-grandchild')!;
       dispatchAndMarkRunning(store, databasePath, grandchildClaim);
-      assert.equal(store.completeClaim({ ...grandchildClaim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...grandchildClaim, sourceState: 'running' },'failed')).applied,true);
       store.enqueueCommand(queueInput('no-provenance', 2));
       const noProvenanceClaim = store.claimNextRunnable('worker-no-provenance')!;
       dispatchAndMarkRunning(store, databasePath, noProvenanceClaim);
-      assert.equal(store.completeClaim({ ...noProvenanceClaim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...noProvenanceClaim, sourceState: 'running' },'failed')).applied,true);
       assert.throws(() => store.createLinkedTerminalRetry({ parentCommandId: 'no-provenance', commandId: 'orphan-child', attemptId: 'orphan-child:attempt-1', requestId: 'orphan-child:request', freshAuthorization }), /provenance/i);
     }),
   },
@@ -2337,7 +2437,7 @@ const rows: AcceptanceRow[] = [
       let parentCommandId = intake.commandId;
       let claim = store.claimNextRunnable('lineage-worker-1')!;
       dispatchAndMarkRunning(store, databasePath, claim);
-      assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...claim, sourceState: 'running' },'failed')).applied,true);
       const freshAuthorization = authorization.authorize({ channel: 'telegram', userId: '123', chatId: '456', privateChat: true });
 
       for (let lineageLength = 2; lineageLength <= 99; lineageLength += 1) {
@@ -2345,7 +2445,7 @@ const rows: AcceptanceRow[] = [
         store.createLinkedTerminalRetry({ parentCommandId, commandId, attemptId: `${commandId}:attempt-1`, requestId: `${commandId}:request`, freshAuthorization });
         claim = store.claimNextRunnable(`lineage-worker-${lineageLength}`)!;
         dispatchAndMarkRunning(store, databasePath, claim);
-        assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed').applied, true);
+        assert.equal((await completeObserved(store,{ ...claim, sourceState: 'running' },'failed')).applied,true);
         parentCommandId = commandId;
       }
 
@@ -2353,7 +2453,7 @@ const rows: AcceptanceRow[] = [
       assert.equal(finalChild.state, 'queued');
       claim = store.claimNextRunnable('lineage-worker-100')!;
       dispatchAndMarkRunning(store, databasePath, claim);
-      assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed').applied, true);
+      assert.equal((await completeObserved(store,{ ...claim, sourceState: 'running' },'failed')).applied,true);
       assert.throws(() => store.createLinkedTerminalRetry({ parentCommandId: 'lineage-100', commandId: 'lineage-101', attemptId: 'lineage-101:attempt-1', requestId: 'lineage-101:request', freshAuthorization }), /lineage|provenance/i);
       assert.equal(store.getCommand('lineage-101'), undefined);
     }),
@@ -2476,7 +2576,7 @@ const rows: AcceptanceRow[] = [
       assert.throws(() => lateDb.prepare(`UPDATE career_commands SET queue_state='suspended', suspension_generation=1,
         blocker_id='late-blocker', processing_budget_remaining_ms=1, processing_deadline_at=NULL,
         suspension_started_at=?, lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
-        WHERE command_id='late-commit'`).run(lateNow - 10, lateNow - 10), /processing time|deadline|suspension transition requires blocker authority/i);
+        WHERE command_id='late-commit'`).run(lateNow - 10, lateNow - 10), /processing time|deadline|suspension transition requires blocker authority|career_terminal_command_/i);
       lateDb.close();
       assert.throws(() => new CareerStore(`file:${path.join(os.tmpdir(), 'deadline-too-long.db')}`, { processingDeadlineMs: 1_800_001 }), /processing deadline/i);
       assert.throws(() => new CareerStore(`file:${path.join(os.tmpdir(), 'deadline-invalid.db')}`, { processingDeadlineMs: 0 }), /processing deadline/i);
@@ -2549,6 +2649,462 @@ const rows: AcceptanceRow[] = [
     }),
   },
   {
+    id: 'P6-startup-order',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      const order: string[] = [];
+      const events: unknown[] = [];
+      let active = 0;
+      let peak = 0;
+      const lifecycle = new CareerWorkerLifecycle({
+        leaseOwner: 'worker-1', openStore: () => { order.push('open'); return store; },
+        validate: () => { order.push('validate'); },
+        reconcileAdapters: async () => { order.push('reconcile-adapters'); },
+        startComponents: async () => { order.push('components'); },
+        runner: { run: async (claim) => {
+          active += 1; peak = Math.max(peak, active);
+          const fence = { ...claim, sourceState: claim.queueState } as const;
+          store.markFirstRunCreated(fence); store.markFirstStartDispatching(fence); store.markFirstStartDispatched(fence);
+          store.recordFirstStartObservation(fence, 'success');
+          assert.equal(store.projectWorkflowTerminal(fence, {} as any).applied, false, 'structural objects are not snapshot authority');
+          const direct = new DatabaseSync(databasePath);
+          assert.throws(() => direct.prepare("UPDATE career_commands SET queue_state='succeeded' WHERE command_id=?").run(claim.commandId), /illegal queue transition|career_terminal_command_/i);
+          const now=Number((direct.prepare("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER) now").get() as {now:number}).now);
+          assert.throws(()=>direct.prepare(`INSERT INTO career_terminal_snapshot_observations
+            (command_id,run_id,resource_id,claim_generation,source_state,status,observed_at,auth_tag) VALUES (?,?,?,?,?,?,?,?)`).run(
+              fence.commandId,fence.runId,fence.ownerResourceId,fence.claimGeneration,fence.sourceState,'success',now,'0'.repeat(64)),/function|authority/i);
+          assert.throws(() => direct.prepare("UPDATE career_commands SET queue_state='succeeded' WHERE command_id=?").run(claim.commandId), /illegal queue transition|career_terminal_command_/i);
+          direct.close();
+          assert.equal(await store.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,'forged-resource','success')}),null);
+          assert.equal(await store.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,fence.ownerResourceId,'success','unrelated-workflow',1)}),null);
+          assert.equal(await store.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,fence.ownerResourceId,'success','save-job-v1',2)}),null);
+          const observation=await store.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,fence.ownerResourceId,'success')});
+          assert.ok(observation);
+          assert.equal(store.projectWorkflowTerminal({...fence,claimGeneration:fence.claimGeneration+1},observation).applied,false,'capability correlation is immutable');
+          active -= 1;
+          return { kind: 'workflow_terminal', observation };
+        } },
+        eventSink: (event) => { order.push(event.transition); events.push(event); },
+      });
+      await lifecycle.start();
+      assert.equal(lifecycle.health().ready, true);
+      assert.deepEqual(order.slice(0, 7), ['validate', 'open', 'store_opened', 'migrations_verified', 'reconciliation', 'reconcile-adapters', 'components']);
+      store.enqueueCommand(queueInput('terminal-projection'));
+      assert.deepEqual(await Promise.all([lifecycle.runOnce(), lifecycle.runOnce()]), [true, false]);
+      assert.equal(peak, 1);
+      assert.equal(store.getCommand('terminal-projection')?.queueState, 'succeeded');
+      assert.equal(store.projectWorkflowTerminal({ commandId:'terminal-projection',runId:'cc-save-v1:terminal-projection:1',ownerResourceId:'owner-1',
+        leaseOwner:'worker-1',claimGeneration:1,sourceState:'starting' }, {} as any).applied, false);
+      assert.equal(store.getCommand('terminal-projection')?.terminalGeneration, 1);
+      store.enqueueCommand(queueInput('running-terminal-evidence'));
+      const runningClaim=store.claimNextRunnable('running-worker')!;
+      assert.equal(dispatchAndMarkRunning(store,databasePath,runningClaim).applied,true);
+      const runningFence={...runningClaim,sourceState:'running' as const};
+      assert.equal(store.completeClaim(runningFence,'failed').applied,false,'completeClaim cannot invent snapshot authority');
+      assert.equal(store.projectWorkflowTerminal(runningFence,{} as any).applied,false);
+      const runningObservation=await store.observeWorkflowTerminalSnapshot(runningFence,{getWorkflowRunById:async()=>terminalSnapshot(runningFence.runId,runningFence.ownerResourceId,'failed')});
+      assert.ok(runningObservation);
+      assert.equal(store.projectWorkflowTerminal(runningFence,runningObservation).applied,true);
+      await withQueueStore(async({store:durableStore,databasePath:durablePath})=>{
+        durableStore.enqueueCommand(queueInput('durable-terminal-observation'));
+        const claim=durableStore.claimNextRunnable('durable-observer')!;assert.equal(dispatchAndMarkRunning(durableStore,durablePath,claim).applied,true);
+        const fence={...claim,sourceState:'running' as const};
+        const capability=await durableStore.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,fence.ownerResourceId,'success')});
+        assert.ok(capability);
+        const raw=new DatabaseSync(durablePath);
+        assert.throws(()=>raw.exec("UPDATE career_terminal_snapshot_observations SET status='failed'"),/immutable/i);
+        assert.throws(()=>raw.exec('DELETE FROM career_terminal_snapshot_observations'),/immutable/i);raw.close();
+        durableStore.close();
+        const storageModuleUrl=new URL('../src/storage/career-store.ts',import.meta.url).href;
+        await runNode(`import {CareerStore} from ${JSON.stringify(storageModuleUrl)};
+          const store=new CareerStore(${JSON.stringify(`file:${durablePath}`)},{terminalObservationRootKey:${JSON.stringify(terminalObservationRootKey)}});
+          const capability=store.loadTerminalSnapshotObservation(${JSON.stringify({commandId:'durable-terminal-observation',runId:'cc-save-v1:durable-terminal-observation:1',ownerResourceId:'owner-1',leaseOwner:'durable-observer',claimGeneration:1,sourceState:'running'})});
+          if(!capability)throw new Error('stable restart authority was not recovered');store.close();`);
+        const reopened=new CareerStore(`file:${durablePath}`,{terminalObservationRootKey});
+        assert.equal(reopened.projectWorkflowTerminal(fence,capability).applied,false,'capability is bound to its issuing runtime store');
+        const durableCapability=reopened.loadTerminalSnapshotObservation(fence);assert.ok(durableCapability);
+        assert.equal(reopened.projectWorkflowTerminal(fence,durableCapability).applied,true);reopened.close();
+      });
+      const corruptionDir=fs.mkdtempSync(path.join(os.tmpdir(),'career-terminal-integrity-'));
+      const sourcePath=path.join(corruptionDir,'source.db');const targetPath=path.join(corruptionDir,'target.db');
+      const sourceStore=new CareerStore(`file:${sourcePath}`,{terminalObservationRootKey} as any);
+      const targetStore=new CareerStore(`file:${targetPath}`,{terminalObservationRootKey} as any);
+      try{
+        for(const candidate of [sourceStore,targetStore])candidate.enqueueCommand(queueInput('cross-store-terminal'));
+        const targetClaim=targetStore.claimNextRunnable('cross-store-worker')!;assert.equal(dispatchAndMarkRunning(targetStore,targetPath,targetClaim).applied,true);
+        const sourceClaim=sourceStore.claimNextRunnable('cross-store-worker')!;assert.equal(dispatchAndMarkRunning(sourceStore,sourcePath,sourceClaim).applied,true);
+        const sourceFence={...sourceClaim,sourceState:'running' as const};
+        assert.ok(await sourceStore.observeWorkflowTerminalSnapshot(sourceFence,{getWorkflowRunById:async()=>terminalSnapshot(sourceFence.runId,sourceFence.ownerResourceId,'success')}));
+        const sourceRaw=new DatabaseSync(sourcePath,{readOnly:true});
+        const copied={...sourceRaw.prepare('SELECT * FROM career_terminal_snapshot_observations').get()!};sourceRaw.close();
+        const attacker=new DatabaseSync(targetPath);attacker.function('career_verify_terminal_observation',{deterministic:true,varargs:true},()=>1);
+        attacker.function('career_terminal_command_payload',{deterministic:true,varargs:true},()=>JSON.stringify(['forged-terminal-row']));
+        attacker.function('career_terminal_command_tag',{deterministic:true,varargs:true},()=> '0'.repeat(64));
+        attacker.function('career_verify_terminal_command_attestation',{deterministic:true,varargs:true},()=>1);
+        attacker.prepare(`INSERT INTO career_terminal_snapshot_observations
+          (command_id,run_id,resource_id,lease_owner,claim_generation,source_state,status,workflow_name,workflow_version,observed_at,auth_tag)
+          VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(copied.command_id,copied.run_id,copied.resource_id,copied.lease_owner,copied.claim_generation,
+            copied.source_state,copied.status,copied.workflow_name,copied.workflow_version,copied.observed_at,copied.auth_tag);
+        attacker.exec(`UPDATE career_commands SET queue_state='succeeded',lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+          terminal_generation=1,terminal_authority_version=1,completed_at=CAST(unixepoch('subsec')*1000 AS INTEGER),resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER),
+          updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE command_id='cross-store-terminal'`);
+        assert.equal(attacker.prepare("SELECT queue_state state FROM career_commands WHERE command_id='cross-store-terminal'").get()!.state,'succeeded',
+          'malicious writable connection can physically corrupt SQLite');attacker.close();
+        assert.throws(()=>targetStore.getCommand('cross-store-terminal'),/integrity/i,'trusted store rejects substituted-UDF cross-store replay');
+        assert.throws(()=>targetStore.lifecycleHealth(),/integrity/i,'health never reports forged terminal authority as valid');
+        assert.throws(()=>targetStore.reconcileLifecycle(),/integrity/i,'reconciliation fails closed on forged terminal authority');
+        targetStore.close();
+        assert.throws(()=>new CareerStore(`file:${targetPath}`,{terminalObservationRootKey} as any),/integrity/i,'startup rejects forged durable authority');
+        const legacyBypassPath=path.join(corruptionDir,'legacy-bypass.db');
+        const legacyBypassStore=new CareerStore(`file:${legacyBypassPath}`,{terminalObservationRootKey});
+        legacyBypassStore.enqueueCommand(queueInput('forged-legacy-terminal'));
+        const legacyClaim=legacyBypassStore.claimNextRunnable('legacy-forger')!;
+        assert.equal(dispatchAndMarkRunning(legacyBypassStore,legacyBypassPath,legacyClaim).applied,true);
+        const legacyRaw=new DatabaseSync(legacyBypassPath);
+        legacyRaw.function('career_terminal_command_payload',{deterministic:true,varargs:true},()=>JSON.stringify(['forged-terminal-row']));
+        legacyRaw.function('career_terminal_command_tag',{deterministic:true,varargs:true},()=> '0'.repeat(64));
+        legacyRaw.function('career_verify_terminal_command_attestation',{deterministic:true,varargs:true},()=>1);
+        const legalTrigger=String(legacyRaw.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='career_commands_legal_queue_transition'").get()!.sql);
+        legacyRaw.exec('DROP TRIGGER career_commands_legal_queue_transition');
+        legacyRaw.exec(`UPDATE career_commands SET queue_state='succeeded',terminal_authority_version=-1,terminal_generation=1,
+          lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,completed_at=CAST(unixepoch('subsec')*1000 AS INTEGER),
+          resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER),updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+          WHERE command_id='forged-legacy-terminal'`);
+        legacyRaw.exec(legalTrigger);legacyRaw.close();
+        assert.throws(()=>legacyBypassStore.getCommand('forged-legacy-terminal'),/terminal command.*integrity|integrity.*terminal command/i);
+        assert.throws(()=>legacyBypassStore.lifecycleHealth(),/terminal command.*integrity|integrity.*terminal command/i);
+        legacyBypassStore.close();
+        assert.throws(()=>new CareerStore(`file:${legacyBypassPath}`,{terminalObservationRootKey}),/terminal command.*integrity|integrity.*terminal command/i,
+          'byte-equivalent trigger restoration cannot forge migration provenance');
+        for(const forged of [
+          {id:'forged-timeout-zero',state:'timed_out',errorClass:'deadline',errorCode:'processing_deadline_expired'},
+          {id:'forged-failed-zero',state:'failed',errorClass:'evidence',errorCode:'forged_non_snapshot_failure'},
+        ] as const){
+          const forgedPath=path.join(corruptionDir,`${forged.id}.db`);const forgedStore=new CareerStore(`file:${forgedPath}`,{terminalObservationRootKey});
+          forgedStore.enqueueCommand(queueInput(forged.id));const claim=forgedStore.claimNextRunnable('authority-zero-forger')!;
+          assert.equal(dispatchAndMarkRunning(forgedStore,forgedPath,claim).applied,true);
+          const raw=new DatabaseSync(forgedPath);
+          raw.function('career_terminal_command_payload',{deterministic:true,varargs:true},()=>JSON.stringify(['forged-terminal-row']));
+          raw.function('career_terminal_command_tag',{deterministic:true,varargs:true},()=> '0'.repeat(64));
+          raw.function('career_verify_terminal_command_attestation',{deterministic:true,varargs:true},()=>1);
+          const trigger=String(raw.prepare("SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='career_commands_legal_queue_transition'").get()!.sql);
+          raw.exec('DROP TRIGGER career_commands_legal_queue_transition');
+          raw.prepare(`UPDATE career_commands SET queue_state=?,terminal_authority_version=0,terminal_generation=1,
+            lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,error_class=?,error_code=?,last_safe_error='Forged terminal bytes.',
+            completed_at=CAST(unixepoch('subsec')*1000 AS INTEGER),resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER),
+            updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER) WHERE command_id=?`).run(forged.state,forged.errorClass,forged.errorCode,forged.id);
+          raw.exec(trigger);raw.close();
+          assert.throws(()=>forgedStore.getCommand(forged.id),/terminal command.*integrity|integrity.*terminal command/i);
+          if(forged.state==='failed')assert.throws(()=>forgedStore.createLinkedTerminalRetry({parentCommandId:forged.id,commandId:'forged-child',attemptId:'forged-child-attempt',requestId:'forged-child-request',freshAuthorization:{} as any}),/integrity/i,
+            'linked retry cannot inherit forged terminal provenance');
+          forgedStore.close();assert.throws(()=>new CareerStore(`file:${forgedPath}`,{terminalObservationRootKey}),/terminal command.*integrity|integrity.*terminal command/i);
+        }
+      }finally{sourceStore.close();targetStore.close();fs.rmSync(corruptionDir,{recursive:true,force:true});}
+      await withTask8(async({store:resumeStore,capability,hashes,token})=>{
+        const input={commandId:token.commandId,runId:token.runId,suspensionId:token.suspensionId,suspendedStep:token.suspendedStep,
+          blockerKind:token.blockerKind,suspensionGeneration:token.suspensionGeneration,response:{schemaVersion:1 as const,kind:'confirmation' as const,value:'ready'},
+          ...hashes,resumeSchemaVersion:1 as const};
+        assert.equal(resumeStore.acceptSuspension(capability,input,'terminal-resumer',task8AcceptanceKey).outcome,'accepted');
+        const work=resumeStore.loadAcceptedResume(capability,token.suspensionId,task8AcceptanceKey)!;
+        assert.equal(resumeStore.markResumeApplying(work.fence,token.suspensionId).applied,true);
+        assert.equal(resumeStore.markResumeCallStarted(work.fence,token.suspensionId).applied,true);
+        assert.equal(resumeStore.markResumeCallReturned(work.fence,token.suspensionId).applied,true);
+        assert.deepEqual(resumeStore.reconcileResume(work.fence,token.suspensionId,'success'),{outcome:'applied'});
+        assert.equal(resumeStore.getCommand(token.commandId)!.queueState,'resuming');
+        const observation=await resumeStore.observeWorkflowTerminalSnapshot(work.fence,{getWorkflowRunById:async()=>terminalSnapshot(token.runId,token.resourceId,'success')});
+        assert.ok(observation);assert.equal(resumeStore.projectWorkflowTerminal(work.fence,observation).applied,true);
+        assert.equal(resumeStore.getCommand(token.commandId)!.terminalGeneration,1);
+      });
+      const serializedEvents = JSON.stringify(events);
+      for (const canary of ['https://secret.invalid/job', 'RAW_PROFILE_CANARY', 'token-canary']) assert.equal(serializedEvents.includes(canary), false);
+      await lifecycle.drain();
+      await lifecycle.waitForShutdown();
+      assert.equal(lifecycle.health().database,false);
+      await assert.rejects(()=>lifecycle.start(),/single-use/i);
+      const attestedStore=new CareerStore(`file:${databasePath}`,{terminalObservationRootKey});
+      const attestedEvents: string[] = [];
+      const attested = new CareerWorkerLifecycle({ leaseOwner:'worker-attested',store:attestedStore,
+        bootstrapAttestation:Object.freeze({ configurationValidated:true,storeOpened:true,migrationsVerified:true }),
+        closeResources:()=>attestedStore.close(),eventSink:(event)=>attestedEvents.push(event.transition),runner:{run:async()=>({kind:'checkpoint'})} });
+      await attested.start();
+      assert.equal(attestedEvents.includes('bootstrap_attested'),true);
+      assert.equal(attestedEvents.includes('store_opened'),false);
+      await attested.drain(); await attested.waitForShutdown();
+      const falseEvents:string[]=[];
+      const falseAttestation=new CareerWorkerLifecycle({leaseOwner:'worker-false',store:attestedStore,
+        bootstrapAttestation:{configurationValidated:true,storeOpened:true,migrationsVerified:false} as any,
+        eventSink:(event)=>falseEvents.push(event.transition),runner:{run:async()=>({kind:'checkpoint'})}});
+      await assert.rejects(()=>falseAttestation.start(),/attestation/i);
+      assert.equal(falseAttestation.health().ready,false);
+      assert.equal(falseEvents.includes('store_opened')||falseEvents.includes('migrations_verified'),false);
+      const failed = new CareerWorkerLifecycle({ leaseOwner: 'worker-fail', store:attestedStore,
+        validate: () => { throw new Error('invalid config'); }, runner: { run: async () => ({ kind: 'checkpoint' }) } });
+      await assert.rejects(() => failed.start(), /invalid config/);
+      assert.equal(failed.health().ready, false);
+      const rollbackPath=path.join(path.dirname(databasePath),'startup-rollback.db');
+      let rollbackCleanup=0;let rollbackClose=0;
+      const rollback=new CareerWorkerLifecycle({leaseOwner:'worker-rollback',validate:()=>{},openStore:()=>new CareerStore(`file:${rollbackPath}`),
+        reconcileAdapters:()=>{throw new Error('adapter recovery failed');},cleanupOwnedResources:()=>{rollbackCleanup+=1;},
+        closeResources:()=>{rollbackClose+=1;},runner:{run:async()=>({kind:'checkpoint'})}});
+      await assert.rejects(()=>rollback.start(),/adapter recovery failed/);
+      assert.equal(rollback.state,'degraded');
+      assert.equal(rollback.health().database,false);
+      assert.equal(rollbackCleanup,1);assert.equal(rollbackClose,1);
+      const reopenedRollback=new CareerStore(`file:${rollbackPath}`);reopenedRollback.close();
+      const runtimeRoot=fs.mkdtempSync(path.join(os.tmpdir(),'career-runtime-close-'));
+      const runtimeConfig=resolveRuntimeConfig({dataDir:runtimeRoot,env:{CAREER_COPILOT_OWNER_RESOURCE_ID:'owner-v0',CAREER_COPILOT_INTAKE_HASH_KEY:'k'.repeat(32),GOOGLE_SHEETS_SPREADSHEET_ID:'sheet'}});
+      const runtime=createCareerCopilotRuntime(runtimeConfig,{commandRunner:{run:async()=>({kind:'checkpoint'})}});
+      await runtime.startWorker();
+      assert.throws(()=>runtime.close(),/awaited shutdown/i);
+      await runtime.shutdown();
+      assert.equal(runtime.worker!.health().database,false);
+      assert.equal(runtime.worker!.health().ready,false);
+      assert.throws(()=>runtime.close(),/awaited shutdown/i);
+      fs.rmSync(runtimeRoot,{recursive:true,force:true});
+      const neverRoot=fs.mkdtempSync(path.join(os.tmpdir(),'career-runtime-never-started-'));
+      const neverRuntime=createCareerCopilotRuntime(resolveRuntimeConfig({dataDir:neverRoot,env:{CAREER_COPILOT_OWNER_RESOURCE_ID:'owner-v0',CAREER_COPILOT_INTAKE_HASH_KEY:'k'.repeat(32),GOOGLE_SHEETS_SPREADSHEET_ID:'sheet'}}),
+        {commandRunner:{run:async()=>({kind:'checkpoint'})}});
+      assert.doesNotThrow(()=>neverRuntime.close());
+      fs.rmSync(neverRoot,{recursive:true,force:true});
+    }),
+  },
+  {
+    id: 'P6-idle-enqueue-wakeup',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      const timer = new ControllableScheduler();
+      const wake = new WorkerWakeSignal();
+      let runs = 0;
+      const lifecycle = new CareerWorkerLifecycle({ leaseOwner: 'worker-1', store, timer, wakeSignal: wake, bootstrapAttestation:verifiedBootstrap,
+        eventSink: () => { throw new Error('telemetry unavailable'); },
+        runner: { run: async () => { runs += 1; return { kind: 'checkpoint' }; } } });
+      await lifecycle.start();
+      store.enqueueCommand(queueInput('wake-command'));
+      lifecycle.notifyEnqueued();
+      assert.equal(timer.pendingDelays()[0], 0);
+      await timer.advanceBy(0);
+      assert.equal(runs, 1);
+      assert.equal(lifecycle.health().ready, true);
+      await lifecycle.drain();
+      await lifecycle.waitForShutdown();
+      store.enqueueCommand(queueInput('recurring-cycles'));
+      const cycleTimer=new ControllableScheduler();const cycleEvents:string[]=[];let releaseCycles!:()=>void;
+      const cycleGate=new Promise<void>(resolve=>{releaseCycles=resolve;});
+      const cycles=new CareerWorkerLifecycle({leaseOwner:'worker-cycles',store,timer:cycleTimer,bootstrapAttestation:verifiedBootstrap,
+        eventSink:event=>cycleEvents.push(event.transition),runner:{run:async()=>{await cycleGate;return{kind:'checkpoint'};}}});
+      await cycles.start();const cycleWork=cycles.runOnce();
+      await cycleTimer.advanceBy(60_000);
+      assert.equal(cycleEvents.filter(event=>event==='heartbeat').length,2);
+      assert.ok(cycleEvents.filter(event=>event==='reconciliation').length>=3);
+      const cycleDrain=cycles.drain();releaseCycles();await cycleWork;await cycleDrain;await cycles.waitForShutdown();
+      assert.deepEqual(cycleTimer.pendingDelays(),[],'prompt settlement clears its drain deadline timer');
+      store.enqueueCommand(queueInput('heartbeat-lease-loss'));
+      const lossTimer=new ControllableScheduler();let lossRuns=0;let lossCleanup=0;const lossEvents:string[]=[];
+      const losing=new CareerWorkerLifecycle({leaseOwner:'worker-lease-loss',store,timer:lossTimer,heartbeatMs:1,bootstrapAttestation:verifiedBootstrap,
+        eventSink:event=>lossEvents.push(event.transition),cleanupOwnedResources:()=>{lossCleanup+=1;},runner:{run:async(_claim,signal)=>{
+          lossRuns+=1;await new Promise<void>(resolve=>signal.addEventListener('abort',()=>resolve(),{once:true}));return {kind:'checkpoint'};}}});
+      await losing.start();const lossWork=losing.runOnce();
+      const lossDb=new DatabaseSync(databasePath);lossDb.prepare("UPDATE career_commands SET lease_expires_at=0 WHERE command_id='heartbeat-lease-loss'").run();lossDb.close();
+      await lossTimer.advanceBy(1);await lossWork;
+      assert.equal(lossEvents.filter(event=>event==='lease_lost').length,1);assert.equal(lossCleanup,1);
+      assert.equal(store.getCommand('heartbeat-lease-loss')!.terminalGeneration,0);
+      const lossInspect=new DatabaseSync(databasePath,{readOnly:true});
+      assert.equal(lossInspect.prepare("SELECT count(*) count FROM career_terminal_snapshot_observations WHERE command_id='heartbeat-lease-loss'").get()!.count,0);lossInspect.close();
+      const lossGeneration=store.getCommand('heartbeat-lease-loss')!.claimGeneration;
+      await lossTimer.advanceBy(30_000);
+      assert.equal(lossRuns,1);assert.equal(store.getCommand('heartbeat-lease-loss')!.claimGeneration,lossGeneration,'lease loss stops further claim churn');
+      await losing.drain();await losing.waitForShutdown();
+      store.enqueueCommand(queueInput('throwing-runner'));
+      const failureTimer = new ControllableScheduler();
+      const failures: string[] = [];
+      const failing = new CareerWorkerLifecycle({leaseOwner:'worker-failure',store,timer:failureTimer,
+        bootstrapAttestation:verifiedBootstrap,eventSink:(event)=>failures.push(event.transition),
+        cleanupOwnedResources:async()=>{throw new Error('cleanup failed');},runner:{run:async()=>{throw new Error('runner failed');}}});
+      await failing.start();
+      failing.notifyEnqueued();
+      await failureTimer.advanceBy(0);
+      assert.equal(failing.health().ready,false);
+      assert.equal(failures.includes('worker_failure'),true);
+      assert.equal(failures.includes('cleanup_failure'),true);
+      await failing.drain(); await failing.waitForShutdown();
+      const reconciliationTimer = new ControllableScheduler();
+      const reconciliation = new CareerWorkerLifecycle({leaseOwner:'worker-reconcile',store,timer:reconciliationTimer,
+        bootstrapAttestation:verifiedBootstrap,runner:{run:async()=>({kind:'checkpoint'})}});
+      await reconciliation.start();
+      const original = store.reconcileLifecycle.bind(store);
+      (store as any).reconcileLifecycle=()=>{throw new Error('database unavailable');};
+      await reconciliationTimer.advanceBy(30_000);
+      assert.equal(reconciliation.health().ready,false);
+      (store as any).reconcileLifecycle=original;
+      await reconciliation.drain(); await reconciliation.waitForShutdown();
+    }),
+  },
+  {
+    id: 'P6-five-second-fallback-poll',
+    run: async () => withQueueStore(async ({ store }) => {
+      const timer = new ControllableScheduler();
+      const lifecycle = new CareerWorkerLifecycle({ leaseOwner: 'worker-1', store, timer, bootstrapAttestation:verifiedBootstrap,
+        runner: { run: async () => ({ kind: 'checkpoint' }) } });
+      await lifecycle.start();
+      assert.ok(timer.pendingDelays().includes(5_000));
+      await timer.advanceBy(5_000);
+      assert.ok(timer.pendingDelays().includes(5_000), 'fallback poll must recur');
+      store.enqueueCommand(queueInput('nearest-due'));
+      const claim = store.claimNextRunnable('retry-seeder')!;
+      dispatchAndMarkRunning(store, '', claim);
+      assert.equal(scheduleTestRetry(store, { ...claim, sourceState: 'running' }, 1_000).applied, true);
+      lifecycle.notifyEnqueued();
+      await timer.advanceBy(0);
+      assert.ok(timer.pendingDelays().some((value) => value > 0 && value < 5_000), 'nearest durable due must arm the worker loop');
+      const base={leaseOwner:'invalid-timer',store,timer,bootstrapAttestation:verifiedBootstrap,runner:{run:async()=>({kind:'checkpoint' as const})}};
+      assert.throws(() => new CareerWorkerLifecycle({...base,fallbackPollMs:5_001}), /fallback/i);
+      assert.throws(() => new CareerWorkerLifecycle({...base,heartbeatMs:30_001}), /heartbeat/i);
+      assert.throws(() => new CareerWorkerLifecycle({...base,reconcileMs:30_001}), /reconciliation/i);
+      assert.throws(() => new CareerWorkerLifecycle({...base,drainDeadlineMs:30_001}), /drain/i);
+      await lifecycle.drain();
+      await lifecycle.waitForShutdown();
+    }),
+  },
+  {
+    id: 'P6-restart-visible-retry',
+    run: async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-restart-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const first = new CareerStore(`file:${databasePath}`);
+        first.enqueueCommand(queueInput('restart-retry'));
+        const claim = first.claimNextRunnable('worker-1')!;
+        assert.equal(dispatchAndMarkRunning(first, databasePath, claim).applied, true);
+        assert.equal(scheduleTestRetry(first, { ...claim, sourceState: 'running' }, 0).applied, true);
+        first.close();
+        const restarted = new CareerStore(`file:${databasePath}`);
+        const reclaimed = restarted.claimNextRunnable('worker-2');
+        assert.equal(reclaimed?.commandId, 'restart-retry');
+        assert.equal(reclaimed?.queueState, 'resuming');
+        restarted.close();
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    },
+  },
+  {
+    id: 'P6-stuck-lease-recovery',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('stuck-lease'));
+      const stale = store.claimNextRunnable('worker-old')!;
+      await delay(8);
+      const old = store.reconcileLifecycle();
+      assert.equal(old.expiredLeaseCycles, 2, 'one sufficiently old lease is stuck');
+      const reopened = new CareerStore(`file:${databasePath}`, { leaseMs:5,reconciliationMs:1 });
+      assert.equal(reopened.reconcileLifecycle().expiredLeaseCycles,2,'stuckness survives restart');
+      reopened.close();
+      const recovered = store.claimNextRunnable('worker-new')!;
+      assert.equal(recovered.commandId, stale.commandId);
+      assert.equal(recovered.claimGeneration, stale.claimGeneration + 1);
+      assert.equal(store.renewClaim({ ...stale, sourceState: stale.queueState }).applied, false);
+      const fence = { ...recovered,sourceState:recovered.queueState } as const;
+      assert.equal(store.markFirstRunCreated(fence).applied,true);
+      assert.equal(store.markFirstStartDispatching(fence).applied,true);
+      assert.equal(store.markFirstStartUnknown(fence).applied,true);
+      await delay(8);
+      assert.equal(store.nextRunnableDueAt(),null,'start_unknown is operator-only');
+      assert.equal(store.claimNextRunnable('worker-churn'),null,'start_unknown must not churn generations');
+      assert.ok(store.lifecycleHealth().oldestRunnableAgeMs >= 0);
+      await withQueueStore(async({store:distinct})=>{
+        distinct.enqueueCommand(queueInput('distinct-leases'));
+        distinct.claimNextRunnable('lease-a');
+        await delay(6);
+        assert.equal(distinct.reconcileLifecycle().expiredLeaseCycles,1);
+        distinct.claimNextRunnable('lease-b');
+        await delay(6);
+        assert.equal(distinct.reconcileLifecycle().expiredLeaseCycles,1,'a different young expired lease is not two-cycle stuck');
+      },{leaseMs:5,reconciliationMs:10});
+      await withTask8(async ({store:resumeStore,capability,hashes})=>{
+        const accepted=resumeStore.acceptSuspension(capability,{commandId:'task7-command',runId:'cc-save-v1:task7-command:1',suspensionId:'task8-blocker',
+          suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required',suspensionGeneration:1,
+          response:{schemaVersion:1,kind:'confirmation',value:'ready'},...hashes,resumeSchemaVersion:1},'resume-worker',task8AcceptanceKey);
+        assert.equal(accepted.outcome,'accepted');
+        await delay(510);
+        assert.equal(resumeStore.nextRunnableDueAt(),null,'blocker-bound resuming is adapter-only');
+        assert.equal(resumeStore.claimNextRunnable('generic-worker'),null);
+      },{leaseMs:500});
+    }, { leaseMs: 5, reconciliationMs:1 }),
+  },
+  {
+    id: 'P6-thirty-second-drain',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('drain-owned'));
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      let cleaned = 0;
+      let closed = 0;
+      const events: string[] = [];
+      const timer = new ControllableScheduler();
+      const lifecycle = new CareerWorkerLifecycle({ leaseOwner: 'worker-1', store, timer, bootstrapAttestation:verifiedBootstrap,
+        cleanupOwnedResources: async () => { cleaned += 1; }, closeResources: async () => { closed += 1; },
+        eventSink:(event)=>events.push(event.transition),
+        runner: { run: async () => { await blocked; return { kind: 'checkpoint' }; } } });
+      await lifecycle.start();
+      const work = lifecycle.runOnce();
+      const draining = lifecycle.drain();
+      await timer.advanceBy(30_000);
+      await draining;
+      assert.equal(lifecycle.state, 'draining', 'abort-ignoring work must not report stopped');
+      assert.equal(lifecycle.health().ready, false);
+      assert.equal(events.includes('heartbeat'), true, 'heartbeat continues while draining');
+      assert.equal(cleaned, 0);
+      assert.equal(closed, 0);
+      release();
+      await work;
+      await lifecycle.waitForShutdown();
+      assert.equal(lifecycle.state, 'stopped');
+      assert.equal(cleaned, 1);
+      assert.equal(closed, 1);
+      store.enqueueCommand(queueInput('drain-cooperative'));
+      const cooperativeTimer = new ControllableScheduler();
+      let cooperativeCleanup = 0;
+      let cooperativeClose = 0;
+      const cooperativeEvents:string[]=[];
+      const cooperative = new CareerWorkerLifecycle({leaseOwner:'worker-2',store,timer:cooperativeTimer,bootstrapAttestation:verifiedBootstrap,
+        cleanupOwnedResources:async()=>{cooperativeCleanup+=1;},closeResources:async()=>{cooperativeClose+=1;},
+        eventSink:(event)=>cooperativeEvents.push(event.transition),
+        runner:{run:async(_claim,signal)=>new Promise((resolve)=>signal.addEventListener('abort',()=>resolve({kind:'checkpoint'}),{once:true}))}});
+      await cooperative.start();
+      const cooperativeWork = cooperative.runOnce();
+      const cooperativeDrain = cooperative.drain();
+      await cooperativeTimer.advanceBy(30_000);
+      await cooperativeDrain;
+      await cooperativeWork;
+      await cooperative.waitForShutdown();
+      assert.equal(cooperative.state,'stopped');
+      assert.equal(cooperativeCleanup,1);
+      assert.equal(cooperativeClose,1);
+      assert.equal(cooperativeEvents.includes('heartbeat'),true);
+      assert.equal(cooperativeEvents.includes('lease_lost'),false,'drain deadline itself performs the cooperative abort');
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const state = database.prepare("SELECT queue_state state FROM career_commands WHERE command_id='drain-owned'").get() as { state: string };
+      database.close();
+      assert.notEqual(state.state, 'cancelled');
+    }),
+  },
+  {
+    id: 'P6-browser-mutex-cleanup',
+    run: async () => {
+      const scheduler = new ControllableScheduler();
+      const mutex = new GlobalResourceMutex(scheduler);
+      await assert.rejects(() => mutex.runExclusive(async () => { throw new Error('fixture'); }, 30), /fixture/);
+      assert.equal(mutex.locked, false);
+      await mutex.runExclusive(async () => undefined, 30);
+      assert.equal(mutex.locked, false);
+      let release!: () => void;
+      const held = mutex.runExclusive(() => new Promise<void>((resolve) => { release = resolve; }), 30);
+      await Promise.resolve();
+      const waiting = mutex.runExclusive(async () => undefined, 30);
+      await scheduler.advanceBy(30);
+      await assert.rejects(() => waiting, /deadline/i);
+      await assert.rejects(() => mutex.runExclusive(async () => undefined, 30_001), /maximum|wait/i);
+      release();
+      await held;
+      assert.equal(mutex.locked, false);
+    },
+  },
+  {
     id: 'P18-authority-order',
     run: async () => {
       const contracts = await loadV0Contracts();
@@ -2578,12 +3134,49 @@ for (const row of rows) {
   test(row.id, { timeout: 90_000 }, row.run);
 }
 
+class ControllableScheduler implements LifecycleTimer {
+  private sequence = 0;
+  private time: number;
+  private readonly tasks = new Map<number, { at: number; callback: () => void }>();
+  constructor(now = Date.now()) { this.time = now; }
+  setTimeout(callback: () => void, delayMs: number): number {
+    const id = ++this.sequence;
+    this.tasks.set(id, { at: this.time + delayMs, callback });
+    return id;
+  }
+  clearTimeout(handle: unknown): void { this.tasks.delete(Number(handle)); }
+  now(): number { return this.time; }
+  delay(delayMs: number): Promise<void> { return new Promise((resolve) => { this.setTimeout(resolve, delayMs); }); }
+  pendingDelays(): number[] { return [...this.tasks.values()].map(({ at }) => at - this.time).sort((a, b) => a - b); }
+  async advanceBy(delayMs: number): Promise<void> {
+    const target = this.time + delayMs;
+    while (true) {
+      const next = [...this.tasks.entries()].filter(([, task]) => task.at <= target).sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+      if (!next) break;
+      this.time = next[1].at;
+      this.tasks.delete(next[0]);
+      next[1].callback();
+      await Promise.resolve();
+      await Promise.resolve();
+    }
+    this.time = target;
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+}
+
 type QueueFixture = { store: CareerStore; databasePath: string };
 
-function withQueueStore<T>(run: (fixture: QueueFixture) => T, options: { leaseMs?: number; processingDeadlineMs?: number } = {}): T {
+function registerForgedTerminalSqlFunctions(database:DatabaseSync){
+  database.function('career_terminal_command_payload',{deterministic:true,varargs:true},()=>JSON.stringify(['forged-test-terminal-row']));
+  database.function('career_terminal_command_tag',{deterministic:true,varargs:true},()=> '0'.repeat(64));
+  database.function('career_verify_terminal_command_attestation',{deterministic:true,varargs:true},()=>1);
+}
+
+function withQueueStore<T>(run: (fixture: QueueFixture) => T, options: { leaseMs?: number; processingDeadlineMs?: number; reconciliationMs?: number } = {}): T {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-queue-'));
   const databasePath = path.join(dir, 'operational.db');
-  const store = new CareerStore(`file:${databasePath}`, options);
+  const store = new CareerStore(`file:${databasePath}`, { ...options,terminalObservationRootKey });
   try {
     const result = run({ store, databasePath });
     if (result instanceof Promise) return result.finally(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); }) as T;
@@ -2619,6 +3212,13 @@ function testRetryAfterPolicy(attempt: number, retryAfter: string) {
   const delayMs = Number(retryAfter) * 1_000;
   return { retry: true as const, delayMs, attempt, calculatedAt, policyTargetAt: calculatedAt + delayMs, source: 'retry_after' as const, retryAfter };
 }
+async function completeObserved(store:CareerStore,fence:Parameters<CareerStore['completeClaim']>[0],outcome:'succeeded'|'failed') {
+  const status=outcome==='succeeded'?'success':'failed';
+  const observation=await store.observeWorkflowTerminalSnapshot(fence,{getWorkflowRunById:async()=>terminalSnapshot(fence.runId,fence.ownerResourceId,status)});
+  assert.ok(observation);
+  return store.completeClaim(fence,outcome);
+}
+
 function scheduleTestRetry(store: CareerStore, fence: Parameters<CareerStore['scheduleRetry']>[0], delayMs = 0) {
   retryFixtureSequence += 1;
   const result = store.scheduleRetry(fence, {
