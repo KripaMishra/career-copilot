@@ -40,17 +40,22 @@ export type RuntimeConfig = {
   };
 };
 
-function assertPersistentDatabaseUrl(databaseUrl: string) {
-  if (databaseUrl.startsWith('file:') && !databaseUrl.startsWith('file:/')) {
-    throw new Error('MASTRA_DATABASE_URL must use an absolute file URL.');
+export function assertOperationalDatabaseUrl(databaseUrl: string): string {
+  let url: URL;
+  try {
+    url = new URL(databaseUrl);
+  } catch {
+    throw new Error('MASTRA_DATABASE_URL must use one absolute local file: database URL.');
   }
-
-  const protocol = new URL(databaseUrl).protocol;
-
-  if (!['file:', 'libsql:', 'https:'].includes(protocol)) {
-    throw new Error('MASTRA_DATABASE_URL must use file, libsql, or HTTPS.');
-  }
-
+  if (
+    !databaseUrl.startsWith('file:/')
+    || url.protocol !== 'file:'
+    || (url.hostname !== '' && url.hostname !== 'localhost')
+    || !path.isAbsolute(url.pathname)
+    || url.pathname === '/:memory:'
+    || url.search !== ''
+    || url.hash !== ''
+  ) throw new Error('MASTRA_DATABASE_URL must use one absolute local file: database URL.');
   return databaseUrl;
 }
 
@@ -102,7 +107,7 @@ export function resolveRuntimeConfig(input: RuntimeConfigInput = {}): RuntimeCon
   fs.mkdirSync(reportsPath, { recursive: true });
   fs.mkdirSync(topicsPath, { recursive: true });
 
-  const databaseUrl = assertPersistentDatabaseUrl(
+  const databaseUrl = assertOperationalDatabaseUrl(
     configuredDatabaseUrl ?? `file:${path.join(absoluteDataDir, 'mastra.db')}`,
   );
   const spreadsheetId = requireDeployment

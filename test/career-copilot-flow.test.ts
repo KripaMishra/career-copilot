@@ -18,11 +18,8 @@ function dependencies(events: string[], overrides: Record<string, unknown> = {})
       claimRequest: async () => { events.push('claim-request'); return true; },
       claim: async () => { events.push('claim'); return { claimed: true, record: { key: 'url:x', firstRequestId: 'telegram:1:2', sightings: 0 } }; },
       recordSighting: async () => { events.push('sighting'); },
-      createOutbox: async () => { events.push('outbox:create'); },
-      markOutbox: async (_requestId: string, step: string, state: string) => { events.push(`outbox:${step}:${state}`); },
       markSucceeded: async () => { events.push('state:succeeded'); },
       markFailed: async () => { events.push('state:failed'); },
-      getOutbox: async () => [],
     },
     sheets: {
       readTracker: async () => { events.push('read-tracker'); return []; },
@@ -45,15 +42,8 @@ test('runs accepted jobs in ordered, fail-closed write sequence and leaves unkno
   const result = await new CareerCopilotService(dependencies(events)).process(update);
   assert.equal(result.outcome, 'reviewed');
   assert.deepEqual(events, [
-    'claim-request', 'claim', 'outbox:create',
-    'outbox:tracker:pending', 'read-tracker', 'outbox:tracker:succeeded', 'create-tracker',
-    'outbox:fetch:pending', 'fetch', 'outbox:fetch:succeeded',
-    'outbox:profile:pending', 'profile', 'outbox:profile:succeeded',
-    'outbox:report:pending', 'report', 'outbox:report:succeeded',
-    'outbox:topics:pending', 'topics', 'outbox:topics:succeeded',
-    'outbox:audit-prepared:pending', 'sheets-audit:prepared', 'outbox:audit-prepared:succeeded',
-    'outbox:tracker-reviewed:pending', 'tracker:reviewed', 'verify-tracker', 'outbox:tracker-reviewed:succeeded',
-    'outbox:audit-reviewed:pending', 'sheets-audit:reviewed', 'outbox:audit-reviewed:succeeded', 'state:succeeded',
+    'claim-request', 'claim', 'read-tracker', 'create-tracker', 'fetch', 'profile', 'report', 'topics',
+    'sheets-audit:prepared', 'tracker:reviewed', 'verify-tracker', 'sheets-audit:reviewed', 'state:succeeded',
   ]);
 });
 

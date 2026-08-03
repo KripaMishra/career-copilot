@@ -26,13 +26,13 @@ test('creates the data directory for local storage', () => {
   fs.rmSync(dataDir, { recursive: true });
 });
 
-test('keeps an explicitly configured database URL', () => {
-  const databaseUrl = 'libsql://career-copilot.example.turso.io';
-
-  assert.equal(
-    resolveRuntimeConfig({ dataDir: '/tmp/career-copilot', databaseUrl, env: {} }).databaseUrl,
-    databaseUrl,
-  );
+test('rejects remote operational database URLs', () => {
+  for (const databaseUrl of ['libsql://career-copilot.example.turso.io', 'https://career-copilot.example']) {
+    assert.throws(
+      () => resolveRuntimeConfig({ dataDir: '/tmp/career-copilot', databaseUrl, env: {} }),
+      /absolute local file/,
+    );
+  }
 });
 
 test('separates approved read-only profile paths from writable report and topic paths', () => {
@@ -83,6 +83,6 @@ test('accepts explicit deployment configuration without reading process environm
 test('rejects relative file database URLs', () => {
   assert.throws(
     () => resolveRuntimeConfig({ databaseUrl: 'file:./mastra.db', env: {} }),
-    /absolute file URL/,
+    /absolute local file/,
   );
 });

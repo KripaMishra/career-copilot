@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { assertJobUrl, assertSameJobSite } from '../tools/job-url.ts';
 import { createCareerFilesystemBoundaries } from '../integrations/local-files.ts';
 import { GoogleOAuthRefreshProvider, GoogleSheetsBoundary, GoogleSheetsHttpApi, createGoogleSheetsTools, type SheetsApi } from '../integrations/google-sheets.ts';
-import { SqliteIdempotencyStore } from '../storage/idempotency.ts';
+import { CareerStore } from '../storage/career-store.ts';
 import { CareerCopilotService, type CareerCopilotDependencies, type CareerJob } from './career-copilot.ts';
 import { createTelegramIngress } from '../channels/telegram-ingress.ts';
 import type { RuntimeConfig } from '../config/runtime.ts';
@@ -27,7 +27,7 @@ async function fetchUntrustedJob(url: string): Promise<CareerJob> {
 
 export function createCareerCopilotRuntime(config: RuntimeConfig, overrides: CareerCopilotRuntimeOverrides = {}) {
   const filesystem = createCareerFilesystemBoundaries({ profile: config.profilePath, reports: config.reportsPath, topics: config.topicsPath });
-  const idempotency = overrides.idempotency ?? new SqliteIdempotencyStore(config.databaseUrl);
+  const idempotency = overrides.idempotency ?? new CareerStore(config.databaseUrl);
   const oauth = new GoogleOAuthRefreshProvider(config.sheetsOAuth);
   const concreteSheets = new GoogleSheetsBoundary({
     target: config.sheetsTarget,

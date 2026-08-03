@@ -4,7 +4,7 @@ import {
   type TelegramAuditWriter,
   type TelegramUpdate,
 } from '../channels/telegram-auth.ts';
-import { buildJobIdempotencyKey, type OutboxEntry } from '../storage/idempotency.ts';
+import { buildJobIdempotencyKey } from '../storage/career-store.ts';
 
 export type CareerJob = { url: string; company?: string; title?: string; location?: string; description?: string; sourceHash?: string };
 
@@ -20,11 +20,8 @@ type DurableJobState = {
   claimRequest(requestId: string): Promise<boolean>;
   claim(key: string, requestId: string): Promise<{ claimed: boolean; record: unknown }>;
   recordSighting(key: string, requestId: string, sourceId: string): Promise<void>;
-  createOutbox(requestId: string, steps: string[], payload?: Record<string, unknown>): Promise<void>;
-  markOutbox(requestId: string, step: string, state: 'pending' | 'succeeded' | 'failed'): Promise<void>;
   markSucceeded(key: string, requestId: string): Promise<void>;
   markFailed(key: string, requestId: string, error?: string): Promise<void>;
-  getOutbox(requestId: string): Promise<OutboxEntry[]> | OutboxEntry[];
 };
 
 export type CareerCopilotDependencies = {
@@ -45,15 +42,9 @@ type FlowResult =
   | { outcome: 'reviewed'; requestId: string }
   | { outcome: 'failed'; requestId: string; error: string };
 
-const outboxSteps = ['tracker', 'fetch', 'profile', 'report', 'topics', 'audit-prepared', 'tracker-reviewed', 'audit-reviewed'];
-
 export class CareerCopilotService {
   private readonly dependencies: CareerCopilotDependencies;
   constructor(dependencies: CareerCopilotDependencies) { this.dependencies = dependencies; }
-
-  async reconcile(requestId: string): Promise<OutboxEntry[]> {
-    return this.dependencies.idempotency.getOutbox(requestId);
-  }
 
   async process(update: TelegramUpdate, context: { alert?: (message: string) => Promise<void> } | ((message: string) => Promise<void>) = {}): Promise<FlowResult> {
     const { dependencies } = this;
@@ -77,21 +68,8 @@ export class CareerCopilotService {
     let rowNumber = -1;
     let previousStatus = '';
     let trackerChanged = false;
-    const step = async <T>(name: string, operation: () => Promise<T>): Promise<T> => {
-      await dependencies.idempotency.markOutbox(requestId, name, 'pending');
-      try {
-        const result = await operation();
-        await dependencies.idempotency.markOutbox(requestId, name, 'succeeded');
-        return result;
-      } catch (error) {
-        await dependencies.idempotency.markOutbox(requestId, name, 'failed');
-        throw error;
-      }
-    };
-
     try {
-      await dependencies.idempotency.createOutbox(requestId, outboxSteps, { key, url });
-      const rows = await step('tracker', () => dependencies.sheets.readTracker());
+      const rows = await dependencies.sheets.readTracker();
       rowNumber = rows.findIndex((row) => row.URL === url);
       if (rowNumber < 0) {
         rowNumber = rows.length;
@@ -102,25 +80,23 @@ export class CareerCopilotService {
         trackerChanged = true;
       }
 
-      const job = await step('fetch', () => dependencies.fetchJob(url));
-      const profile = await step('profile', () => dependencies.profile.readApproved());
-      const report = await step('report', () => dependencies.report.write({ job, profile }));
-      await step('topics', () => dependencies.topics.write({ job }));
-      await step('audit-prepared', () => dependencies.sheets.appendAudit({
+      const job = await dependencies.fetchJob(url);
+      const profile = await dependencies.profile.readApproved();
+      const report = await dependencies.report.write({ job, profile });
+      await dependencies.topics.write({ job });
+      await dependencies.sheets.appendAudit({
         actor: 'telegram', timestamp: new Date().toISOString(), requestId, outcome: 'prepared',
         sourceHash: job.sourceHash ?? '', artifactHash: report.hash ?? '', beforeStatus: previousStatus, afterStatus: previousStatus,
-      }));
-      await step('tracker-reviewed', async () => {
-        await dependencies.sheets.updateTrackerRow(rowNumber, {
-          URL: job.url, Company: job.company ?? '', Title: job.title ?? '', Location: job.location ?? '', Report: report.hash ?? '', Status: 'reviewed',
-        });
-        await dependencies.sheets.verifyTrackerRow(rowNumber, 'reviewed');
-        trackerChanged = true;
       });
-      await step('audit-reviewed', () => dependencies.sheets.appendAudit({
+      await dependencies.sheets.updateTrackerRow(rowNumber, {
+        URL: job.url, Company: job.company ?? '', Title: job.title ?? '', Location: job.location ?? '', Report: report.hash ?? '', Status: 'reviewed',
+      });
+      await dependencies.sheets.verifyTrackerRow(rowNumber, 'reviewed');
+      trackerChanged = true;
+      await dependencies.sheets.appendAudit({
         actor: 'telegram', timestamp: new Date().toISOString(), requestId, outcome: 'reviewed',
         sourceHash: job.sourceHash ?? '', artifactHash: report.hash ?? '', beforeStatus: previousStatus, afterStatus: 'reviewed',
-      }));
+      });
       await dependencies.idempotency.markSucceeded(key, requestId);
       return { outcome: 'reviewed', requestId };
     } catch (error) {
@@ -135,7 +111,7 @@ export class CareerCopilotService {
           await dependencies.sheets.verifyTrackerRow(rowNumber, previousStatus);
         }
       } finally {
-        await dependencies.idempotency.markFailed(key, requestId, message);
+        await dependencies.idempotency.markFailed(key, requestId, 'job_processing_failed');
         const alert = typeof context === 'function' ? context : (context.alert ?? dependencies.alert);
         await alert(`Job review failed for request ${requestId}; no automatic retry was attempted.`);
       }

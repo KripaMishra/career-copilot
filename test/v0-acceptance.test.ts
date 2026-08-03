@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { setTimeout as delay } from 'node:timers/promises';
 import test from 'node:test';
 
@@ -12,6 +15,22 @@ import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { LibSQLStore } from '@mastra/libsql';
 import { Memory } from '@mastra/memory';
 import { z } from 'zod';
+
+import { resolveRuntimeConfig } from '../src/config/runtime.ts';
+import * as V0Contracts from '../src/contracts/v0.ts';
+import { CareerStore, MIGRATIONS } from '../src/storage/career-store.ts';
+
+const exactLegacySql = `
+  CREATE TABLE career_requests (request_id TEXT PRIMARY KEY) STRICT;
+  CREATE TABLE career_idempotency (
+    key TEXT PRIMARY KEY, first_request_id TEXT NOT NULL, sightings INTEGER NOT NULL DEFAULT 0,
+    last_request_id TEXT, last_source_id TEXT, state TEXT NOT NULL DEFAULT 'pending', lease_until INTEGER, error TEXT
+  ) STRICT;
+  CREATE TABLE career_outbox (
+    request_id TEXT NOT NULL, step TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending', payload TEXT,
+    updated_at INTEGER NOT NULL, PRIMARY KEY (request_id, step)
+  ) STRICT;
+`;
 
 const primaryMemoryConfig = {
   lastMessages: 20,
@@ -45,7 +64,433 @@ type AcceptanceRow = {
   run: () => Promise<void> | void;
 };
 
+function runNode(program: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--experimental-strip-types', '--input-type=module', '--eval', program], { stdio: ['ignore', 'ignore', 'pipe'] });
+    let stderr = '';
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('exit', (code) => code === 0 ? resolve(0) : reject(new Error(stderr || `child exited ${code}`)));
+  });
+}
+
+function withMigratedDatabase(run: (databasePath: string) => void): void {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-focused-'));
+  const databasePath = path.join(dir, 'operational.db');
+  try {
+    const store = new CareerStore(`file:${databasePath}`);
+    store.close();
+    run(databasePath);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test('rejects case-tampered enum literals in an otherwise valid ledger schema without mutating it', () => {
+  withMigratedDatabase((databasePath) => {
+    const database = new DatabaseSync(databasePath);
+    database.exec("INSERT INTO career_requests VALUES ('keep-me')");
+    database.enableDefensive(false);
+    database.exec('PRAGMA writable_schema = ON');
+    database.prepare("UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE type = 'table' AND name = 'career_turn_inbox'").run("'ordinary_reply'", "'Ordinary_reply'");
+    database.exec('PRAGMA writable_schema = OFF');
+    database.close();
+    const before = databaseSnapshot(databasePath);
+    assert.throws(() => new CareerStore(`file:${databasePath}`), /installed schema/i);
+    assert.deepEqual(databaseSnapshot(databasePath), before);
+  });
+});
+
+test('rejects quoted-literal whitespace tampering that does not alter SQL structure', () => {
+  withMigratedDatabase((databasePath) => {
+    const database = new DatabaseSync(databasePath);
+    database.enableDefensive(false);
+    database.exec('PRAGMA writable_schema = ON');
+    database.prepare("UPDATE sqlite_schema SET sql = replace(sql, ?, ?) WHERE type = 'trigger' AND name = 'career_outbox_rendering_immutable'").run(
+      "'rendered delivery is immutable'",
+      "'rendered  delivery is immutable'",
+    );
+    database.exec('PRAGMA writable_schema = OFF');
+    database.close();
+    assert.throws(() => new CareerStore(`file:${databasePath}`), /installed schema/i);
+  });
+});
+
+test('migrates exact legacy career tables alongside pre-existing Mastra objects', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-mastra-legacy-'));
+  const databasePath = path.join(dir, 'operational.db');
+  try {
+    const mastraStorage = new LibSQLStore({ id: 'legacy-coexistence', url: `file:${databasePath}` });
+    await mastraStorage.init();
+    await mastraStorage.close();
+    const database = new DatabaseSync(databasePath);
+    database.exec(exactLegacySql);
+    database.exec("INSERT INTO career_requests VALUES ('legacy-request'); INSERT INTO career_outbox VALUES ('legacy-request','report','succeeded','{}',1)");
+    database.close();
+
+    const store = new CareerStore(`file:${databasePath}`);
+    assert.deepEqual(store.migrationStatus(), { currentVersion: MIGRATIONS.length, verified: true });
+    store.close();
+    const upgraded = new DatabaseSync(databasePath, { readOnly: true });
+    assert.equal(upgraded.prepare("SELECT count(*) AS count FROM career_requests WHERE request_id='legacy-request'").get()!.count, 1);
+    assert.equal(upgraded.prepare("SELECT count(*) AS count FROM career_outbox WHERE request_id='legacy-request'").get()!.count, 1);
+    assert.ok((upgraded.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name LIKE 'mastra_%' LIMIT 1").get()));
+    upgraded.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('rejects unknown unledgered legacy damage without changing schema or data', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-recognize-'));
+  const databasePath = path.join(dir, 'operational.db');
+  try {
+    const database = new DatabaseSync(databasePath);
+    database.exec("CREATE TABLE career_requests (request_id TEXT PRIMARY KEY, injected TEXT) STRICT; INSERT INTO career_requests(request_id, injected) VALUES ('keep-me', 'unchanged');");
+    const before = database.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all();
+    database.close();
+    assert.throws(() => new CareerStore(`file:${databasePath}`), /unrecognized|verification/i);
+    const after = new DatabaseSync(databasePath, { readOnly: true });
+    assert.deepEqual(after.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all(), before);
+    assert.deepEqual(after.prepare('SELECT * FROM career_requests').all().map((row) => ({ ...row })), [{ request_id: 'keep-me', injected: 'unchanged' }]);
+    after.close();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('rejects injected managed-table triggers', () => {
+  withMigratedDatabase((databasePath) => {
+    const database = new DatabaseSync(databasePath);
+    database.exec("CREATE TRIGGER career_injected_trigger AFTER INSERT ON career_requests BEGIN SELECT 1; END;");
+    database.close();
+    assert.throws(() => new CareerStore(`file:${databasePath}`), /installed schema/i);
+  });
+});
+
+test('enforces run provenance and suspension-envelope blocker linkage', () => {
+  withMigratedDatabase((databasePath) => {
+    const db = new DatabaseSync(databasePath);
+    const hash = `sha256:${'a'.repeat(64)}`;
+    db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('c1','a1','r1','job','https://example.com/job','owner','thread','telegram','chat','suspended','run-1','dispatched',20,1,'blocker-1',10,20,10)");
+    assert.throws(() => db.exec("INSERT INTO career_stage_journal (stage_record_id, command_id, run_id, stage_key, stage_version, state, idempotency_key, created_at, updated_at) VALUES ('bad-stage','c1','wrong-run','acquire',1,'planned','bad-stage-key',20,20)"), /constraint/i);
+    assert.throws(() => db.prepare("INSERT INTO career_suspensions (suspension_id, command_id, run_id, suspended_step, blocker_kind, blocker_state, blocker_schema_version, generation, safe_payload, payload_hash, source_hash, profile_hash, prompt_version, prompt_hash, resume_schema_version, resume_schema_hash, allowed_response, issued_at, expires_at, created_at, updated_at) VALUES ('wrong-run-blocker','c1','wrong-run','acquire','reauth_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',20,40,20,20)").run(hash, hash, hash, hash, hash), /constraint/i);
+    db.prepare("INSERT INTO career_suspensions (suspension_id, command_id, run_id, suspended_step, blocker_kind, blocker_state, blocker_schema_version, generation, safe_payload, payload_hash, source_hash, profile_hash, prompt_version, prompt_hash, resume_schema_version, resume_schema_hash, allowed_response, issued_at, expires_at, created_at, updated_at) VALUES ('blocker-1','c1','run-1','acquire','reauth_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',20,40,20,20)").run(hash, hash, hash, hash, hash);
+    const completion = fixture(contractFixtures(V0Contracts), 'CompletionEnvelopeV1Schema');
+    const envelope = (envelopeId: string, runId: string, generation: number, blockerId: string) => JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({
+      ...suspensionEnvelope(completion), envelopeId, commandId: 'c1', runId, suspensionGeneration: generation,
+      blocker: { ...suspensionEnvelope(completion).blocker, blockerId },
+    }));
+    db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, suspension_generation, suspension_id, envelope_json, state, created_at, updated_at) VALUES ('env-good','c1','run-1','suspension',1,'blocker-1',?,'pending',20,20)").run(envelope('env-good', 'run-1', 1, 'blocker-1'));
+    for (const [id, runId, generation, blockerId] of [['bad-run', 'wrong-run', 1, 'blocker-1'], ['bad-generation', 'run-1', 2, 'blocker-1'], ['bad-blocker', 'run-1', 1, 'other-blocker']] as const) {
+      assert.throws(() => db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, suspension_generation, suspension_id, envelope_json, state, created_at, updated_at) VALUES (?,?,?,?,?,?,?,'pending',20,20)").run(id, 'c1', runId, 'suspension', generation, blockerId, envelope(id, runId, generation, blockerId)), /constraint/i);
+    }
+    db.close();
+  });
+});
+
 const rows: AcceptanceRow[] = [
+  {
+    id: 'P18-empty-migration',
+    run: () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-migration-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const store = new CareerStore(`file:${databasePath}`);
+        assert.deepEqual(store.migrationStatus(), { currentVersion: MIGRATIONS.length, verified: true });
+        store.close();
+
+        const database = new DatabaseSync(databasePath, { readOnly: true });
+        const tables = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as Array<{ name: string }>).map(({ name }) => name);
+        for (const table of [
+          'schema_migrations', 'career_inbound_events', 'career_commands', 'career_stage_journal',
+          'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries',
+          'career_turn_inbox', 'career_structured_events', 'career_deletion_tombstones',
+        ]) assert.ok(tables.includes(table), `missing ${table}`);
+        assert.equal(tables.includes('career_outbox'), false);
+        const indexes = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>).map(({ name }) => name);
+        for (const index of [
+          'career_commands_fifo_idx', 'career_commands_retry_due_idx', 'career_commands_lease_expiry_idx', 'career_commands_retention_idx',
+          'career_stage_retention_idx', 'career_suspensions_retention_idx', 'career_outbox_pending_delivery_idx',
+          'career_outbox_lease_expiry_idx', 'career_outbox_retention_idx', 'career_deliveries_due_work_idx',
+          'career_deliveries_claim_expiry_idx', 'career_deliveries_retention_idx',
+          'career_turn_inbox_fifo_idx', 'career_turn_inbox_lease_expiry_idx', 'career_evidence_retention_idx',
+          'career_structured_events_retention_idx',
+        ]) assert.ok(indexes.includes(index), `missing ${index}`);
+        assert.equal(indexes.includes('career_commands_terminal_immutable'), false);
+        const fifo = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'career_commands_fifo_idx'").get() as { sql: string };
+        assert.match(fifo.sql, /\(queue_state, queue_sequence\)/);
+        const commandColumns = (database.prepare('PRAGMA table_info(career_commands)').all() as Array<{ name: string }>).map(({ name }) => name);
+        for (const column of ['queue_sequence', 'workflow_attempt', 'processing_started_at', 'retention_deadline_at']) assert.ok(commandColumns.includes(column), `missing command.${column}`);
+        const deliveryColumns = (database.prepare('PRAGMA table_info(career_deliveries)').all() as Array<{ name: string }>).map(({ name }) => name);
+        for (const column of ['source_kind', 'envelope_id', 'turn_delivery_id', 'claim_generation', 'claim_owner', 'claim_expires_at', 'heartbeat_at', 'attempt_count', 'first_attempt_at', 'next_attempt_at', 'retry_deadline_at', 'provider', 'provider_outcome', 'retention_deadline_at']) assert.ok(deliveryColumns.includes(column), `missing delivery.${column}`);
+        for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries']) {
+          assert.ok(database.prepare(`PRAGMA foreign_key_list(${table})`).all().length > 0, `missing foreign key on ${table}`);
+        }
+        const ledger = (database.prepare('SELECT version, name, checksum FROM schema_migrations ORDER BY version').all() as Array<{ version: number; name: string; checksum: string }>).map((row) => ({ ...row }));
+        assert.deepEqual(ledger, MIGRATIONS.map(({ version, name, checksum }) => ({ version, name, checksum })));
+        for (const migration of MIGRATIONS) {
+          assert.equal(createHash('sha256').update(migration.sql).digest('hex'), migration.checksum);
+        }
+        database.close();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    id: 'P18-interrupted-migration-retry',
+    run: () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-interrupted-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const database = new DatabaseSync(databasePath);
+        database.exec(exactLegacySql);
+        database.exec("INSERT INTO career_requests VALUES ('request-a'); INSERT INTO career_idempotency VALUES ('bad','request-a',-1,NULL,NULL,'pending',NULL,NULL); INSERT INTO career_outbox VALUES ('request-a','report','pending','{}',1)");
+        database.close();
+        const before = databaseSnapshot(databasePath);
+
+        assert.throws(() => new CareerStore(`file:${databasePath}`), /constraint/i);
+        assert.deepEqual(databaseSnapshot(databasePath), before, 'failed migration must roll back ledger, schema, and rows');
+
+        const repair = new DatabaseSync(databasePath);
+        repair.exec("UPDATE career_idempotency SET sightings=0 WHERE key='bad'");
+        repair.close();
+        const store = new CareerStore(`file:${databasePath}`);
+        assert.deepEqual(store.migrationStatus(), { currentVersion: MIGRATIONS.length, verified: true });
+        store.close();
+        const upgraded = new DatabaseSync(databasePath, { readOnly: true });
+        assert.equal(upgraded.prepare("SELECT sightings FROM career_idempotency WHERE key='bad'").get()!.sightings, 0);
+        assert.equal(upgraded.prepare("SELECT count(*) AS count FROM career_outbox").get()!.count, 1);
+        assert.equal(upgraded.prepare("SELECT count(*) AS count FROM schema_migrations").get()!.count, MIGRATIONS.length);
+        upgraded.close();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    id: 'P18-ledger-and-installed-schema-guards',
+    run: () => {
+      const makeDatabase = () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-schema-guard-'));
+        const databasePath = path.join(dir, 'operational.db');
+        const store = new CareerStore(`file:${databasePath}`);
+        store.close();
+        return { dir, databasePath };
+      };
+      for (const mutate of [
+        (db: DatabaseSync) => db.exec('DROP TABLE career_deletion_tombstones'),
+        (db: DatabaseSync) => db.exec('DROP INDEX career_commands_fifo_idx'),
+        (db: DatabaseSync) => db.exec('DROP TRIGGER career_outbox_rendering_immutable'),
+        (db: DatabaseSync) => db.exec('ALTER TABLE career_deliveries RENAME COLUMN authorization_revision TO authorization_revision_broken'),
+      ]) {
+        const { dir, databasePath } = makeDatabase();
+        try {
+          const database = new DatabaseSync(databasePath); mutate(database); database.close();
+          assert.throws(() => new CareerStore(`file:${databasePath}`), /installed schema/i);
+        } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+      }
+      for (const versionRows of [
+        [{ version: 99, name: 'future', checksum: '0'.repeat(64) }],
+        [{ version: 2, name: MIGRATIONS[1].name, checksum: MIGRATIONS[1].checksum }],
+      ]) {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-ledger-'));
+        const databasePath = path.join(dir, 'operational.db');
+        try {
+          const database = new DatabaseSync(databasePath);
+          database.exec('CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY CHECK (version > 0), name TEXT NOT NULL UNIQUE, checksum TEXT NOT NULL CHECK (length(checksum) = 64), applied_at INTEGER NOT NULL CHECK (applied_at >= 0), legacy_outbox_preserved INTEGER NOT NULL CHECK (legacy_outbox_preserved IN (0, 1) AND (version = 1 OR legacy_outbox_preserved = 0))) STRICT;');
+          for (const row of versionRows) database.prepare('INSERT INTO schema_migrations VALUES (?, ?, ?, ?, 0)').run(row.version, row.name, row.checksum, Date.now());
+          database.close();
+          assert.throws(() => new CareerStore(`file:${databasePath}`), /unsupported schema migration version/i);
+        } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+      }
+    },
+  },
+  {
+    id: 'P18-concurrent-migrators',
+    run: async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-concurrent-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const moduleUrl = new URL('../src/storage/career-store.ts', import.meta.url).href;
+        const program = `import { CareerStore } from ${JSON.stringify(moduleUrl)}; const store = new CareerStore(${JSON.stringify(`file:${databasePath}`)}); store.close();`;
+        const results = await Promise.all([runNode(program), runNode(program)]);
+        assert.deepEqual(results, [0, 0]);
+        const store = new CareerStore(`file:${databasePath}`);
+        assert.deepEqual(store.migrationStatus(), { currentVersion: MIGRATIONS.length, verified: true });
+        store.close();
+
+        const toctouDatabasePath = path.join(dir, 'toctou-operational.db');
+        const toctouReadyPath = path.join(dir, 'toctou-ready');
+        const toctouGoPath = path.join(dir, 'toctou-go');
+        new DatabaseSync(toctouDatabasePath).close();
+        const toctouProgram = `
+          import fs from 'node:fs';
+          import { DatabaseSync } from 'node:sqlite';
+          const prepare = DatabaseSync.prototype.prepare;
+          let gated = false;
+          DatabaseSync.prototype.prepare = function (sql) {
+            if (!gated && sql === "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'schema_migrations'") {
+              gated = true;
+              const result = prepare.call(this, sql).get();
+              fs.writeFileSync(${JSON.stringify(toctouReadyPath)}, '');
+              while (!fs.existsSync(${JSON.stringify(toctouGoPath)})) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+              return { get: () => result };
+            }
+            return prepare.call(this, sql);
+          };
+          const { CareerStore } = await import(${JSON.stringify(moduleUrl)});
+          const store = new CareerStore(${JSON.stringify(`file:${toctouDatabasePath}`)});
+          store.close();
+        `;
+        const toctouChild = runNode(toctouProgram);
+        await waitFor(() => fs.existsSync(toctouReadyPath), 'TOCTOU migration child did not become ready');
+        const toctouPeer = runNode(program.replaceAll(databasePath, toctouDatabasePath));
+        await delay(250);
+        fs.writeFileSync(toctouGoPath, '');
+        await Promise.all([toctouChild, toctouPeer]);
+
+        const lockedDatabasePath = path.join(dir, 'locked-operational.db');
+        const readyPath = path.join(dir, 'child-ready');
+        const goPath = path.join(dir, 'child-go');
+        const lock = new DatabaseSync(lockedDatabasePath);
+        lock.exec('BEGIN EXCLUSIVE; CREATE TABLE startup_lock (value INTEGER) STRICT;');
+        const lockedProgram = `
+          import fs from 'node:fs';
+          import { setTimeout as delay } from 'node:timers/promises';
+          import { CareerStore } from ${JSON.stringify(moduleUrl)};
+          fs.writeFileSync(${JSON.stringify(readyPath)}, '');
+          while (!fs.existsSync(${JSON.stringify(goPath)})) await delay(10);
+          const store = new CareerStore(${JSON.stringify(`file:${lockedDatabasePath}`)});
+          store.close();
+        `;
+        const child = runNode(lockedProgram);
+        await waitFor(() => fs.existsSync(readyPath), 'concurrent migration child did not become ready');
+        fs.writeFileSync(goPath, '');
+        await delay(250);
+        lock.exec('ROLLBACK');
+        lock.close();
+        await child;
+
+        const migrated = new CareerStore(`file:${lockedDatabasePath}`);
+        assert.deepEqual(migrated.migrationStatus(), { currentVersion: MIGRATIONS.length, verified: true });
+        migrated.close();
+        const verified = new DatabaseSync(lockedDatabasePath, { readOnly: true });
+        assert.deepEqual(
+          verified.prepare('SELECT version, name, checksum FROM schema_migrations ORDER BY version').all().map((row) => ({ ...row })),
+          MIGRATIONS.map(({ version, name, checksum }) => ({ version, name, checksum })),
+        );
+        verified.close();
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    },
+  },
+  {
+    id: 'P18-static-storage-invariants',
+    run: () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-static-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const store = new CareerStore(`file:${databasePath}`); store.close();
+        const db = new DatabaseSync(databasePath);
+        const hash = `sha256:${'a'.repeat(64)}`;
+        assert.throws(() => db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run('a'.repeat(64)), /constraint/i);
+        db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run(hash);
+        const insertCommand = db.prepare("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at) VALUES (?, ?, ?, 'job','https://example.com/job','owner','thread','telegram','chat','queued',10,10,20)");
+        insertCommand.run('c1', 'a1', 'r1'); insertCommand.run('c2', 'a2', 'r2');
+        assert.throws(() => db.exec("INSERT INTO career_commands (queue_sequence, command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at) VALUES (99,'forged','forged-attempt','forged-request','job','https://example.com/job','owner','thread','telegram','chat','queued',10,10,20)"), /database-assigned/i);
+        assert.deepEqual((db.prepare('SELECT command_id FROM career_commands ORDER BY queue_sequence').all() as Array<{ command_id: string }>).map(({ command_id }) => command_id), ['c1', 'c2']);
+        assert.throws(() => db.exec("UPDATE career_commands SET run_id='run' WHERE command_id='c1'"), /constraint/i);
+        assert.throws(() => db.prepare("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, envelope_id, turn_delivery_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, retry_deadline_at, created_at, updated_at) VALUES ('d1','key-invalid','turn','envelope','turn','telegram','chat','owner','thread','telegram','chat',0,'pending',100,1,1)").run(), /constraint/i);
+        db.prepare("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, turn_delivery_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, retry_deadline_at, created_at, updated_at) VALUES ('d1','key-1','turn','turn-1','telegram','chat','owner','thread','telegram','chat',0,'pending',100,1,1)").run();
+        assert.throws(() => db.exec("UPDATE career_deliveries SET rendered_bytes=x'01', rendered_hash='sha256:" + 'b'.repeat(64) + "' WHERE delivery_id='d1'"), /constraint/i);
+        db.exec("UPDATE career_deliveries SET state='claimed', claim_generation=1, claim_owner='dispatcher', claim_expires_at=20, heartbeat_at=2 WHERE delivery_id='d1'");
+        assert.equal((db.prepare("SELECT rendered_bytes FROM career_deliveries WHERE delivery_id='d1'").get() as { rendered_bytes: null }).rendered_bytes, null);
+        assert.throws(() => db.exec("UPDATE career_commands SET retention_deadline_at=100 WHERE command_id='c1'"), /constraint/i);
+
+        db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, processing_deadline_at, terminal_generation, created_at, updated_at, queued_at, completed_at, resolved_at) VALUES ('c3','a3','r3','job3','https://example.com/job3','owner','thread','telegram','chat','failed','run-3','not_dispatched',20,30,1,10,30,10,30,30)");
+        const completion = fixture(contractFixtures(V0Contracts), 'CompletionEnvelopeV1Schema');
+        const envelope = JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({ ...completion, envelopeId: 'env-1', commandId: 'c3', runId: 'run-3' }));
+        db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, terminal_generation, envelope_json, state, created_at, updated_at) VALUES ('env-1','c3','run-3','terminal',1,?,'pending',30,30)").run(envelope);
+        const mismatchedTerminalEnvelope = JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({ ...completion, envelopeId: 'env-mismatch', commandId: 'c3', runId: 'run-3', terminalGeneration: 2 }));
+        assert.throws(() => db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, terminal_generation, envelope_json, state, created_at, updated_at) VALUES ('env-mismatch','c3','run-3','terminal',1,?,'pending',30,30)").run(mismatchedTerminalEnvelope), /constraint/i);
+        assert.throws(() => db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, envelope_json, state, created_at, updated_at) VALUES ('env-null','c3','run-3','terminal',?,'pending',30,30)").run(JSON.stringify({ ...JSON.parse(envelope), envelopeId: 'env-null', terminalGeneration: null })), /constraint/i);
+        db.exec("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, envelope_id, source_command_id, source_run_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, retry_deadline_at, created_at, updated_at) VALUES ('d2','key-2','completion','env-1','c3','run-3','telegram','chat','owner','thread','telegram','chat',0,'pending',100,30,30)");
+        assert.throws(() => db.exec("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, envelope_id, source_command_id, source_run_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, retry_deadline_at, created_at, updated_at) VALUES ('d3','key-3','completion','env-1','c3','wrong-run','telegram','chat','owner','thread','telegram','chat',0,'pending',100,30,30)"), /constraint/i);
+
+        db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('c4','a4','r4','job4','https://example.com/job4','owner','thread','telegram','chat','suspended','run-4','dispatched',20,1,'blocker-1',10,20,10)");
+        assert.throws(() => db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, processing_deadline_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('bad-suspended-deadline','bad-a1','bad-r1','job','https://example.com/a','owner','thread','telegram','chat','suspended','run-bad-1','dispatched',20,30,1,'blocker-bad',10,20,10)"), /constraint/i);
+        assert.throws(() => db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, claim_generation, lease_owner, lease_expires_at, heartbeat_at, processing_started_at, processing_deadline_at, blocker_id, created_at, updated_at, queued_at) VALUES ('bad-running-blocker','bad-a2','bad-r2','job','https://example.com/b','owner','thread','telegram','chat','running','run-bad-2','dispatched',1,'worker',40,20,20,30,'stray-blocker',10,20,10)"), /constraint/i);
+        db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, claim_generation, lease_owner, lease_expires_at, heartbeat_at, processing_started_at, processing_deadline_at, created_at, updated_at, queued_at) VALUES ('good-running','good-a','good-r','job','https://example.com/good','owner','thread','telegram','chat','running','run-good','dispatched',1,'worker',40,20,20,30,10,20,10)");
+        db.exec("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, claim_generation, lease_owner, lease_expires_at, heartbeat_at, processing_started_at, processing_deadline_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('good-resuming','resume-a','resume-r','job','https://example.com/resume','owner','thread','telegram','chat','resuming','run-resume','dispatched',1,'worker',40,20,20,30,1,'resume-blocker',10,20,10)");
+        db.prepare("INSERT INTO career_suspensions (suspension_id, command_id, run_id, suspended_step, blocker_kind, blocker_state, blocker_schema_version, generation, safe_payload, payload_hash, source_hash, profile_hash, prompt_version, prompt_hash, resume_schema_version, resume_schema_hash, allowed_response, issued_at, expires_at, created_at, updated_at) VALUES ('blocker-1','c4','run-4','acquire','reauth_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',20,40,20,20)").run(hash, hash, hash, hash, hash);
+        const suspensionCompletion = suspensionEnvelope(completion);
+        const badSuspensionEnvelope = JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({
+          ...suspensionCompletion, envelopeId: 'env-bad', commandId: 'c4', runId: 'run-4',
+          blocker: { ...suspensionCompletion.blocker, blockerId: 'other-blocker' },
+        }));
+        assert.throws(() => db.prepare("INSERT INTO career_completion_outbox (envelope_id, command_id, run_id, envelope_kind, suspension_generation, suspension_id, envelope_json, state, created_at, updated_at) VALUES ('env-bad','c4','run-4','suspension',1,'blocker-1',?,'pending',20,20)").run(badSuspensionEnvelope), /constraint/i);
+        assert.throws(() => db.exec("INSERT INTO career_deliveries (delivery_id, delivery_key, source_kind, turn_delivery_id, destination_channel, destination_id, owner_resource_id, thread_id, origin_channel, origin_destination, authorization_revision, state, rendered_bytes, rendered_hash, attempt_count, first_attempt_at, retry_deadline_at, created_at, updated_at) VALUES ('d-unknown','key-unknown','turn','turn-unknown','telegram','chat','owner','thread','telegram','chat',0,'send_unknown',x'01','sha256:" + 'b'.repeat(64) + "',1,2,100,1,2)"), /constraint/i);
+        assert.throws(() => db.exec("UPDATE career_suspensions SET blocker_state='accepted' WHERE suspension_id='blocker-1'"), /constraint/i);
+        db.exec("INSERT INTO career_stage_journal (stage_record_id, command_id, run_id, stage_key, stage_version, state, idempotency_key, created_at, updated_at) VALUES ('stage-1','c4','run-4','acquire',1,'planned','stage-key',20,20)");
+        assert.throws(() => db.exec("UPDATE career_stage_journal SET resolved_at=30, retention_deadline_at=40 WHERE stage_record_id='stage-1'"), /constraint/i);
+        assert.throws(() => db.exec("INSERT INTO career_turn_inbox (event_key,event_kind,owner_resource_id,thread_id,safe_payload,created_at) VALUES ('bad-json','user','owner','thread','not-json',1)"), /constraint/i);
+        assert.throws(() => db.exec("INSERT INTO career_structured_events (event_id,event_kind,safe_fields,occurred_at,retention_deadline_at) VALUES ('bad-json','audit','not-json',1,2)"), /constraint/i);
+        db.exec("INSERT INTO career_turn_inbox (event_key,event_kind,owner_resource_id,thread_id,safe_payload,created_at) VALUES ('good-json','user','owner','thread','{}',1)");
+        db.exec("INSERT INTO career_structured_events (event_id,event_kind,safe_fields,occurred_at,retention_deadline_at) VALUES ('good-json','audit','{}',1,2)");
+        db.close();
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    },
+  },
+  {
+    id: 'P18-checksum-drift-blocks-readiness',
+    run: () => {
+      assert.equal(Object.isFrozen(MIGRATIONS), true);
+      for (const migration of MIGRATIONS) {
+        assert.equal(Object.isFrozen(migration), true);
+        assert.equal(createHash('sha256').update(migration.sql).digest('hex'), migration.checksum);
+      }
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-drift-'));
+      const databasePath = path.join(dir, 'operational.db');
+      try {
+        const store = new CareerStore(`file:${databasePath}`);
+        store.close();
+        const database = new DatabaseSync(databasePath);
+        database.prepare("UPDATE schema_migrations SET checksum = ? WHERE version = 1").run('0'.repeat(64));
+        database.close();
+        assert.throws(() => new CareerStore(`file:${databasePath}`), /checksum drift/i);
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
+  {
+    id: 'P18-remote-operational-db-rejected',
+    run: () => {
+      for (const databaseUrl of ['libsql://career.turso.io', 'https://career.turso.io', 'file:./relative.db', ':memory:', 'file::memory:']) {
+        assert.throws(() => resolveRuntimeConfig({ dataDir: '/tmp/career-v0-config', databaseUrl, env: {} }), /absolute local file/i);
+        assert.throws(() => new CareerStore(databaseUrl), /absolute local file/i);
+      }
+    },
+  },
+  {
+    id: 'P18-one-authoritative-file-db',
+    run: async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-shared-'));
+      try {
+        const config = resolveRuntimeConfig({ dataDir: dir, env: {} });
+        const applicationStore = new CareerStore(config.databaseUrl);
+        const mastraStorage = new LibSQLStore({ id: 'shared-operational-storage', url: config.databaseUrl });
+        await mastraStorage.init();
+        applicationStore.close();
+        await mastraStorage.close();
+
+        const database = new DatabaseSync(path.join(dir, 'mastra.db'), { readOnly: true });
+        const tables = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as Array<{ name: string }>).map(({ name }) => name);
+        assert.ok(tables.includes('schema_migrations'));
+        assert.ok(tables.some((name) => name.startsWith('mastra_')));
+        database.close();
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  },
   {
     id: 'P2-installed-duplicate-startAsync',
     run: async () => {
@@ -663,6 +1108,18 @@ function expectedDefaults() {
     intake: { globalFifoConsumers: 1, rawChannelUpdateRetention: 'discard_after_validation' },
     artifacts: { claim: 'auditable_and_traceable_not_reproducible', encryptedFullPageSnapshot: false },
   };
+}
+
+function databaseSnapshot(databasePath: string) {
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  try {
+    const schema = database.prepare("SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all().map((row) => ({ ...row }));
+    const data: Record<string, unknown[]> = {};
+    for (const { name } of database.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND (name='schema_migrations' OR name LIKE 'career_%') ORDER BY name").all() as Array<{ name: string }>) {
+      data[name] = database.prepare(`SELECT * FROM "${name}"`).all().map((row) => ({ ...row }));
+    }
+    return { schema, data };
+  } finally { database.close(); }
 }
 
 function dbMessage(id: string, role: 'user' | 'assistant', parts: Record<string, unknown>[]) {
