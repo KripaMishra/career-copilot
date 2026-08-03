@@ -29,7 +29,9 @@ import {
   withOperationDeadline,
 } from '../src/workflows/retry-policy.ts';
 import { CareerCopilotService } from '../src/services/career-copilot.ts';
+import { CareerWorker, FirstStartCrashError, type SaveJobWorkflowPort } from '../src/services/career-worker.ts';
 import { createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
+import { SAVE_JOB_WORKFLOW_VERSION, saveJobWorkflow } from '../src/workflows/save-job.ts';
 
 const exactLegacySql = `
   CREATE TABLE career_requests (request_id TEXT PRIMARY KEY) STRICT;
@@ -215,6 +217,83 @@ function withTask5(run: (fixture: { store: CareerStore; secondStore: CareerStore
     .finally(() => { secondStore.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 }
 
+type Task7Status = 'pending' | 'running' | 'waiting' | 'suspended' | 'success' | 'failed' | 'canceled';
+type Task7SharedWorkflow = {
+  states: Map<string, { runId: string; workflowName: string; resourceId?: string; status: Task7Status }>;
+  createCalls: number; reconstructCalls: number; startCalls: number; startInputs: unknown[]; resumeCalls: number; restartCalls: number;
+  createGate?: Promise<void>; createEntered?: () => void;
+};
+class Task7Workflow implements SaveJobWorkflowPort {
+  readonly id = 'save-job-v1';
+  readonly shared: Task7SharedWorkflow;
+  keepPendingAfterStart = false;
+  startStatus: Task7Status = 'running';
+
+  constructor(shared?: Task7SharedWorkflow) {
+    this.shared = shared ?? { states: new Map(), createCalls: 0, reconstructCalls: 0, startCalls: 0, startInputs: [], resumeCalls: 0, restartCalls: 0 };
+  }
+  fork() { const fork = new Task7Workflow(this.shared); fork.keepPendingAfterStart = this.keepPendingAfterStart; fork.startStatus = this.startStatus; return fork; }
+  get runIds() { return new Set(this.shared.states.keys()); }
+  get createCount() { return this.shared.createCalls; }
+  get reconstructCount() { return this.shared.reconstructCalls; }
+  get startCount() { return this.shared.startCalls; }
+  get startInputs() { return this.shared.startInputs; }
+  get resumeCount() { return this.shared.resumeCalls; }
+  get restartCount() { return this.shared.restartCalls; }
+  async getWorkflowRunById(runId: string) { return this.shared.states.get(runId) ?? null; }
+  async createRun({ runId, resourceId }: { runId: string; resourceId: string }) {
+    this.shared.createCalls += 1;
+    if (this.shared.createCalls > 1) throw new Error('duplicate first createRun call');
+    this.shared.createEntered?.();
+    await this.shared.createGate;
+    if (this.shared.states.has(runId)) throw new Error('first createRun called for an existing run');
+    this.shared.states.set(runId, { runId, workflowName: this.id, resourceId, status: 'pending' });
+    return this.handle(runId, resourceId);
+  }
+  async reconstructRun({ runId, resourceId }: { runId: string; resourceId: string }) {
+    this.shared.reconstructCalls += 1;
+    const state = this.shared.states.get(runId);
+    if (!state || state.resourceId !== resourceId) throw new Error('cannot reconstruct an uncorrelated run');
+    return this.handle(runId, resourceId);
+  }
+  private handle(runId: string, resourceId: string) {
+    return {
+      runId, resourceId,
+      startAsync: async ({ inputData }: { inputData: unknown }) => {
+        this.shared.startCalls += 1;
+        this.shared.startInputs.push(structuredClone(inputData));
+        if (!this.keepPendingAfterStart) this.setStatus(runId, this.startStatus);
+        return { runId };
+      },
+      resumeAsync: async () => { this.shared.resumeCalls += 1; return { runId }; },
+      restart: async () => { this.shared.restartCalls += 1; return { status: this.shared.states.get(runId)!.status }; },
+    };
+  }
+  setStatus(runId: string, status: Task7Status) { this.shared.states.set(runId, { ...this.shared.states.get(runId)!, status }); }
+}
+
+function claimToFence(claim: ReturnType<CareerStore['claimNextRunnable']> & {}) {
+  return { commandId: claim.commandId, runId: claim.runId, ownerResourceId: claim.ownerResourceId, leaseOwner: claim.leaseOwner,
+    claimGeneration: claim.claimGeneration, sourceState: claim.queueState };
+}
+
+async function withTask7(run: (fixture: { store: CareerStore; secondStore: CareerStore; workflow: Task7Workflow; claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>; databasePath: string }) => Promise<void>, options: { leaseMs?: number } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-task7-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs });
+  const secondStore = new CareerStore(`file:${databasePath}`, { leaseMs: options.leaseMs });
+  const workflow = new Task7Workflow();
+  try {
+    store.enqueueCommand({ commandId: 'task7-command', attemptId: 'task7-attempt', requestId: 'task7-request', canonicalJobKey: 'url:https://example.com/job',
+      canonicalUrl: 'https://example.com/job', ownerResourceId: 'owner-v0', threadId: 'thread-v0', originChannel: 'studio', originDestination: 'studio-v0' });
+    const claim = store.claimNextRunnable('worker-v0');
+    assert.ok(claim);
+    await run({ store, secondStore, workflow, claim, databasePath });
+  } finally {
+    secondStore.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 const rows: AcceptanceRow[] = [
   {
     id: 'P4-telegram-user-and-private-chat',
@@ -371,7 +450,7 @@ const rows: AcceptanceRow[] = [
         for (const table of [
           'schema_migrations', 'career_inbound_events', 'career_commands', 'career_stage_journal',
           'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries',
-          'career_turn_inbox', 'career_structured_events', 'career_deletion_tombstones',
+          'career_turn_inbox', 'career_structured_events', 'career_deletion_tombstones', 'career_start_dispatch_journal',
         ]) assert.ok(tables.includes(table), `missing ${table}`);
         assert.equal(tables.includes('career_outbox'), false);
         const indexes = (database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'").all() as Array<{ name: string }>).map(({ name }) => name);
@@ -390,7 +469,7 @@ const rows: AcceptanceRow[] = [
         for (const column of ['queue_sequence', 'workflow_attempt', 'processing_started_at', 'retention_deadline_at', 'authorization_revision']) assert.ok(commandColumns.includes(column), `missing command.${column}`);
         const deliveryColumns = (database.prepare('PRAGMA table_info(career_deliveries)').all() as Array<{ name: string }>).map(({ name }) => name);
         for (const column of ['source_kind', 'envelope_id', 'turn_delivery_id', 'claim_generation', 'claim_owner', 'claim_expires_at', 'heartbeat_at', 'attempt_count', 'first_attempt_at', 'next_attempt_at', 'retry_deadline_at', 'provider', 'provider_outcome', 'retention_deadline_at']) assert.ok(deliveryColumns.includes(column), `missing delivery.${column}`);
-        for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries']) {
+        for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries', 'career_start_dispatch_journal']) {
           assert.ok(database.prepare(`PRAGMA foreign_key_list(${table})`).all().length > 0, `missing foreign key on ${table}`);
         }
         const ledger = (database.prepare('SELECT version, name, checksum FROM schema_migrations ORDER BY version').all() as Array<{ version: number; name: string; checksum: string }>).map((row) => ({ ...row }));
@@ -892,6 +971,218 @@ const rows: AcceptanceRow[] = [
         );
         fs.rmSync(dir, { recursive: true, force: true });
       }
+    },
+  },
+  {
+    id: 'P2-save-workflow-strict-versioned-skeleton',
+    run: async () => {
+      assert.equal(SAVE_JOB_WORKFLOW_VERSION, 1);
+      assert.equal(saveJobWorkflow.id, 'save-job-v1');
+      assert.deepEqual(Object.keys(saveJobWorkflow.steps), ['save-job-skeleton-v1']);
+      assert.throws(() => saveJobWorkflow.inputSchema.parse({ schemaVersion: 1, workflowVersion: 1, commandId: 'c', attempt: 1, runId: 'r', resourceId: 'owner', canonicalUrl: 'https://example.com/', extra: true }));
+      const output = await (saveJobWorkflow.steps['save-job-skeleton-v1'] as { execute: (args: { inputData: unknown }) => Promise<unknown> }).execute({
+        inputData: { schemaVersion: 1, workflowVersion: 1, commandId: 'c', attempt: 1, runId: 'r', resourceId: 'owner', canonicalUrl: 'https://example.com/' },
+      });
+      assert.deepEqual(output, { schemaVersion: 1, workflowVersion: 1, commandId: 'c', attempt: 1, runId: 'r', resourceId: 'owner', outcome: 'skeleton_complete' });
+    },
+  },
+  {
+    id: 'P2-installed-save-workflow-libsql-correlation',
+    run: async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-save-workflow-'));
+      try {
+        const mastra = new Mastra({ workflows: { saveJobWorkflow }, storage: new LibSQLStore({ id: 'task7-save-workflow', url: `file:${path.join(dir, 'mastra.db')}` }) });
+        const registered = mastra.getWorkflow('saveJobWorkflow');
+        const runId = 'cc-save-v1:installed-command:1';
+        const resourceId = 'installed-owner';
+        const run = await registered.createRun({ runId, resourceId });
+        const pending = await registered.getWorkflowRunById(runId);
+        assert.deepEqual({ runId: pending?.runId, workflowName: pending?.workflowName, resourceId: pending?.resourceId, status: pending?.status },
+          { runId, workflowName: 'save-job-v1', resourceId, status: 'pending' });
+        assert.deepEqual(await run.startAsync({ inputData: { schemaVersion: 1, workflowVersion: 1, commandId: 'installed-command', attempt: 1,
+          runId, resourceId, canonicalUrl: 'https://example.com/job' } }), { runId });
+        const terminal = await waitForWorkflowRun(registered, runId);
+        assert.equal(terminal.status, 'success');
+        assert.deepEqual(terminal.result, { schemaVersion: 1, workflowVersion: 1, commandId: 'installed-command', attempt: 1,
+          runId, resourceId, outcome: 'skeleton_complete' });
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    },
+  },
+  {
+    id: 'P2-first-start-crash-recovery-matrix',
+    run: async () => {
+      for (const crashAt of ['beforeRunCreation', 'afterRunCreation', 'afterDispatching', 'duringStartAsync', 'afterStartAsync', 'beforeRunning'] as const) {
+        await withTask7(async ({ store, workflow, claim }) => {
+          workflow.keepPendingAfterStart = crashAt === 'afterStartAsync';
+          const worker = new CareerWorker({ store, workflow });
+          await assert.rejects(worker.startOrRecover(claim, { on: (point) => { if (point === crashAt) throw new FirstStartCrashError(point); } }), FirstStartCrashError);
+          const recovered = await worker.startOrRecover(claim);
+          const journal = store.getFirstStartJournal(claim.commandId);
+          assert.equal(journal?.runId, claim.runId, crashAt);
+          assert.equal(workflow.runIds.size, 1, crashAt);
+          if (crashAt === 'afterDispatching' || crashAt === 'afterStartAsync') {
+            assert.equal(recovered.kind, 'operator_reconciliation_required');
+            assert.equal(journal?.dispatchState, 'start_unknown');
+            assert.equal(workflow.startCount, crashAt === 'afterStartAsync' ? 1 : 0);
+            assert.equal(workflow.resumeCount, 0);
+            assert.equal(workflow.restartCount, 0);
+          } else {
+            assert.notEqual(recovered.kind, 'operator_reconciliation_required', crashAt);
+            assert.equal(workflow.startCount, 1, crashAt);
+          }
+          if (crashAt === 'afterRunCreation') {
+            assert.equal(workflow.createCount, 1);
+            assert.equal(workflow.reconstructCount, 1);
+          }
+          if (workflow.startCount === 1) assert.deepEqual(workflow.startInputs, [{
+            schemaVersion: 1, workflowVersion: 1, commandId: claim.commandId, attempt: 1, runId: claim.runId,
+            resourceId: claim.ownerResourceId, canonicalUrl: 'https://example.com/job',
+          }], crashAt);
+        });
+      }
+    },
+  },
+  {
+    id: 'P2-pending-journal-recovery-branches',
+    run: async () => {
+      await withTask7(async ({ store, workflow, claim }) => {
+        await workflow.createRun({ runId: claim.runId, resourceId: claim.ownerResourceId });
+        const result = await new CareerWorker({ store, workflow }).startOrRecover(claim);
+        assert.equal(result.kind, 'running');
+        assert.equal(workflow.startCount, 1);
+      });
+      for (const dispatchState of ['dispatching', 'dispatched', 'start_unknown'] as const) {
+        await withTask7(async ({ store, workflow, claim }) => {
+          await workflow.createRun({ runId: claim.runId, resourceId: claim.ownerResourceId });
+          assert.equal(store.markFirstRunCreated(claimToFence(claim)).applied, true);
+          assert.equal(store.markFirstStartDispatching(claimToFence(claim)).applied, true);
+          if (dispatchState === 'dispatched') assert.equal(store.markFirstStartDispatched(claimToFence(claim)).applied, true);
+          if (dispatchState === 'start_unknown') assert.equal(store.markFirstStartUnknown(claimToFence(claim)).applied, true);
+          const result = await new CareerWorker({ store, workflow }).startOrRecover(claim);
+          assert.equal(result.kind, 'operator_reconciliation_required');
+          assert.equal(store.getFirstStartJournal(claim.commandId)?.dispatchState, 'start_unknown');
+          assert.equal(workflow.startCount, 0);
+          assert.equal(workflow.resumeCount, 0);
+          assert.equal(workflow.restartCount, 0);
+        });
+      }
+    },
+  },
+  {
+    id: 'P2-existing-state-reconnects-without-first-start',
+    run: async () => {
+      for (const status of ['running', 'waiting', 'suspended', 'success', 'failed', 'canceled'] as const) {
+        await withTask7(async ({ store, workflow, claim }) => {
+          await workflow.createRun({ runId: claim.runId, resourceId: claim.ownerResourceId });
+          workflow.setStatus(claim.runId, status);
+          const result = await new CareerWorker({ store, workflow }).startOrRecover(claim);
+          assert.equal(result.kind, status === 'running' ? 'running' : status === 'waiting' || status === 'suspended' ? 'reconnected' : 'terminal');
+          assert.equal(workflow.startCount, 0);
+          assert.equal(workflow.resumeCount, 0);
+          assert.equal(workflow.restartCount, 0);
+          assert.equal(store.getFirstStartJournal(claim.commandId)?.observedRunStatus, status);
+        });
+      }
+    },
+  },
+  {
+    id: 'P2-correlation-and-running-fences',
+    run: async () => {
+      await withTask7(async ({ store, workflow, claim }) => {
+        await workflow.createRun({ runId: claim.runId, resourceId: 'wrong-owner' });
+        workflow.setStatus(claim.runId, 'running');
+        await assert.rejects(new CareerWorker({ store, workflow }).startOrRecover(claim), /correlation/i);
+        assert.equal(store.getCommand(claim.commandId)?.queueState, 'starting');
+      });
+      await withTask7(async ({ store, claim }) => {
+        assert.deepEqual(store.markRunning(claimToFence(claim)), { applied: false, reason: 'lease_lost' });
+        assert.equal(store.getCommand(claim.commandId)?.queueState, 'starting');
+      });
+    },
+  },
+  {
+    id: 'P2-immediate-terminal-is-explicit-not-running',
+    run: async () => {
+      await withTask7(async ({ store, workflow, claim }) => {
+        workflow.startStatus = 'success';
+        const worker = new CareerWorker({ store, workflow });
+        const result = await worker.startOrRecover(claim);
+        assert.equal(result.kind, 'terminal');
+        assert.equal(result.status, 'success');
+        assert.equal(store.getCommand(claim.commandId)?.queueState, 'starting');
+        assert.equal(store.getFirstStartJournal(claim.commandId)?.observedRunStatus, 'success');
+        assert.equal((await worker.startOrRecover(claim)).kind, 'terminal');
+        assert.equal(workflow.createCount, 1);
+        assert.equal(workflow.startCount, 1);
+        assert.equal(workflow.resumeCount, 0);
+        assert.equal(workflow.restartCount, 0);
+      });
+    },
+  },
+  {
+    id: 'P2-concurrent-recovery-one-correlated-run',
+    run: async () => {
+      await withTask7(async ({ store, secondStore, workflow, claim }) => {
+        const independentAdapter = workflow.fork();
+        const results = await Promise.all([
+          new CareerWorker({ store, workflow }).startOrRecover(claim),
+          new CareerWorker({ store: secondStore, workflow: independentAdapter }).startOrRecover(claim),
+        ]);
+        assert.equal(workflow.createCount, 1);
+        assert.equal(workflow.runIds.size, 1);
+        assert.deepEqual([...workflow.runIds], [claim.runId]);
+        assert.equal(workflow.startCount, 1);
+        assert.ok(results.some(({ kind }) => kind === 'running'));
+      });
+    },
+  },
+  {
+    id: 'P2-reclaimed-creating-without-evidence-closes-unknown',
+    run: async () => {
+      await withTask7(async ({ store, secondStore, workflow, claim }) => {
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        workflow.shared.createEntered = () => entered.resolve();
+        workflow.shared.createGate = release.promise;
+        const stale = new CareerWorker({ store, workflow }).startOrRecover(claim);
+        await entered.promise;
+        await delay(20);
+        const reclaimed = secondStore.claimNextRunnable('worker-v1');
+        assert.ok(reclaimed);
+        assert.ok(reclaimed.claimGeneration > claim.claimGeneration);
+        const result = await new CareerWorker({ store: secondStore, workflow: workflow.fork() }).startOrRecover(reclaimed);
+        assert.equal(result.kind, 'operator_reconciliation_required');
+        assert.equal(workflow.createCount, 1);
+        assert.equal(workflow.startCount, 0);
+        assert.equal(secondStore.getFirstStartJournal(claim.commandId)?.runCreationState, 'create_unknown');
+        assert.equal(secondStore.getFirstStartJournal(claim.commandId)?.dispatchState, 'start_unknown');
+        release.resolve();
+        await assert.rejects(stale, /fence was lost/i);
+        assert.equal(workflow.createCount, 1);
+      }, { leaseMs: 5 });
+    },
+  },
+  {
+    id: 'P2-v6-direct-sql-authority-and-running-evidence',
+    run: async () => {
+      await withTask7(async ({ store, claim, databasePath }) => {
+        const db = new DatabaseSync(databasePath);
+        assert.throws(() => db.prepare('DELETE FROM career_start_dispatch_journal WHERE command_id = ?').run(claim.commandId), /immutable/i);
+        assert.throws(() => db.prepare('UPDATE career_start_dispatch_journal SET claim_generation = claim_generation + 1 WHERE command_id = ?').run(claim.commandId), /authority|generation/i);
+        assert.throws(() => db.prepare("UPDATE career_start_dispatch_journal SET run_creation_state = 'create_unknown', creation_claim_generation = claim_generation WHERE command_id = ?").run(claim.commandId), /creation|authority/i);
+        assert.throws(() => db.prepare("UPDATE career_start_dispatch_journal SET dispatch_state = 'dispatching' WHERE command_id = ?").run(claim.commandId), /dispatch|creation|authority/i);
+        assert.throws(() => db.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatching' WHERE command_id = ?").run(claim.commandId), /dispatch|journal|authority/i);
+        assert.equal(store.markFirstRunCreated(claimToFence(claim)).applied, true);
+        assert.equal(store.markFirstStartDispatching(claimToFence(claim)).applied, true);
+        assert.equal(store.markFirstStartDispatched(claimToFence(claim)).applied, true);
+        assert.deepEqual(store.markRunning(claimToFence(claim)), { applied: false, reason: 'lease_lost' });
+        assert.equal(store.recordFirstStartObservation(claimToFence(claim), 'success').applied, true);
+        assert.throws(() => db.prepare('UPDATE career_start_dispatch_journal SET observed_run_status = NULL WHERE command_id = ?').run(claim.commandId), /terminal.*immutable/i);
+        assert.throws(() => db.prepare("UPDATE career_start_dispatch_journal SET observed_run_status = 'failed' WHERE command_id = ?").run(claim.commandId), /terminal.*immutable/i);
+        db.prepare('UPDATE career_commands SET lease_expires_at = 0 WHERE command_id = ?').run(claim.commandId);
+        assert.throws(() => db.prepare('UPDATE career_start_dispatch_journal SET updated_at = updated_at + 1 WHERE command_id = ?').run(claim.commandId), /lease|authority/i);
+        db.close();
+      });
     },
   },
   {
@@ -1418,9 +1709,10 @@ const rows: AcceptanceRow[] = [
       const start = store.claimNextRunnable('worker-a')!;
       const startFence = { ...start, sourceState: 'starting' as const };
       assert.deepEqual(store.renewClaim({ ...startFence, ownerResourceId: 'owner-2' }), { applied: false, reason: 'lease_lost' });
-      const fixtureDatabase = new DatabaseSync(databasePath);
-      fixtureDatabase.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatched' WHERE command_id = ?").run(start.commandId);
-      fixtureDatabase.close();
+      assert.equal(store.markFirstRunCreated(startFence).applied, true);
+      assert.equal(store.markFirstStartDispatching(startFence).applied, true);
+      assert.equal(store.markFirstStartDispatched(startFence).applied, true);
+      assert.equal(store.recordFirstStartObservation(startFence, 'running').applied, true);
       for (const stale of [
         { ...startFence, ownerResourceId: 'owner-2' },
         { ...startFence, leaseOwner: 'worker-b' },
@@ -1910,9 +2202,11 @@ const rows: AcceptanceRow[] = [
       dispatchAndMarkRunning(store, databasePath, claim);
       store.enqueueCommand(queueInput('late-mark-running'));
       const markClaim = store.claimNextRunnable('worker-late-mark')!;
-      const dispatchDb = new DatabaseSync(databasePath);
-      dispatchDb.prepare("UPDATE career_commands SET start_dispatch_state='dispatched' WHERE command_id=?").run(markClaim.commandId);
-      dispatchDb.close();
+      const markFence = { ...markClaim, sourceState: 'starting' as const };
+      assert.equal(store.markFirstRunCreated(markFence).applied, true);
+      assert.equal(store.markFirstStartDispatching(markFence).applied, true);
+      assert.equal(store.markFirstStartDispatched(markFence).applied, true);
+      assert.equal(store.recordFirstStartObservation(markFence, 'running').applied, true);
       Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
       assert.deepEqual(store.scheduleRetry({ ...claim, sourceState: 'running' }, { scheduleKey: 'late', stage: 'direct_acquisition', failure: { class: 'transient', code: 'temporary' }, policy: testRetryPolicy(1) }), { applied: false, reason: 'deadline_expired' });
       (store as unknown as { databaseNow: () => number }).databaseNow = () => claim.heartbeatAt;
@@ -2058,17 +2352,16 @@ function withQueueStore<T>(run: (fixture: QueueFixture) => T, options: { leaseMs
   }
 }
 
-// Task 7 owns dispatch-journal CAS/recovery; Task 4 fixtures persist dispatched evidence through SQLite constraints.
-function dispatchAndMarkRunning(store: CareerStore, databasePath: string, claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>) {
-  const database = new DatabaseSync(databasePath);
-  const dispatched = database.prepare(`
-    UPDATE career_commands SET start_dispatch_state = 'dispatched'
-    WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
-      AND claim_generation = ? AND queue_state IN ('starting', 'resuming')
-  `).run(claim.commandId, claim.runId, claim.ownerResourceId, claim.leaseOwner, claim.claimGeneration);
-  database.close();
-  assert.equal(dispatched.changes, 1, 'test fixture must exercise persisted claim constraints');
-  return store.markRunning({ ...claim, sourceState: claim.queueState });
+// Task 7 owns dispatch-journal CAS/recovery; later-task fixtures use its public evidence path.
+function dispatchAndMarkRunning(store: CareerStore, _databasePath: string, claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>) {
+  const fence = { ...claim, sourceState: claim.queueState };
+  if (claim.queueState === 'starting') {
+    assert.equal(store.markFirstRunCreated(fence).applied, true);
+    assert.equal(store.markFirstStartDispatching(fence).applied, true);
+    assert.equal(store.markFirstStartDispatched(fence).applied, true);
+    assert.equal(store.recordFirstStartObservation(fence, 'running').applied, true);
+  }
+  return store.markRunning(fence);
 }
 
 let retryFixtureSequence = 0;

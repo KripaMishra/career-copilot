@@ -827,12 +827,122 @@ BEGIN
 END;
 `;
 
+const firstStartDispatchJournalSql = `
+CREATE TABLE career_start_dispatch_journal (
+  command_id TEXT PRIMARY KEY REFERENCES career_commands(command_id) ON DELETE RESTRICT,
+  schema_version INTEGER NOT NULL DEFAULT 1 CHECK (schema_version = 1),
+  workflow_version INTEGER NOT NULL CHECK (workflow_version > 0),
+  workflow_attempt INTEGER NOT NULL CHECK (workflow_attempt > 0),
+  run_id TEXT NOT NULL UNIQUE CHECK (run_id = 'cc-save-v1:' || command_id || ':' || workflow_attempt),
+  resource_id TEXT NOT NULL CHECK (length(resource_id) BETWEEN 1 AND 200),
+  claim_generation INTEGER NOT NULL CHECK (claim_generation > 0),
+  run_creation_state TEXT NOT NULL DEFAULT 'not_created' CHECK (run_creation_state IN ('not_created', 'creating', 'created', 'create_unknown')),
+  creation_claim_generation INTEGER CHECK (creation_claim_generation IS NULL OR creation_claim_generation > 0),
+  dispatch_state TEXT NOT NULL DEFAULT 'not_dispatched' CHECK (dispatch_state IN ('not_dispatched', 'dispatching', 'dispatched', 'start_unknown')),
+  observed_run_status TEXT CHECK (observed_run_status IS NULL OR observed_run_status IN ('pending', 'running', 'waiting', 'suspended', 'success', 'failed', 'tripwire', 'canceled', 'bailed', 'paused', 'skipped')),
+  created_at INTEGER NOT NULL CHECK (created_at >= 0),
+  updated_at INTEGER NOT NULL CHECK (updated_at >= created_at),
+  CHECK ((run_creation_state = 'not_created' AND creation_claim_generation IS NULL) OR (run_creation_state <> 'not_created' AND creation_claim_generation IS NOT NULL)),
+  FOREIGN KEY (command_id, run_id) REFERENCES career_commands(command_id, run_id) ON DELETE RESTRICT
+) STRICT;
+UPDATE career_commands SET start_dispatch_state = 'start_unknown'
+WHERE queue_state = 'starting' AND start_dispatch_state <> 'not_dispatched';
+INSERT INTO career_start_dispatch_journal (
+  command_id, workflow_version, workflow_attempt, run_id, resource_id, claim_generation,
+  run_creation_state, creation_claim_generation, dispatch_state, created_at, updated_at
+)
+SELECT command_id, workflow_version, workflow_attempt, run_id, owner_resource_id, max(1, claim_generation),
+  CASE start_dispatch_state WHEN 'not_dispatched' THEN 'not_created' ELSE 'create_unknown' END,
+  CASE start_dispatch_state WHEN 'not_dispatched' THEN NULL ELSE max(1, claim_generation) END,
+  start_dispatch_state, processing_started_at, updated_at
+FROM career_commands WHERE queue_state = 'starting';
+CREATE TRIGGER career_start_dispatch_insert_authority
+BEFORE INSERT ON career_start_dispatch_journal
+WHEN COALESCE(NOT EXISTS (
+  SELECT 1 FROM career_commands c WHERE c.command_id = NEW.command_id AND c.run_id = NEW.run_id
+    AND c.workflow_version = NEW.workflow_version AND c.workflow_attempt = NEW.workflow_attempt
+    AND c.owner_resource_id = NEW.resource_id AND c.claim_generation = NEW.claim_generation
+    AND c.queue_state = 'starting' AND c.lease_owner IS NOT NULL
+    AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.start_dispatch_state = NEW.dispatch_state
+), 1)
+BEGIN SELECT RAISE(ABORT, 'first-start insert authority denied'); END;
+CREATE TRIGGER career_start_dispatch_identity_immutable
+BEFORE UPDATE OF command_id, schema_version, workflow_version, workflow_attempt, run_id, resource_id, created_at ON career_start_dispatch_journal
+BEGIN SELECT RAISE(ABORT, 'first-start correlation is immutable'); END;
+CREATE TRIGGER career_start_dispatch_delete_immutable
+BEFORE DELETE ON career_start_dispatch_journal
+BEGIN SELECT RAISE(ABORT, 'first-start journal is immutable'); END;
+CREATE TRIGGER career_start_dispatch_update_authority
+BEFORE UPDATE ON career_start_dispatch_journal
+WHEN COALESCE(NEW.updated_at < OLD.updated_at OR NOT EXISTS (
+  SELECT 1 FROM career_commands c WHERE c.command_id = NEW.command_id AND c.run_id = NEW.run_id
+    AND c.workflow_version = NEW.workflow_version AND c.workflow_attempt = NEW.workflow_attempt
+    AND c.owner_resource_id = NEW.resource_id AND c.claim_generation = NEW.claim_generation
+    AND c.queue_state = 'starting' AND c.lease_owner IS NOT NULL
+    AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.start_dispatch_state = OLD.dispatch_state
+) OR NEW.claim_generation < OLD.claim_generation OR (
+  NEW.claim_generation > OLD.claim_generation AND NOT (
+    NEW.run_creation_state = OLD.run_creation_state
+    AND NEW.creation_claim_generation IS OLD.creation_claim_generation
+    AND NEW.dispatch_state = OLD.dispatch_state
+    AND NEW.observed_run_status IS OLD.observed_run_status
+  )
+), 1)
+BEGIN SELECT RAISE(ABORT, 'first-start update authority denied'); END;
+CREATE TRIGGER career_start_creation_state_transition
+BEFORE UPDATE OF run_creation_state, creation_claim_generation ON career_start_dispatch_journal
+WHEN NOT (OLD.run_creation_state IS NEW.run_creation_state AND OLD.creation_claim_generation IS NEW.creation_claim_generation) AND NOT (
+  (OLD.run_creation_state = 'not_created' AND NEW.run_creation_state = 'creating' AND NEW.creation_claim_generation = NEW.claim_generation) OR
+  (OLD.run_creation_state = 'not_created' AND NEW.run_creation_state = 'created' AND NEW.creation_claim_generation = NEW.claim_generation) OR
+  (OLD.run_creation_state = 'creating' AND NEW.run_creation_state = 'created' AND NEW.creation_claim_generation = OLD.creation_claim_generation) OR
+  (OLD.run_creation_state IN ('creating', 'created') AND NEW.run_creation_state = 'create_unknown' AND NEW.creation_claim_generation = OLD.creation_claim_generation)
+)
+BEGIN SELECT RAISE(ABORT, 'illegal first-start creation transition'); END;
+CREATE TRIGGER career_start_dispatch_state_transition
+BEFORE UPDATE OF dispatch_state ON career_start_dispatch_journal
+WHEN OLD.dispatch_state <> NEW.dispatch_state AND NOT (
+  (OLD.dispatch_state = 'not_dispatched' AND NEW.dispatch_state = 'dispatching' AND NEW.run_creation_state = 'created') OR
+  (OLD.dispatch_state = 'not_dispatched' AND NEW.dispatch_state = 'start_unknown') OR
+  (OLD.dispatch_state = 'dispatching' AND NEW.dispatch_state IN ('dispatched', 'start_unknown')) OR
+  (OLD.dispatch_state = 'dispatched' AND NEW.dispatch_state = 'start_unknown') OR
+  (OLD.dispatch_state = 'start_unknown' AND NEW.dispatch_state = 'dispatched' AND NEW.observed_run_status IN ('running','waiting','suspended','success','failed','tripwire','canceled','bailed','paused','skipped'))
+)
+BEGIN SELECT RAISE(ABORT, 'illegal first-start dispatch transition'); END;
+CREATE TRIGGER career_start_observed_terminal_immutable
+BEFORE UPDATE OF observed_run_status ON career_start_dispatch_journal
+WHEN OLD.observed_run_status IN ('success','failed','tripwire','canceled','bailed','skipped')
+  AND NOT (NEW.observed_run_status IS OLD.observed_run_status)
+BEGIN SELECT RAISE(ABORT, 'terminal first-start observation is immutable'); END;
+CREATE TRIGGER career_commands_start_dispatch_authority
+BEFORE UPDATE OF start_dispatch_state ON career_commands
+WHEN OLD.start_dispatch_state <> NEW.start_dispatch_state AND COALESCE(
+  NOT EXISTS (
+    SELECT 1 FROM career_start_dispatch_journal j WHERE j.command_id = NEW.command_id
+      AND j.run_id = NEW.run_id AND j.resource_id = NEW.owner_resource_id
+      AND j.claim_generation = NEW.claim_generation AND j.dispatch_state = NEW.start_dispatch_state
+  ), 1)
+BEGIN SELECT RAISE(ABORT, 'command first-start dispatch authority denied'); END;
+CREATE TRIGGER career_start_dispatch_project_command
+AFTER UPDATE OF dispatch_state ON career_start_dispatch_journal
+WHEN OLD.dispatch_state <> NEW.dispatch_state
+BEGIN
+  UPDATE career_commands SET start_dispatch_state = NEW.dispatch_state, updated_at = NEW.updated_at
+  WHERE command_id = NEW.command_id AND run_id = NEW.run_id AND owner_resource_id = NEW.resource_id
+    AND claim_generation = NEW.claim_generation AND queue_state = 'starting';
+END;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: 'legacy_idempotency_compatibility', sql: legacyCompatibilitySql, checksum: '606b96f6bea28639b2f8699634873cfeb02a1f6ef549bc0b676e2f6c7a8cbd28' }),
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
   Object.freeze({ version: 3, name: 'queue_fencing', sql: queueFencingSql, checksum: 'befa6ba8eec3fcca3fe235e29c6f162ad83482b6f268d073a45534b43ba73d09' }),
   Object.freeze({ version: 4, name: 'normalized_authorized_intake', sql: normalizedIntakeSql, checksum: 'f4a09f69f4cd9c6c777d5d2a1264a70ca6ad55d1df5a4cd155722681e3b7851b' }),
   Object.freeze({ version: 5, name: 'durable_retry_policy', sql: retryPolicySql, checksum: '025bad062c801c0d130eeeb481355ce662e8a6917d38961856d27689a21ccb38' }),
+  Object.freeze({ version: 6, name: 'first_start_dispatch_journal', sql: firstStartDispatchJournalSql, checksum: '1987c52f737eae28f1c87f0e74df062f94a6fb08b961df3d24e404153df2389e' }),
 ]);
 
 const LEDGER_SQL = `
@@ -921,6 +1031,7 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
     }
     if (version >= 4) expected.exec(normalizedIntakeSql);
     if (version >= 5) expected.exec(retryPolicySql);
+    if (version >= 6) expected.exec(firstStartDispatchJournalSql);
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -1121,6 +1232,19 @@ export type WorkerFence = {
 };
 
 export type WorkerWriteResult = { applied: true; updatedAt: number } | { applied: false; reason: 'lease_lost' };
+export type FirstStartJournal = {
+  commandId: string;
+  workflowVersion: number;
+  workflowAttempt: number;
+  runId: string;
+  resourceId: string;
+  claimGeneration: number;
+  runCreationState: 'not_created' | 'creating' | 'created' | 'create_unknown';
+  creationClaimGeneration: number | null;
+  dispatchState: 'not_dispatched' | 'dispatching' | 'dispatched' | 'start_unknown';
+  observedRunStatus: 'pending' | 'running' | 'waiting' | 'suspended' | 'success' | 'failed' | 'tripwire' | 'canceled' | 'bailed' | 'paused' | 'skipped' | null;
+  canonicalUrl: string;
+};
 export type RetryScheduleInput = {
   scheduleKey: string;
   stage: RetryStage;
@@ -1413,6 +1537,18 @@ export class CareerStore {
         `).run(leaseOwner, this.leaseMs, current.commandId, current.ownerResourceId, current.queueState);
       }
       if (Number(result.changes) !== 1 || runId === null) throw new Error('Atomic queue claim lost unexpectedly.');
+      if (nextState === 'starting') {
+        this.database.prepare(`
+          INSERT INTO career_start_dispatch_journal (
+            command_id, workflow_version, workflow_attempt, run_id, resource_id, claim_generation,
+            run_creation_state, dispatch_state, created_at, updated_at
+          )
+          SELECT command_id, workflow_version, workflow_attempt, run_id, owner_resource_id, claim_generation,
+            'not_created', start_dispatch_state, processing_started_at, updated_at
+          FROM career_commands WHERE command_id = ?
+          ON CONFLICT(command_id) DO UPDATE SET claim_generation = excluded.claim_generation, updated_at = excluded.updated_at
+        `).run(current.commandId);
+      }
       const persisted = this.database.prepare(`SELECT claim_generation AS generation, lease_expires_at AS leaseExpiresAt,
         heartbeat_at AS heartbeatAt FROM career_commands WHERE command_id = ?`).get(current.commandId) as { generation: number; leaseExpiresAt: number; heartbeatAt: number };
       this.database.exec('COMMIT');
@@ -1449,6 +1585,109 @@ export class CareerStore {
     return result ? { applied: true, updatedAt: Number(result.updatedAt) } : { applied: false, reason: 'lease_lost' };
   }
 
+  getFirstStartJournal(commandId: string): FirstStartJournal | undefined {
+    return this.database.prepare(`
+      SELECT j.command_id AS commandId, j.workflow_version AS workflowVersion, j.workflow_attempt AS workflowAttempt,
+        j.run_id AS runId, j.resource_id AS resourceId, j.claim_generation AS claimGeneration,
+        j.run_creation_state AS runCreationState, j.creation_claim_generation AS creationClaimGeneration, j.dispatch_state AS dispatchState,
+        j.observed_run_status AS observedRunStatus, c.canonical_url AS canonicalUrl
+      FROM career_start_dispatch_journal j JOIN career_commands c ON c.command_id = j.command_id
+      WHERE j.command_id = ?
+    `).get(commandId) as FirstStartJournal | undefined;
+  }
+
+  private updateFirstStart(fence: WorkerFence, journalSet: string, predicate = '1'): WorkerWriteResult {
+    const safeId = /^[A-Za-z0-9_.:@-]{1,200}$/;
+    if (!fence || typeof fence !== 'object' || fence.sourceState !== 'starting'
+      || ![fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner].every((value) => typeof value === 'string' && safeId.test(value))
+      || !Number.isSafeInteger(fence.claimGeneration) || fence.claimGeneration < 1) return { applied: false, reason: 'lease_lost' };
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.database.prepare(`
+          UPDATE career_start_dispatch_journal AS j SET ${journalSet}, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          WHERE command_id = ? AND run_id = ? AND resource_id = ? AND claim_generation = ? AND (${predicate})
+            AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id = j.command_id AND c.run_id = j.run_id
+              AND c.owner_resource_id = j.resource_id AND c.lease_owner = ? AND c.claim_generation = ? AND c.queue_state = ?
+              AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+              AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER))
+          RETURNING updated_at AS updatedAt
+      `).get(fence.commandId, fence.runId, fence.ownerResourceId, fence.claimGeneration,
+        fence.leaseOwner, fence.claimGeneration, fence.sourceState) as { updatedAt: number } | undefined;
+      if (!row) {
+        this.database.exec('ROLLBACK');
+        return { applied: false, reason: 'lease_lost' };
+      }
+      this.database.exec('COMMIT');
+      return { applied: true, updatedAt: Number(row.updatedAt) };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  claimFirstRunCreation(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence,
+      `run_creation_state = 'creating', creation_claim_generation = ${Number(fence.claimGeneration)}`, "run_creation_state = 'not_created'");
+  }
+
+  markFirstRunCreated(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence,
+      `run_creation_state = 'created', creation_claim_generation = COALESCE(creation_claim_generation, ${Number(fence.claimGeneration)})`,
+      `run_creation_state IN ('not_created', 'creating', 'created')`);
+  }
+
+  markFirstRunCreateUnknown(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence,
+      `run_creation_state = 'create_unknown', dispatch_state = 'start_unknown'`, "run_creation_state IN ('creating', 'created')");
+  }
+
+  markFirstStartDispatching(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence, `dispatch_state = 'dispatching'`, "dispatch_state = 'not_dispatched' AND run_creation_state = 'created'");
+  }
+
+  markFirstStartDispatched(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence, `dispatch_state = 'dispatched'`, "dispatch_state = 'dispatching'");
+  }
+
+  markFirstStartUnknown(fence: WorkerFence): WorkerWriteResult {
+    return this.updateFirstStart(fence, `dispatch_state = 'start_unknown'`, "dispatch_state IN ('dispatching', 'dispatched')");
+  }
+
+  recordFirstStartObservation(fence: WorkerFence, status: FirstStartJournal['observedRunStatus']): WorkerWriteResult {
+    if (status === null) return { applied: false, reason: 'lease_lost' };
+    const allowed: readonly NonNullable<FirstStartJournal['observedRunStatus']>[] = ['pending', 'running', 'waiting', 'suspended', 'success', 'failed', 'tripwire', 'canceled', 'bailed', 'paused', 'skipped'];
+    if (!allowed.includes(status)) return { applied: false, reason: 'lease_lost' };
+    if (status === 'pending') return this.updateFirstStart(fence, `observed_run_status = '${status}'`);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      let updatedAt = this.updateFirstStartInOpenTransaction(fence, `observed_run_status = '${status}'`);
+        if (!updatedAt) { this.database.exec('ROLLBACK'); return { applied: false, reason: 'lease_lost' }; }
+        const current = this.getFirstStartJournal(fence.commandId);
+        if (current?.dispatchState === 'not_dispatched') {
+          updatedAt = this.updateFirstStartInOpenTransaction(fence, "dispatch_state = 'dispatching'");
+          if (!updatedAt) { this.database.exec('ROLLBACK'); return { applied: false, reason: 'lease_lost' }; }
+        }
+        const after = this.getFirstStartJournal(fence.commandId);
+        if (after && after.dispatchState !== 'dispatched') {
+          updatedAt = this.updateFirstStartInOpenTransaction(fence, "dispatch_state = 'dispatched'");
+          if (!updatedAt) { this.database.exec('ROLLBACK'); return { applied: false, reason: 'lease_lost' }; }
+        }
+      this.database.exec('COMMIT');
+      return { applied: true, updatedAt };
+    } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
+
+  private updateFirstStartInOpenTransaction(fence: WorkerFence, journalSet: string): number | null {
+    const row = this.database.prepare(`UPDATE career_start_dispatch_journal AS j SET ${journalSet}, updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+      WHERE command_id = ? AND run_id = ? AND resource_id = ? AND claim_generation = ?
+        AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id = j.command_id AND c.run_id = j.run_id
+          AND c.owner_resource_id = j.resource_id AND c.lease_owner = ? AND c.claim_generation = ? AND c.queue_state = ?
+          AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+          AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)) RETURNING updated_at AS updatedAt`)
+      .get(fence.commandId, fence.runId, fence.ownerResourceId, fence.claimGeneration, fence.leaseOwner, fence.claimGeneration, fence.sourceState) as { updatedAt: number } | undefined;
+    return row ? Number(row.updatedAt) : null;
+  }
+
   markRunning(fence: WorkerFence): WorkerWriteResult {
     if (fence.sourceState !== 'starting' && fence.sourceState !== 'resuming') return { applied: false, reason: 'lease_lost' };
     return this.workerWrite(`
@@ -1458,6 +1697,12 @@ export class CareerStore {
         AND lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
         AND processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
         AND start_dispatch_state = 'dispatched'
+        AND (career_commands.queue_state = 'resuming' OR EXISTS (
+          SELECT 1 FROM career_start_dispatch_journal j WHERE j.command_id = career_commands.command_id
+            AND j.run_id = career_commands.run_id AND j.resource_id = career_commands.owner_resource_id
+            AND j.claim_generation = career_commands.claim_generation AND j.dispatch_state = 'dispatched'
+            AND j.observed_run_status = 'running'
+        ))
       RETURNING updated_at AS updatedAt
     `, fence);
   }

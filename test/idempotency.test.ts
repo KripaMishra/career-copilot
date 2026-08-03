@@ -162,9 +162,10 @@ test('due retry claims resume the same run with a higher generation', () => {
   });
   const starting = store.claimNextRunnable('worker-1')!;
   const startingFence = { ...starting, sourceState: 'starting' as const };
-  const database = new DatabaseSync(databasePath);
-  database.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatched' WHERE command_id = ? AND queue_state = 'starting'").run(starting.commandId);
-  database.close();
+  assert.equal(store.markFirstRunCreated(startingFence).applied, true);
+  assert.equal(store.markFirstStartDispatching(startingFence).applied, true);
+  assert.equal(store.markFirstStartDispatched(startingFence).applied, true);
+  assert.equal(store.recordFirstStartObservation(startingFence, 'running').applied, true);
   assert.equal(store.markRunning(startingFence).applied, true);
   assert.equal(store.scheduleRetry({ ...starting, sourceState: 'running' }, {
     scheduleKey: 'command-retry:direct:1', stage: 'direct_acquisition',
