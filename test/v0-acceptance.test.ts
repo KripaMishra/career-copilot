@@ -235,6 +235,81 @@ const rows: AcceptanceRow[] = [
     },
   },
   {
+    id: 'P18-populated-v2-to-v3-preserves-correlations',
+    run: () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-v2-preservation-'));
+      const databasePath = path.join(dir, 'operational.db');
+      const expectedPath = path.join(dir, 'expected-v3.db');
+      try {
+        const hash = `sha256:${'a'.repeat(64)}`;
+        const completion = fixture(contractFixtures(V0Contracts), 'CompletionEnvelopeV1Schema');
+        const envelope = JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({
+          ...suspensionEnvelope(completion), envelopeId: 'v2-envelope', commandId: 'v2-command', runId: 'v2-run',
+          blocker: { ...suspensionEnvelope(completion).blocker, blockerId: 'v2-suspension' },
+        }));
+        const terminalEnvelope = JSON.stringify(V0Contracts.CompletionEnvelopeV1Schema.parse({
+          ...completion, envelopeId: 'v2-terminal-envelope', commandId: 'v2-parent-command', runId: 'v2-parent-run', terminalGeneration: 1,
+        }));
+        const database = new DatabaseSync(databasePath);
+        database.exec(exactLegacySql);
+        database.exec(MIGRATIONS[0].sql);
+        database.exec(`
+          CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY CHECK (version > 0), name TEXT NOT NULL UNIQUE,
+            checksum TEXT NOT NULL CHECK (length(checksum) = 64), applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
+            legacy_outbox_preserved INTEGER NOT NULL CHECK (legacy_outbox_preserved IN (0, 1) AND (version = 1 OR legacy_outbox_preserved = 0))
+          ) STRICT;
+        `);
+        database.prepare('INSERT INTO schema_migrations VALUES (1, ?, ?, 1, 1)').run(MIGRATIONS[0].name, MIGRATIONS[0].checksum);
+        database.exec(MIGRATIONS[1].sql);
+        database.prepare('INSERT INTO schema_migrations VALUES (2, ?, ?, 2, 0)').run(MIGRATIONS[1].name, MIGRATIONS[1].checksum);
+        database.exec("INSERT INTO career_commands (command_id,attempt_id,request_id,canonical_job_key,canonical_url,owner_resource_id,thread_id,origin_channel,origin_destination,queue_state,run_id,start_dispatch_state,processing_started_at,processing_deadline_at,terminal_generation,created_at,updated_at,queued_at,completed_at,resolved_at) VALUES ('v2-parent-command','v2-parent-attempt','v2-parent-request','job:v2-parent','https://example.com/v2-parent','v2-owner','v2-thread','telegram','v2-chat','failed','v2-parent-run','not_dispatched',2,100,1,1,3,1,3,3)");
+        database.exec("INSERT INTO career_commands (command_id,attempt_id,parent_command_id,request_id,canonical_job_key,canonical_url,owner_resource_id,thread_id,origin_channel,origin_destination,queue_state,run_id,start_dispatch_state,processing_started_at,suspension_generation,blocker_id,created_at,updated_at,queued_at) VALUES ('v2-command','v2-attempt','v2-parent-command','v2-request','job:v2','https://example.com/v2','v2-owner','v2-thread','telegram','v2-chat','suspended','v2-run','dispatched',2,1,'v2-suspension',1,2,1)");
+        database.exec("INSERT INTO career_stage_journal (stage_record_id,command_id,run_id,stage_key,stage_version,state,idempotency_key,created_at,updated_at) VALUES ('v2-stage','v2-command','v2-run','acquire',1,'planned','v2-stage-key',2,2)");
+        database.prepare("INSERT INTO career_suspensions (suspension_id,command_id,run_id,suspended_step,blocker_kind,blocker_state,blocker_schema_version,generation,safe_payload,payload_hash,source_hash,profile_hash,prompt_version,prompt_hash,resume_schema_version,resume_schema_hash,allowed_response,issued_at,expires_at,created_at,updated_at) VALUES ('v2-suspension','v2-command','v2-run','acquire','reauth_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',2,100,2,2)").run(hash, hash, hash, hash, hash);
+        database.prepare("INSERT INTO career_completion_outbox (envelope_id,command_id,run_id,envelope_kind,suspension_generation,suspension_id,envelope_json,state,created_at,updated_at) VALUES ('v2-envelope','v2-command','v2-run','suspension',1,'v2-suspension',?,'pending',2,2)").run(envelope);
+        database.prepare("INSERT INTO career_completion_outbox (envelope_id,command_id,run_id,envelope_kind,terminal_generation,envelope_json,state,created_at,updated_at) VALUES ('v2-terminal-envelope','v2-parent-command','v2-parent-run','terminal',1,?,'pending',3,3)").run(terminalEnvelope);
+        database.exec("INSERT INTO career_deliveries (delivery_id,delivery_key,source_kind,envelope_id,source_command_id,source_run_id,destination_channel,destination_id,owner_resource_id,thread_id,origin_channel,origin_destination,authorization_revision,state,retry_deadline_at,created_at,updated_at) VALUES ('v2-delivery','v2-delivery-key','completion','v2-envelope','v2-command','v2-run','telegram','v2-chat','v2-owner','v2-thread','telegram','v2-chat',0,'pending',100,2,2)");
+        database.prepare("INSERT INTO career_evidence_records (evidence_id,command_id,source_url,acquisition_method,acquired_at,bounded_spans,bounded_excerpts,source_hash,source_version,profile_hash,profile_version,retention_deadline_at,created_at) VALUES ('v2-evidence','v2-command','https://example.com/v2','direct_fetch',2,'[]','[]',?,'v1',?,'v1',100,2)").run(hash, hash);
+        database.exec("INSERT INTO career_structured_events (event_id,event_kind,owner_resource_id,command_id,safe_fields,occurred_at,retention_deadline_at) VALUES ('v2-event','audit','v2-owner','v2-command','{}',2,100)");
+        const tables = ['career_commands', 'career_stage_journal', 'career_suspensions', 'career_completion_outbox', 'career_deliveries', 'career_evidence_records', 'career_structured_events'];
+        const before = Object.fromEntries(tables.map((table) => [table, database.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row }))]));
+        database.close();
+
+        const store = new CareerStore(`file:${databasePath}`);
+        store.close();
+        const expectedStore = new CareerStore(`file:${expectedPath}`);
+        expectedStore.close();
+        const upgraded = new DatabaseSync(databasePath, { readOnly: true });
+        const expected = new DatabaseSync(expectedPath, { readOnly: true });
+        for (const table of tables) assert.deepEqual(upgraded.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row })), before[table], table);
+        const v3ObjectsSql = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE (name LIKE 'career_%' OR tbl_name LIKE 'career_%') AND name <> 'career_outbox' AND tbl_name <> 'career_outbox' ORDER BY type,name";
+        assert.deepEqual(
+          upgraded.prepare(v3ObjectsSql).all().map((row) => ({ ...row })),
+          expected.prepare(v3ObjectsSql).all().map((row) => ({ ...row })),
+        );
+        assert.deepEqual(upgraded.prepare('SELECT version,name,checksum FROM schema_migrations ORDER BY version').all().map((row) => ({ ...row })), MIGRATIONS.map(({ version, name, checksum }) => ({ version, name, checksum })));
+        assert.deepEqual(upgraded.prepare('PRAGMA foreign_key_check').all(), []);
+        assert.equal((upgraded.prepare("SELECT parent_command_id FROM career_commands WHERE command_id = 'v2-command'").get() as { parent_command_id: string }).parent_command_id, 'v2-parent-command');
+        const commandForeignKeys = upgraded.prepare('PRAGMA foreign_key_list(career_commands)').all() as Array<{ table: string; from: string; to: string }>;
+        assert.ok(commandForeignKeys.some((foreignKey) => foreignKey.table === 'career_commands' && foreignKey.from === 'parent_command_id' && foreignKey.to === 'command_id'));
+        const outboxForeignKeys = upgraded.prepare('PRAGMA foreign_key_list(career_completion_outbox)').all() as Array<{ id: number; seq: number; table: string; from: string; to: string }>;
+        const terminalForeignKeyId = outboxForeignKeys.find((foreignKey) => foreignKey.table === 'career_commands' && foreignKey.from === 'terminal_generation' && foreignKey.to === 'terminal_generation')?.id;
+        assert.notEqual(terminalForeignKeyId, undefined);
+        assert.deepEqual(
+          outboxForeignKeys.filter((foreignKey) => foreignKey.id === terminalForeignKeyId).sort((left, right) => left.seq - right.seq).map(({ from, to }) => ({ from, to })),
+          [
+            { from: 'command_id', to: 'command_id' },
+            { from: 'run_id', to: 'run_id' },
+            { from: 'terminal_generation', to: 'terminal_generation' },
+          ],
+        );
+        upgraded.close();
+        expected.close();
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    },
+  },
+  {
     id: 'P18-interrupted-migration-retry',
     run: () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-interrupted-'));
@@ -673,6 +748,19 @@ const rows: AcceptanceRow[] = [
         }
       }
       assert.equal(contracts.CommandV1Schema.safeParse(suspensionExpiryTimedOut(command)).success, true, 'suspension-expiry timeout');
+      const retryResume = commandForState(command, 'resuming');
+      retryResume.progress = { ...retryResume.progress, suspensionGeneration: 0, blockerId: null };
+      assert.equal(contracts.CommandV1Schema.safeParse(retryResume).success, true, 'first retry resume');
+      assert.equal(contracts.CommandV1Schema.safeParse({
+        ...retryResume,
+        progress: { ...retryResume.progress, suspensionGeneration: 1, blockerId: null },
+      }).success, true, 'retry resume after a historical suspension');
+      const suspensionResume = commandForState(command, 'resuming');
+      assert.equal(contracts.CommandV1Schema.safeParse(suspensionResume).success, true, 'accepted suspension resume');
+      assert.equal(contracts.CommandV1Schema.safeParse({
+        ...retryResume,
+        progress: { ...retryResume.progress, suspensionGeneration: 0, blockerId: 'blocker-1' },
+      }).success, false, 'suspension resume requires a positive generation');
       const completion = fixture(fixtures, 'CompletionEnvelopeV1Schema');
       assert.equal(contracts.CompletionEnvelopeV1Schema.safeParse(previouslySeenEnvelope(completion)).success, true, 'previously_seen');
       assert.equal(contracts.CompletionEnvelopeV1Schema.safeParse(failureEnvelope(completion, 'failed')).success, true, 'failed without tracker row');
@@ -850,6 +938,334 @@ const rows: AcceptanceRow[] = [
     },
   },
   {
+    id: 'P1-legal-queue-transition-table',
+    run: () => {
+      const expected = {
+        queued: ['starting'],
+        starting: ['running', 'timed_out'],
+        running: ['retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out'],
+        retry_wait: ['resuming', 'timed_out'],
+        suspended: ['resuming', 'timed_out'],
+        resuming: ['running', 'timed_out'],
+        succeeded: [],
+        failed: [],
+        timed_out: [],
+      };
+      assert.deepEqual(V0Contracts.LEGAL_QUEUE_TRANSITIONS_V0, expected);
+      const states = Object.keys(expected) as V0Contracts.QueueStateV0[];
+      for (const from of states) {
+        for (const to of states) {
+          const listed = expected[from].includes(to as never);
+          assert.equal(V0Contracts.isLegalQueueTransitionV0(from, to), listed, `${from} -> ${to}`);
+        }
+      }
+      withQueueStore(({ databasePath }) => {
+        const database = new DatabaseSync(databasePath);
+        database.exec('PRAGMA ignore_check_constraints = ON');
+        for (const from of states) {
+          for (const to of states) {
+            if (from === to) continue;
+            const id = `trigger-${from}-${to}`;
+            database.prepare("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at) VALUES (?, ?, ?, 'job', 'https://example.com/job', 'owner-1', 'thread-1', 'telegram', 'chat-1', ?, 1, 1, 1)").run(id, `${id}:attempt`, `${id}:request`, from);
+            const update = () => database.prepare('UPDATE career_commands SET queue_state = ? WHERE command_id = ?').run(to, id);
+            if (expected[from].includes(to as never)) assert.doesNotThrow(update, `${from} -> ${to}`);
+            else assert.throws(update, /illegal queue transition|terminal command is immutable/i, `${from} -/-> ${to}`);
+          }
+        }
+        database.close();
+      });
+    },
+  },
+  {
+    id: 'P1-queued-has-no-processing-deadline',
+    run: () => withQueueStore(({ store }) => {
+      const first = store.enqueueCommand(queueInput('queued-a'));
+      const second = store.enqueueCommand(queueInput('queued-b'));
+      assert.deepEqual({ position: first.position, state: first.state }, { position: 1, state: 'queued' });
+      assert.deepEqual({ position: second.position, state: second.state }, { position: 2, state: 'queued' });
+      assert.equal(store.getCommand('queued-a')?.processingDeadlineAt, null);
+      assert.equal(store.queuePosition('queued-b'), 2);
+    }),
+  },
+  {
+    id: 'P1-database-clock-lease',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('clock-command'));
+      const originalNow = Date.now;
+      Date.now = () => 1;
+      let claim;
+      try { claim = store.claimNextRunnable('worker-clock'); } finally { Date.now = originalNow; }
+      assert.ok(claim);
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const databaseNow = Number((database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get() as { now: number }).now);
+      database.close();
+      assert.ok(Math.abs(claim.heartbeatAt - databaseNow) < 2_000);
+      assert.equal(claim.leaseExpiresAt - claim.heartbeatAt, 120_000);
+    }),
+  },
+  {
+    id: 'P1-simultaneous-process-claim',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('simultaneous-command'));
+      const dir = path.dirname(databasePath);
+      const gate = path.join(dir, 'claim-go');
+      const moduleUrl = new URL('../src/storage/career-store.ts', import.meta.url).href;
+      const children = ['a', 'b'].map((worker) => {
+        const ready = path.join(dir, `claim-${worker}-ready`);
+        const output = path.join(dir, `claim-${worker}.json`);
+        const program = `
+          import fs from 'node:fs';
+          import { setTimeout as delay } from 'node:timers/promises';
+          import { CareerStore } from ${JSON.stringify(moduleUrl)};
+          fs.writeFileSync(${JSON.stringify(ready)}, '');
+          while (!fs.existsSync(${JSON.stringify(gate)})) await delay(2);
+          const store = new CareerStore(${JSON.stringify(`file:${databasePath}`)});
+          const claim = store.claimNextRunnable(${JSON.stringify(`worker-${worker}`)});
+          fs.writeFileSync(${JSON.stringify(output)}, JSON.stringify(claim));
+          store.close();
+        `;
+        return { ready, output, result: runNode(program) };
+      });
+      await waitFor(() => children.every(({ ready }) => fs.existsSync(ready)), 'claim processes did not become ready');
+      fs.writeFileSync(gate, '');
+      await Promise.all(children.map(({ result }) => result));
+      const claims = children.map(({ output }) => JSON.parse(fs.readFileSync(output, 'utf8'))).filter(Boolean);
+      assert.equal(claims.length, 1);
+      assert.equal(claims[0].claimGeneration, 1);
+      assert.equal(claims[0].ownerResourceId, 'owner-1');
+      const persisted = store.getCommand('simultaneous-command')!;
+      assert.equal(persisted.claimGeneration, 1);
+      assert.equal(persisted.leaseOwner, claims[0].leaseOwner);
+    }),
+  },
+  {
+    id: 'P1-atomic-claim-owner-predicate',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('owner-predicate'));
+      const prepare = DatabaseSync.prototype.prepare;
+      let intercepted = false;
+      DatabaseSync.prototype.prepare = function (sql: string) {
+        const statement = prepare.call(this, sql);
+        if (!intercepted && /UPDATE career_commands[\s\S]*queue_state = 'starting'/.test(sql)) {
+          intercepted = true;
+          assert.match(sql, /owner_resource_id = \?/);
+          return { run: (...args: unknown[]) => statement.run(...args.slice(0, -1), 'mismatched-owner') } as never;
+        }
+        return statement;
+      };
+      try {
+        assert.throws(() => store.claimNextRunnable('worker-a'), /atomic queue claim lost unexpectedly/i);
+      } finally {
+        DatabaseSync.prototype.prepare = prepare;
+      }
+      assert.equal(intercepted, true);
+      assert.equal(store.getCommand('owner-predicate')?.queueState, 'queued');
+
+      const source = CareerStore.prototype.claimNextRunnable.toString();
+      const updates = source.match(/UPDATE career_commands[\s\S]*?`/g) ?? [];
+      assert.equal(updates.length, 3);
+      for (const update of updates) assert.match(update, /owner_resource_id = \?/);
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      assert.equal(database.prepare("SELECT owner_resource_id FROM career_commands WHERE command_id='owner-predicate'").get()!.owner_resource_id, 'owner-1');
+      database.close();
+    }),
+  },
+  {
+    id: 'P1-stale-generation-zero-row',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('stale-command'));
+      const claim = store.claimNextRunnable('worker-a')!;
+      const starting = { ...claim, sourceState: 'starting' as const };
+      for (const stale of [
+        { ...starting, ownerResourceId: 'owner-2' },
+        { ...starting, leaseOwner: 'worker-b' },
+        { ...starting, claimGeneration: claim.claimGeneration + 1 },
+        { ...starting, runId: 'wrong-run' },
+      ]) assert.deepEqual(store.renewClaim(stale), { applied: false, reason: 'lease_lost' });
+      const database = new DatabaseSync(databasePath);
+      database.prepare('UPDATE career_commands SET lease_expires_at = ? WHERE command_id = ?').run(0, claim.commandId);
+      database.close();
+      assert.deepEqual(store.renewClaim(starting), { applied: false, reason: 'lease_lost' });
+      assert.equal(store.getCommand('stale-command')?.claimGeneration, claim.claimGeneration);
+    }),
+  },
+  {
+    id: 'P1-reclaimed-worker-wins',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('reclaimed-command'));
+      const first = store.claimNextRunnable('worker-a')!;
+      assert.equal(dispatchAndMarkRunning(store, databasePath, first).applied, true);
+      await delay(25);
+      const second = store.claimNextRunnable('worker-b')!;
+      assert.equal(second.queueState, 'running');
+      assert.equal(second.commandId, first.commandId);
+      assert.equal(second.claimGeneration, first.claimGeneration + 1);
+      assert.deepEqual(store.completeClaim({ ...first, sourceState: 'running' }, 'succeeded'), { applied: false, reason: 'lease_lost' });
+      assert.equal(store.completeClaim({ ...second, sourceState: 'running' }, 'succeeded').applied, true);
+    }, { leaseMs: 10 }),
+  },
+  {
+    id: 'P1-terminal-immutable',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('terminal-command'));
+      const claim = store.claimNextRunnable('worker-a')!;
+      assert.equal(dispatchAndMarkRunning(store, databasePath, claim).applied, true);
+      assert.equal(store.completeClaim({ ...claim, sourceState: 'running' }, 'succeeded').applied, true);
+      assert.deepEqual(store.completeClaim({ ...claim, sourceState: 'running' }, 'failed'), { applied: false, reason: 'lease_lost' });
+      const database = new DatabaseSync(databasePath);
+      assert.throws(() => database.exec("UPDATE career_commands SET queue_state='queued' WHERE command_id='terminal-command'"), /terminal command is immutable/i);
+      database.close();
+    }),
+  },
+  {
+    id: 'P3-stage-journal-required-for-effect',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      store.enqueueCommand(queueInput('effect-command'));
+      const claim = store.claimNextRunnable('worker-a')!;
+      assert.equal(dispatchAndMarkRunning(store, databasePath, claim).applied, true);
+      const guard = { ...claim, sourceState: 'running' as const, stageKey: 'sheet_commit', stageVersion: 1, idempotencyKey: 'effect-command:sheet_commit:1', expectedSheetFingerprint: `sha256:${'a'.repeat(64)}`, expectedRowVersion: 2 };
+      assert.deepEqual(store.authorizeExternalEffect(guard), { authorized: false, reason: 'stage_guard_failed' });
+      const database = new DatabaseSync(databasePath);
+      database.prepare("INSERT INTO career_stage_journal (stage_record_id, command_id, run_id, stage_key, stage_version, state, idempotency_key, expected_sheet_fingerprint, expected_row_version, created_at, updated_at) VALUES ('effect-stage','effect-command',?,'sheet_commit',1,'planned',?,?,2,1,1)").run(claim.runId, guard.idempotencyKey, guard.expectedSheetFingerprint);
+      database.exec("UPDATE career_stage_journal SET state='applying', updated_at=2 WHERE stage_record_id='effect-stage'");
+      database.close();
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, stageVersion: 2 }), { authorized: false, reason: 'stage_guard_failed' });
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, idempotencyKey: 'wrong-key' }), { authorized: false, reason: 'stage_guard_failed' });
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, expectedRowVersion: 3 }), { authorized: false, reason: 'stage_guard_failed' });
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, ownerResourceId: 'owner-2' }), { authorized: false, reason: 'lease_lost' });
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, leaseOwner: 'worker-b' }), { authorized: false, reason: 'lease_lost' });
+      assert.deepEqual(store.authorizeExternalEffect({ ...guard, claimGeneration: guard.claimGeneration + 1 }), { authorized: false, reason: 'lease_lost' });
+      assert.deepEqual(store.authorizeExternalEffect(guard), { authorized: true, stageRecordId: 'effect-stage' });
+      const expired = new DatabaseSync(databasePath);
+      expired.prepare('UPDATE career_commands SET processing_deadline_at = 0 WHERE command_id = ?').run(claim.commandId);
+      expired.close();
+      assert.deepEqual(store.authorizeExternalEffect(guard), { authorized: false, reason: 'lease_lost' });
+    }),
+  },
+  {
+    id: 'P1-owner-and-deadline-fence-every-worker-write',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      const expireDeadline = (commandId: string) => {
+        const database = new DatabaseSync(databasePath);
+        database.prepare('UPDATE career_commands SET processing_deadline_at = 0 WHERE command_id = ?').run(commandId);
+        database.close();
+      };
+      store.enqueueCommand(queueInput('deadline-start'));
+      const start = store.claimNextRunnable('worker-a')!;
+      const startFence = { ...start, sourceState: 'starting' as const };
+      assert.deepEqual(store.renewClaim({ ...startFence, ownerResourceId: 'owner-2' }), { applied: false, reason: 'lease_lost' });
+      const fixtureDatabase = new DatabaseSync(databasePath);
+      fixtureDatabase.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatched' WHERE command_id = ?").run(start.commandId);
+      fixtureDatabase.close();
+      for (const stale of [
+        { ...startFence, ownerResourceId: 'owner-2' },
+        { ...startFence, leaseOwner: 'worker-b' },
+        { ...startFence, claimGeneration: startFence.claimGeneration + 1 },
+      ]) assert.deepEqual(store.markRunning(stale), { applied: false, reason: 'lease_lost' });
+      assert.equal(store.markRunning(startFence).applied, true);
+      const running = { ...start, sourceState: 'running' as const };
+      for (const stale of [
+        { ...running, ownerResourceId: 'owner-2' },
+        { ...running, leaseOwner: 'worker-b' },
+        { ...running, claimGeneration: running.claimGeneration + 1 },
+      ]) {
+        assert.deepEqual(store.renewClaim(stale), { applied: false, reason: 'lease_lost' });
+        assert.deepEqual(store.releaseForRetry(stale, 0), { applied: false, reason: 'lease_lost' });
+        assert.deepEqual(store.completeClaim(stale, 'succeeded'), { applied: false, reason: 'lease_lost' });
+      }
+      expireDeadline(start.commandId);
+      assert.deepEqual(store.renewClaim(running), { applied: false, reason: 'lease_lost' });
+      assert.deepEqual(store.releaseForRetry(running, 0), { applied: false, reason: 'lease_lost' });
+      assert.deepEqual(store.completeClaim(running, 'succeeded'), { applied: false, reason: 'lease_lost' });
+
+    }),
+  },
+  {
+    id: 'P1-historical-suspension-retry-resume',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      const database = new DatabaseSync(databasePath);
+      const now = Number(database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get()!.now);
+      database.prepare(`
+        INSERT INTO career_commands (
+          command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id,
+          thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state,
+          processing_started_at, suspension_generation, blocker_id, created_at, updated_at, queued_at
+        ) VALUES ('historical-suspension', 'historical-attempt', 'historical-request', 'job:historical',
+          'https://example.com/jobs/historical', 'owner-1', 'thread-1', 'telegram', 'chat-1',
+          'suspended', 'run-historical', 'dispatched', ?, 1, 'blocker-1', ?, ?, ?)
+      `).run(now - 10, now - 10, now - 10, now - 10);
+      database.prepare(`
+        UPDATE career_commands
+        SET queue_state = 'resuming', claim_generation = 1, lease_owner = 'worker-suspension',
+          lease_expires_at = ?, heartbeat_at = ?, processing_deadline_at = ?, updated_at = ?
+        WHERE command_id = 'historical-suspension' AND queue_state = 'suspended'
+      `).run(now + 60_000, now, now + 60_000, now);
+      database.close();
+
+      const suspensionResume = {
+        commandId: 'historical-suspension', runId: 'run-historical', ownerResourceId: 'owner-1',
+        queueState: 'resuming' as const, leaseOwner: 'worker-suspension', claimGeneration: 1,
+        leaseExpiresAt: now + 60_000, heartbeatAt: now,
+      };
+      assert.equal(store.markRunning({ ...suspensionResume, sourceState: 'resuming' }).applied, true);
+      assert.equal(store.releaseForRetry({ ...suspensionResume, sourceState: 'running' }, 0).applied, true);
+      const retryResume = store.claimNextRunnable('worker-retry')!;
+      assert.equal(retryResume.queueState, 'resuming');
+      const inspect = new DatabaseSync(databasePath, { readOnly: true });
+      const persisted = inspect.prepare("SELECT suspension_generation, blocker_id FROM career_commands WHERE command_id='historical-suspension'").get()!;
+      inspect.close();
+      assert.deepEqual({ ...persisted }, { suspension_generation: 1, blocker_id: null });
+    }),
+  },
+  {
+    id: 'P12-guarded-timeout-transitions',
+    run: async () => withQueueStore(async ({ store, databasePath }) => {
+      for (const id of ['timeout-starting', 'timeout-running', 'timeout-retry', 'timeout-resuming']) store.enqueueCommand(queueInput(id));
+      store.claimNextRunnable('worker-starting');
+      const running = store.claimNextRunnable('worker-running')!;
+      dispatchAndMarkRunning(store, databasePath, running);
+      const retry = store.claimNextRunnable('worker-retry')!;
+      dispatchAndMarkRunning(store, databasePath, retry);
+      store.releaseForRetry({ ...retry, sourceState: 'running' }, 1_000);
+      const resume = store.claimNextRunnable('worker-resume')!;
+      dispatchAndMarkRunning(store, databasePath, resume);
+      store.releaseForRetry({ ...resume, sourceState: 'running' }, 0);
+      assert.equal(store.claimNextRunnable('worker-resume-2')?.queueState, 'resuming');
+      await delay(25);
+      assert.deepEqual(store.expireProcessingDeadlines(), { transitioned: 4 });
+      for (const id of ['timeout-starting', 'timeout-running', 'timeout-retry', 'timeout-resuming']) assert.equal(store.getCommand(id)?.queueState, 'timed_out', id);
+      assert.equal(store.expireProcessingDeadlines().transitioned, 0);
+    }, { processingDeadlineMs: 15 }),
+  },
+  {
+    id: 'P12-current-suspension-expiry',
+    run: () => withQueueStore(({ store, databasePath }) => {
+      const database = new DatabaseSync(databasePath);
+      const now = Number((database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get() as { now: number }).now);
+      const hash = `sha256:${'a'.repeat(64)}`;
+      database.prepare("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('suspended-expired','suspended-attempt','suspended-request','job:suspended','https://example.com/jobs/suspended','owner-1','thread-1','telegram','chat-1','suspended','run-suspended','dispatched',?,2,'blocker-current',?,?,?)").run(now - 200, now - 200, now - 200, now - 200);
+      const insert = database.prepare("INSERT INTO career_suspensions (suspension_id, command_id, run_id, suspended_step, blocker_kind, blocker_state, blocker_schema_version, generation, safe_payload, payload_hash, source_hash, profile_hash, prompt_version, prompt_hash, resume_schema_version, resume_schema_hash, allowed_response, issued_at, expires_at, created_at, updated_at) VALUES (?,'suspended-expired','run-suspended','acquire','reauth_required','pending',1,?,'{}',?,?,?,1,?,1,?,'{}',?,?,?,?)");
+      insert.run('blocker-old', 1, hash, hash, hash, hash, hash, now - 200, now - 100, now - 200, now - 200);
+      insert.run('blocker-current', 2, hash, hash, hash, hash, hash, now - 50, now + 10_000, now - 50, now - 50);
+      database.close();
+      assert.deepEqual(store.expireSuspensions(), { transitioned: 0 });
+      let inspect = new DatabaseSync(databasePath);
+      assert.equal(inspect.prepare("SELECT blocker_state FROM career_suspensions WHERE suspension_id='blocker-old'").get()!.blocker_state, 'pending');
+      assert.equal(store.getCommand('suspended-expired')?.queueState, 'suspended');
+      inspect.prepare("UPDATE career_suspensions SET expires_at = ? WHERE suspension_id='blocker-current'").run(now - 1);
+      inspect.close();
+      assert.deepEqual(store.expireSuspensions(), { transitioned: 1 });
+      inspect = new DatabaseSync(databasePath, { readOnly: true });
+      assert.deepEqual(inspect.prepare('SELECT suspension_id, blocker_state FROM career_suspensions ORDER BY generation').all().map((row) => ({ ...row })), [
+        { suspension_id: 'blocker-old', blocker_state: 'pending' },
+        { suspension_id: 'blocker-current', blocker_state: 'expired' },
+      ]);
+      const terminal = inspect.prepare("SELECT queue_state, terminal_generation, error_code FROM career_commands WHERE command_id='suspended-expired'").get();
+      assert.deepEqual({ ...terminal }, { queue_state: 'timed_out', terminal_generation: 1, error_code: 'suspension_expired' });
+      inspect.close();
+    }),
+  },
+  {
     id: 'P18-authority-order',
     run: async () => {
       const contracts = await loadV0Contracts();
@@ -877,6 +1293,52 @@ const rows: AcceptanceRow[] = [
 
 for (const row of rows) {
   test(row.id, { timeout: 90_000 }, row.run);
+}
+
+type QueueFixture = { store: CareerStore; databasePath: string };
+
+function withQueueStore<T>(run: (fixture: QueueFixture) => T, options: { leaseMs?: number; processingDeadlineMs?: number } = {}): T {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-queue-'));
+  const databasePath = path.join(dir, 'operational.db');
+  const store = new CareerStore(`file:${databasePath}`, options);
+  try {
+    const result = run({ store, databasePath });
+    if (result instanceof Promise) return result.finally(() => { store.close(); fs.rmSync(dir, { recursive: true, force: true }); }) as T;
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    return result;
+  } catch (error) {
+    store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+// Task 7 owns dispatch-journal CAS/recovery; Task 4 fixtures persist dispatched evidence through SQLite constraints.
+function dispatchAndMarkRunning(store: CareerStore, databasePath: string, claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>) {
+  const database = new DatabaseSync(databasePath);
+  const dispatched = database.prepare(`
+    UPDATE career_commands SET start_dispatch_state = 'dispatched'
+    WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
+      AND claim_generation = ? AND queue_state IN ('starting', 'resuming')
+  `).run(claim.commandId, claim.runId, claim.ownerResourceId, claim.leaseOwner, claim.claimGeneration);
+  database.close();
+  assert.equal(dispatched.changes, 1, 'test fixture must exercise persisted claim constraints');
+  return store.markRunning({ ...claim, sourceState: claim.queueState });
+}
+
+function queueInput(commandId: string) {
+  return {
+    commandId,
+    attemptId: `${commandId}:attempt-1`,
+    requestId: `${commandId}:request`,
+    canonicalJobKey: `job:${commandId}`,
+    canonicalUrl: `https://example.com/jobs/${commandId}`,
+    ownerResourceId: 'owner-1',
+    threadId: 'thread-1',
+    originChannel: 'telegram',
+    originDestination: 'chat-1',
+  };
 }
 
 async function waitForWorkflowRun(workflow: { getWorkflowRunById: (runId: string) => Promise<any> }, runId: string) {

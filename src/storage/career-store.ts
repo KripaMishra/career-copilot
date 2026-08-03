@@ -3,6 +3,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { assertOperationalDatabaseUrl } from '../config/runtime.ts';
+import type { QueueStateV0 } from '../contracts/v0.ts';
 
 export type JobIdentity = { url?: string; company?: string; title?: string; location?: string };
 export type JobState = 'pending' | 'succeeded' | 'failed';
@@ -432,9 +433,55 @@ BEGIN
 END;
 `;
 
+const task4CommandTableSql = durableRecordsSql
+  .slice(durableRecordsSql.indexOf('CREATE TABLE career_commands'), durableRecordsSql.indexOf('\n\nCREATE TABLE career_stage_journal'))
+  .replace(
+    "CHECK ((queue_state IN ('suspended', 'resuming')) = (suspension_generation > 0 AND blocker_id IS NOT NULL)),\n  CHECK ((blocker_id IS NOT NULL) = (queue_state IN ('suspended', 'resuming'))),",
+    "CHECK (queue_state <> 'suspended' OR (suspension_generation > 0 AND blocker_id IS NOT NULL)),\n  CHECK (queue_state <> 'resuming' OR (blocker_id IS NULL OR suspension_generation > 0)),\n  CHECK (queue_state IN ('suspended', 'resuming') OR blocker_id IS NULL),",
+  );
+
+const queueFencingSql = `
+PRAGMA legacy_alter_table = ON;
+ALTER TABLE career_commands RENAME TO career_commands_task3;
+${task4CommandTableSql}
+INSERT INTO career_commands SELECT * FROM career_commands_task3;
+DROP TABLE career_commands_task3;
+CREATE INDEX career_commands_fifo_idx ON career_commands(queue_state, queue_sequence);
+CREATE INDEX career_commands_retry_due_idx ON career_commands(retry_due_at, queue_sequence) WHERE queue_state = 'retry_wait';
+CREATE INDEX career_commands_lease_expiry_idx ON career_commands(lease_expires_at, queue_sequence) WHERE lease_owner IS NOT NULL;
+CREATE INDEX career_commands_retention_idx ON career_commands(retention_deadline_at, queue_sequence) WHERE retention_deadline_at IS NOT NULL;
+CREATE TRIGGER career_commands_queue_sequence_database_assigned
+BEFORE INSERT ON career_commands
+WHEN NEW.queue_sequence <> -1
+BEGIN
+  SELECT RAISE(ABORT, 'queue_sequence is database-assigned');
+END;
+CREATE TRIGGER career_commands_legal_queue_transition
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state <> NEW.queue_state AND NOT (
+  (OLD.queue_state = 'queued' AND NEW.queue_state = 'starting') OR
+  (OLD.queue_state = 'starting' AND NEW.queue_state IN ('running', 'timed_out')) OR
+  (OLD.queue_state = 'running' AND NEW.queue_state IN ('retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out')) OR
+  (OLD.queue_state = 'retry_wait' AND NEW.queue_state IN ('resuming', 'timed_out')) OR
+  (OLD.queue_state = 'suspended' AND NEW.queue_state IN ('resuming', 'timed_out')) OR
+  (OLD.queue_state = 'resuming' AND NEW.queue_state IN ('running', 'timed_out'))
+)
+BEGIN
+  SELECT RAISE(ABORT, 'illegal queue transition');
+END;
+CREATE TRIGGER career_commands_terminal_immutable
+BEFORE UPDATE ON career_commands
+WHEN OLD.queue_state IN ('succeeded', 'failed', 'timed_out')
+BEGIN
+  SELECT RAISE(ABORT, 'terminal command is immutable');
+END;
+PRAGMA legacy_alter_table = OFF;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: 'legacy_idempotency_compatibility', sql: legacyCompatibilitySql, checksum: '606b96f6bea28639b2f8699634873cfeb02a1f6ef549bc0b676e2f6c7a8cbd28' }),
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
+  Object.freeze({ version: 3, name: 'queue_fencing', sql: queueFencingSql, checksum: 'befa6ba8eec3fcca3fe235e29c6f162ad83482b6f268d073a45534b43ba73d09' }),
 ]);
 
 const LEDGER_SQL = `
@@ -517,6 +564,10 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
     expected.exec(LEDGER_SQL);
     if (version >= 1) expected.exec(legacyCompatibilitySql);
     if (version >= 2) expected.exec(durableRecordsSql);
+    if (version >= 3) {
+      expected.exec('PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;');
+      expected.exec(queueFencingSql);
+    }
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -584,14 +635,50 @@ export function buildJobIdempotencyKey(identity: JobIdentity): string {
   throw new Error('A URL or complete company, title, and location identity is required.');
 }
 
+export type EnqueueCommandInput = {
+  commandId: string;
+  attemptId: string;
+  requestId: string;
+  canonicalJobKey: string;
+  canonicalUrl: string;
+  ownerResourceId: string;
+  threadId: string;
+  originChannel: string;
+  originDestination: string;
+};
+
+export type QueueClaim = {
+  commandId: string;
+  runId: string;
+  ownerResourceId: string;
+  queueState: 'starting' | 'running' | 'resuming';
+  leaseOwner: string;
+  claimGeneration: number;
+  leaseExpiresAt: number;
+  heartbeatAt: number;
+};
+
+export type WorkerFence = {
+  commandId: string;
+  runId: string;
+  ownerResourceId: string;
+  leaseOwner: string;
+  claimGeneration: number;
+  sourceState: 'starting' | 'running' | 'resuming';
+};
+
+export type WorkerWriteResult = { applied: true; updatedAt: number } | { applied: false; reason: 'lease_lost' };
+
 export class CareerStore {
   private readonly database: DatabaseSync;
   private readonly leaseMs: number;
+  private readonly processingDeadlineMs: number;
   private migrationsVerified = false;
 
-  constructor(databaseUrl: string, options: { leaseMs?: number } = {}) {
+  constructor(databaseUrl: string, options: { leaseMs?: number; processingDeadlineMs?: number } = {}) {
     const verifiedUrl = assertOperationalDatabaseUrl(databaseUrl);
-    this.leaseMs = options.leaseMs ?? 60_000;
+    this.leaseMs = options.leaseMs ?? 120_000;
+    this.processingDeadlineMs = options.processingDeadlineMs ?? 1_800_000;
     this.database = new DatabaseSync(fileURLToPath(verifiedUrl));
     try {
       this.verifyCommittedChecksums();
@@ -631,6 +718,11 @@ export class CareerStore {
 
   private migrate(): void {
     while (!this.migrationsVerified) {
+      const appliedCount = ledgerExists(this.database)
+        ? Number((this.database.prepare('SELECT count(*) AS count FROM schema_migrations').get() as { count: number }).count)
+        : 0;
+      const rebuildingCommands = appliedCount === 2;
+      if (rebuildingCommands) this.database.exec('PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;');
       this.database.exec('BEGIN IMMEDIATE');
       try {
         if (!ledgerExists(this.database)) {
@@ -648,7 +740,6 @@ export class CareerStore {
         verifyLedger(applied);
         if (applied.length === MIGRATIONS.length) {
           verifyInstalledSchema(this.database, applied.length, applied[0].legacy_outbox_preserved === 1);
-          if ((this.database.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1) throw new Error('Installed schema verification failed: foreign keys are disabled.');
           this.database.exec('COMMIT');
           this.migrationsVerified = true;
           continue;
@@ -657,17 +748,266 @@ export class CareerStore {
         verifyInstalledSchema(this.database, applied.length, applied[0].legacy_outbox_preserved === 1);
         const migration = MIGRATIONS[applied.length];
         this.database.exec(migration.sql);
+        if ((this.database.prepare('PRAGMA foreign_key_check').all() as unknown[]).length !== 0) throw new Error('Queue migration introduced a foreign key violation.');
         this.database.prepare('INSERT INTO schema_migrations (version, name, checksum, applied_at, legacy_outbox_preserved) VALUES (?, ?, ?, ?, 0)').run(migration.version, migration.name, migration.checksum, Date.now());
         this.database.exec('COMMIT');
       } catch (error) {
         this.database.exec('ROLLBACK');
         throw error;
+      } finally {
+        if (rebuildingCommands) this.database.exec('PRAGMA legacy_alter_table = OFF; PRAGMA foreign_keys = ON;');
       }
     }
+    if ((this.database.prepare('PRAGMA foreign_keys').get() as { foreign_keys: number }).foreign_keys !== 1) throw new Error('Installed schema verification failed: foreign keys are disabled.');
   }
 
   migrationStatus(): { currentVersion: number; verified: boolean } {
     return { currentVersion: MIGRATIONS.length, verified: this.migrationsVerified };
+  }
+
+  private databaseNow(): number {
+    return Number((this.database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get() as { now: number }).now);
+  }
+
+  enqueueCommand(input: EnqueueCommandInput): { commandId: string; queueSequence: number; position: number; state: 'queued' } {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const now = this.databaseNow();
+      this.database.prepare(`
+        INSERT INTO career_commands (
+          command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id,
+          thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+      `).run(
+        input.commandId, input.attemptId, input.requestId, input.canonicalJobKey, input.canonicalUrl,
+        input.ownerResourceId, input.threadId, input.originChannel, input.originDestination, now, now, now,
+      );
+      const row = this.database.prepare('SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ?').get(input.commandId) as { queueSequence: number };
+      const position = Number((this.database.prepare("SELECT count(*) AS count FROM career_commands WHERE queue_state = 'queued' AND queue_sequence <= ?").get(row.queueSequence) as { count: number }).count);
+      this.database.exec('COMMIT');
+      return { commandId: input.commandId, queueSequence: row.queueSequence, position, state: 'queued' };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  queuePosition(commandId: string): number | null {
+    const row = this.database.prepare("SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ? AND queue_state = 'queued'").get(commandId) as { queueSequence: number } | undefined;
+    if (!row) return null;
+    return Number((this.database.prepare("SELECT count(*) AS count FROM career_commands WHERE queue_state = 'queued' AND queue_sequence <= ?").get(row.queueSequence) as { count: number }).count);
+  }
+
+  claimNextRunnable(leaseOwner: string): QueueClaim | null {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const now = this.databaseNow();
+      const current = this.database.prepare(`
+        SELECT command_id AS commandId, owner_resource_id AS ownerResourceId, queue_state AS queueState,
+          workflow_attempt AS workflowAttempt, run_id AS runId
+        FROM career_commands
+        WHERE
+          queue_state = 'queued'
+          OR (queue_state = 'retry_wait' AND retry_due_at <= ? AND processing_deadline_at > ?)
+          OR (queue_state IN ('starting', 'running', 'resuming') AND lease_expires_at <= ? AND processing_deadline_at > ?)
+        ORDER BY queue_sequence
+        LIMIT 1
+      `).get(now, now, now, now) as { commandId: string; ownerResourceId: string; queueState: QueueStateV0; workflowAttempt: number; runId: string | null } | undefined;
+      if (!current) {
+        this.database.exec('COMMIT');
+        return null;
+      }
+
+      const leaseExpiresAt = now + this.leaseMs;
+      let nextState: 'starting' | 'running' | 'resuming';
+      let runId = current.runId;
+      let result;
+      if (current.queueState === 'queued') {
+        nextState = 'starting';
+        runId = `cc-save-v1:${current.commandId}:${current.workflowAttempt}`;
+        result = this.database.prepare(`
+          UPDATE career_commands
+          SET queue_state = 'starting', run_id = ?, claim_generation = claim_generation + 1,
+              lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, processing_started_at = ?,
+              processing_deadline_at = ?, updated_at = ?
+          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = 'queued'
+        `).run(runId, leaseOwner, leaseExpiresAt, now, now, now + this.processingDeadlineMs, now, current.commandId, current.ownerResourceId);
+      } else if (current.queueState === 'retry_wait') {
+        nextState = 'resuming';
+        result = this.database.prepare(`
+          UPDATE career_commands
+          SET queue_state = 'resuming', claim_generation = claim_generation + 1, lease_owner = ?,
+              lease_expires_at = ?, heartbeat_at = ?, retry_due_at = NULL, updated_at = ?
+          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = 'retry_wait' AND retry_due_at <= ? AND processing_deadline_at > ?
+        `).run(leaseOwner, leaseExpiresAt, now, now, current.commandId, current.ownerResourceId, now, now);
+      } else {
+        if (!['starting', 'running', 'resuming'].includes(current.queueState)) throw new Error('Selected queue state is not claimable.');
+        nextState = current.queueState as 'starting' | 'running' | 'resuming';
+        result = this.database.prepare(`
+          UPDATE career_commands
+          SET claim_generation = claim_generation + 1, lease_owner = ?, lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+          WHERE command_id = ? AND owner_resource_id = ? AND queue_state = ? AND lease_expires_at <= ? AND processing_deadline_at > ?
+        `).run(leaseOwner, leaseExpiresAt, now, now, current.commandId, current.ownerResourceId, current.queueState, now, now);
+      }
+      if (Number(result.changes) !== 1 || runId === null) throw new Error('Atomic queue claim lost unexpectedly.');
+      const generation = Number((this.database.prepare('SELECT claim_generation AS generation FROM career_commands WHERE command_id = ?').get(current.commandId) as { generation: number }).generation);
+      this.database.exec('COMMIT');
+      return { commandId: current.commandId, runId, ownerResourceId: current.ownerResourceId, queueState: nextState, leaseOwner, claimGeneration: generation, leaseExpiresAt, heartbeatAt: now };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private workerWrite(sql: string, fence: WorkerFence): WorkerWriteResult {
+    const now = this.databaseNow();
+    const result = this.database.prepare(sql).run(
+      now, fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner,
+      fence.claimGeneration, fence.sourceState, now, now,
+    );
+    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+  }
+
+  renewClaim(fence: WorkerFence): WorkerWriteResult {
+    const now = this.databaseNow();
+    const result = this.database.prepare(`
+      UPDATE career_commands SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
+      WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
+        AND claim_generation = ? AND queue_state = ? AND lease_expires_at > ? AND processing_deadline_at > ?
+    `).run(
+      now + this.leaseMs, now, now, fence.commandId, fence.runId, fence.ownerResourceId,
+      fence.leaseOwner, fence.claimGeneration, fence.sourceState, now, now,
+    );
+    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+  }
+
+  markRunning(fence: WorkerFence): WorkerWriteResult {
+    if (fence.sourceState !== 'starting' && fence.sourceState !== 'resuming') return { applied: false, reason: 'lease_lost' };
+    return this.workerWrite(`
+      UPDATE career_commands SET queue_state = 'running', blocker_id = NULL, updated_at = ?
+      WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ? AND claim_generation = ? AND queue_state = ?
+        AND lease_expires_at > ? AND processing_deadline_at > ? AND start_dispatch_state = 'dispatched'
+    `, fence);
+  }
+
+  releaseForRetry(fence: WorkerFence, retryDelayMs: number): WorkerWriteResult {
+    if (fence.sourceState !== 'running' || !Number.isSafeInteger(retryDelayMs) || retryDelayMs < 0) return { applied: false, reason: 'lease_lost' };
+    const now = this.databaseNow();
+    const result = this.database.prepare(`
+      UPDATE career_commands
+      SET queue_state = 'retry_wait', retry_due_at = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL, updated_at = ?
+      WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
+        AND claim_generation = ? AND queue_state = 'running' AND lease_expires_at > ? AND processing_deadline_at > ?
+    `).run(
+      now + retryDelayMs, now, fence.commandId, fence.runId, fence.ownerResourceId,
+      fence.leaseOwner, fence.claimGeneration, now, now,
+    );
+    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+  }
+
+  completeClaim(fence: WorkerFence, outcome: 'succeeded' | 'failed'): WorkerWriteResult {
+    if (fence.sourceState !== 'running') return { applied: false, reason: 'lease_lost' };
+    const now = this.databaseNow();
+    const result = this.database.prepare(`
+      UPDATE career_commands
+      SET queue_state = ?, lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+          terminal_generation = terminal_generation + 1, completed_at = ?, resolved_at = ?, updated_at = ?
+      WHERE command_id = ? AND run_id = ? AND owner_resource_id = ? AND lease_owner = ?
+        AND claim_generation = ? AND queue_state = 'running' AND lease_expires_at > ? AND processing_deadline_at > ?
+    `).run(
+      outcome, now, now, now, fence.commandId, fence.runId, fence.ownerResourceId,
+      fence.leaseOwner, fence.claimGeneration, now, now,
+    );
+    return Number(result.changes) === 1 ? { applied: true, updatedAt: now } : { applied: false, reason: 'lease_lost' };
+  }
+
+  authorizeExternalEffect(guard: WorkerFence & {
+    stageKey: string;
+    stageVersion: number;
+    idempotencyKey: string;
+    expectedSheetFingerprint: string | null;
+    expectedRowVersion: number | null;
+  }): { authorized: true; stageRecordId: string } | { authorized: false; reason: 'lease_lost' | 'stage_guard_failed' } {
+    if (guard.sourceState !== 'running' && guard.sourceState !== 'resuming') return { authorized: false, reason: 'stage_guard_failed' };
+    const now = this.databaseNow();
+    const authorization = this.database.prepare(`
+      SELECT s.stage_record_id AS stageRecordId
+      FROM career_commands c
+      LEFT JOIN career_stage_journal s
+        ON s.command_id = c.command_id AND s.run_id = c.run_id
+        AND s.stage_key = ? AND s.stage_version = ? AND s.state = 'applying'
+        AND s.idempotency_key = ? AND s.expected_sheet_fingerprint IS ? AND s.expected_row_version IS ?
+      WHERE c.command_id = ? AND c.run_id = ? AND c.owner_resource_id = ? AND c.lease_owner = ?
+        AND c.claim_generation = ? AND c.queue_state = ? AND c.lease_expires_at > ? AND c.processing_deadline_at > ?
+    `).get(
+      guard.stageKey, guard.stageVersion, guard.idempotencyKey, guard.expectedSheetFingerprint, guard.expectedRowVersion,
+      guard.commandId, guard.runId, guard.ownerResourceId, guard.leaseOwner, guard.claimGeneration, guard.sourceState, now, now,
+    ) as { stageRecordId: string | null } | undefined;
+    if (!authorization) return { authorized: false, reason: 'lease_lost' };
+    return authorization.stageRecordId === null
+      ? { authorized: false, reason: 'stage_guard_failed' }
+      : { authorized: true, stageRecordId: authorization.stageRecordId };
+  }
+
+  expireProcessingDeadlines(): { transitioned: number } {
+    const now = this.databaseNow();
+    const result = this.database.prepare(`
+      UPDATE career_commands
+      SET queue_state = 'timed_out', lease_owner = NULL, lease_expires_at = NULL, heartbeat_at = NULL,
+          retry_due_at = NULL, blocker_id = NULL, terminal_generation = terminal_generation + 1,
+          error_class = 'deadline', error_code = 'processing_deadline_expired',
+          last_safe_error = 'The automatic processing deadline expired.', completed_at = ?, resolved_at = ?, updated_at = ?
+      WHERE queue_state IN ('starting', 'running', 'resuming', 'retry_wait') AND processing_deadline_at <= ?
+    `).run(now, now, now, now);
+    return { transitioned: Number(result.changes) };
+  }
+
+  expireSuspensions(): { transitioned: number } {
+    const now = this.databaseNow();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const ids = this.database.prepare(`
+        SELECT c.command_id AS commandId, s.suspension_id AS suspensionId
+        FROM career_commands c JOIN career_suspensions s
+          ON s.command_id = c.command_id AND s.run_id = c.run_id AND s.generation = c.suspension_generation AND s.suspension_id = c.blocker_id
+        WHERE c.queue_state = 'suspended' AND s.blocker_state = 'pending' AND s.expires_at <= ?
+      `).all(now) as Array<{ commandId: string; suspensionId: string }>;
+      for (const { commandId, suspensionId } of ids) {
+        this.database.prepare("UPDATE career_suspensions SET blocker_state = 'expired', resolved_at = ?, updated_at = ? WHERE suspension_id = ? AND blocker_state = 'pending' AND expires_at <= ?").run(now, now, suspensionId, now);
+        this.database.prepare(`
+          UPDATE career_commands
+          SET queue_state = 'timed_out', blocker_id = NULL, terminal_generation = terminal_generation + 1,
+              error_class = 'blocker', error_code = 'suspension_expired',
+              last_safe_error = 'The suspension expired before an accepted response was received.',
+              completed_at = ?, resolved_at = ?, updated_at = ?
+          WHERE command_id = ? AND queue_state = 'suspended' AND blocker_id = ?
+        `).run(now, now, now, commandId, suspensionId);
+      }
+      this.database.exec('COMMIT');
+      return { transitioned: ids.length };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  getCommand(commandId: string): {
+    commandId: string;
+    queueState: QueueStateV0;
+    claimGeneration: number;
+    leaseOwner: string | null;
+    leaseExpiresAt: number | null;
+    heartbeatAt: number | null;
+    processingDeadlineAt: number | null;
+    retryDueAt: number | null;
+    terminalGeneration: number;
+  } | undefined {
+    return this.database.prepare(`
+      SELECT command_id AS commandId, queue_state AS queueState, claim_generation AS claimGeneration,
+        lease_owner AS leaseOwner, lease_expires_at AS leaseExpiresAt, heartbeat_at AS heartbeatAt,
+        processing_deadline_at AS processingDeadlineAt, retry_due_at AS retryDueAt, terminal_generation AS terminalGeneration
+      FROM career_commands WHERE command_id = ?
+    `).get(commandId) as ReturnType<CareerStore['getCommand']>;
   }
 
   async claimRequest(requestId: string): Promise<boolean> {

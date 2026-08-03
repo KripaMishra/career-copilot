@@ -165,6 +165,26 @@ export const QueueStateV0Schema = z.enum([
   'failed',
   'timed_out',
 ]);
+export type QueueStateV0 = z.infer<typeof QueueStateV0Schema>;
+
+export const LEGAL_QUEUE_TRANSITIONS_V0 = Object.freeze({
+  queued: Object.freeze(['starting']),
+  starting: Object.freeze(['running', 'timed_out']),
+  running: Object.freeze(['retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out']),
+  retry_wait: Object.freeze(['resuming', 'timed_out']),
+  suspended: Object.freeze(['resuming', 'timed_out']),
+  resuming: Object.freeze(['running', 'timed_out']),
+  succeeded: Object.freeze([]),
+  failed: Object.freeze([]),
+  timed_out: Object.freeze([]),
+} as const satisfies Record<QueueStateV0, readonly QueueStateV0[]>);
+
+export function isLegalQueueTransitionV0(from: unknown, to: unknown): boolean {
+  const source = QueueStateV0Schema.safeParse(from);
+  const target = QueueStateV0Schema.safeParse(to);
+  return source.success && target.success && (LEGAL_QUEUE_TRANSITIONS_V0[source.data] as readonly QueueStateV0[]).includes(target.data);
+}
+
 export const StartDispatchStateV0Schema = z.enum(['not_dispatched', 'dispatching', 'dispatched', 'start_unknown']);
 export const StageStateV0Schema = z.enum([
   'planned',
@@ -323,7 +343,9 @@ export const CommandV1Schema = z.strictObject({
     if (command.retry.processingDeadlineAt !== null) issue(['retry', 'processingDeadlineAt'], 'human suspension pauses the processing deadline');
     if (command.progress.suspensionGeneration === 0 || command.progress.blockerId === null) issue(['progress'], 'suspended requires the current blocker generation');
   } else if (command.state === 'resuming') {
-    if (command.progress.suspensionGeneration === 0 || command.progress.blockerId === null) issue(['progress'], 'resuming requires an accepted blocker generation');
+    const retryResume = command.progress.blockerId === null;
+    const suspensionResume = command.progress.suspensionGeneration > 0 && command.progress.blockerId !== null;
+    if (!retryResume && !suspensionResume) issue(['progress'], 'resuming requires either retry or accepted blocker correlation');
   } else if (command.progress.blockerId !== null) {
     issue(['progress', 'blockerId'], `${command.state} cannot carry an active blocker`);
   }

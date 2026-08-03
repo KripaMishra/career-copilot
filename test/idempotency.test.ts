@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import {
   CareerStore,
+  MIGRATIONS,
   buildJobIdempotencyKey,
   normalizeJobIdentity,
 } from '../src/storage/career-store.ts';
@@ -39,10 +40,10 @@ test('migrates the baseline same-volume store without dropping legacy data', () 
   store.close();
   const upgraded = new DatabaseSync(databasePath, { readOnly: true });
   assert.equal(upgraded.prepare('SELECT count(*) AS count FROM career_outbox').get()!.count, 1);
-  assert.equal(upgraded.prepare('SELECT count(*) AS count FROM schema_migrations').get()!.count, 2);
+  assert.equal(upgraded.prepare('SELECT count(*) AS count FROM schema_migrations').get()!.count, MIGRATIONS.length);
   assert.deepEqual(
     upgraded.prepare('SELECT version, legacy_outbox_preserved FROM schema_migrations ORDER BY version').all().map((row) => ({ ...row })),
-    [{ version: 1, legacy_outbox_preserved: 1 }, { version: 2, legacy_outbox_preserved: 0 }],
+    MIGRATIONS.map(({ version }) => ({ version, legacy_outbox_preserved: version === 1 ? 1 : 0 })),
   );
   assert.match((upgraded.prepare("SELECT sql FROM sqlite_schema WHERE name = 'career_requests'").get() as { sql: string }).sql, /length\(request_id\) > 0/);
   assert.match((upgraded.prepare("SELECT sql FROM sqlite_schema WHERE name = 'career_idempotency'").get() as { sql: string }).sql, /state IN \('pending', 'succeeded', 'failed'\)/);
@@ -126,6 +127,51 @@ test('rolls back legacy canonicalization when preserved rows violate canonical c
   assert.equal(restored.prepare('SELECT sightings FROM career_idempotency').get()!.sightings, -1);
   assert.equal(restored.prepare('SELECT count(*) AS count FROM career_outbox').get()!.count, 1);
   restored.close();
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('durable queue claims oldest runnable command and reports FIFO positions', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-queue-fifo-'));
+  const store = new CareerStore(`file:${path.join(dir, 'state.db')}`);
+  const enqueue = (commandId: string) => store.enqueueCommand({
+    commandId,
+    attemptId: `${commandId}:attempt-1`,
+    requestId: `${commandId}:request`,
+    canonicalJobKey: `job:${commandId}`,
+    canonicalUrl: `https://example.com/jobs/${commandId}`,
+    ownerResourceId: 'owner-1',
+    threadId: 'thread-1',
+    originChannel: 'telegram',
+    originDestination: 'chat-1',
+  });
+  assert.equal(enqueue('command-a').position, 1);
+  assert.equal(enqueue('command-b').position, 2);
+  assert.equal(store.claimNextRunnable('worker-1')?.commandId, 'command-a');
+  assert.equal(store.queuePosition('command-b'), 1);
+  store.close();
+  fs.rmSync(dir, { recursive: true });
+});
+
+test('due retry claims resume the same run with a higher generation', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-queue-retry-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  store.enqueueCommand({
+    commandId: 'command-retry', attemptId: 'attempt-retry', requestId: 'request-retry', canonicalJobKey: 'job:retry',
+    canonicalUrl: 'https://example.com/jobs/retry', ownerResourceId: 'owner-1', threadId: 'thread-1', originChannel: 'telegram', originDestination: 'chat-1',
+  });
+  const starting = store.claimNextRunnable('worker-1')!;
+  const startingFence = { ...starting, sourceState: 'starting' as const };
+  const database = new DatabaseSync(databasePath);
+  database.prepare("UPDATE career_commands SET start_dispatch_state = 'dispatched' WHERE command_id = ? AND queue_state = 'starting'").run(starting.commandId);
+  database.close();
+  assert.equal(store.markRunning(startingFence).applied, true);
+  assert.equal(store.releaseForRetry({ ...starting, sourceState: 'running' }, 0).applied, true);
+  const resuming = store.claimNextRunnable('worker-2')!;
+  assert.deepEqual({ commandId: resuming.commandId, runId: resuming.runId, queueState: resuming.queueState, claimGeneration: resuming.claimGeneration }, {
+    commandId: starting.commandId, runId: starting.runId, queueState: 'resuming', claimGeneration: starting.claimGeneration + 1,
+  });
+  store.close();
   fs.rmSync(dir, { recursive: true });
 });
 
