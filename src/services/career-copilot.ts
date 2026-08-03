@@ -2,6 +2,7 @@ import { createHmac, randomUUID } from 'node:crypto';
 
 import {
   OwnerAuthorization,
+  assertCurrentlyValidPrincipalAuthorizationCapability,
   assertRawTelegramUpdate,
   authorizeTelegramUpdate,
   parseIntakeCommand,
@@ -14,6 +15,8 @@ import {
   buildJobIdempotencyKey,
   type AtomicIntakeResult,
   type IntakeRejectionReason,
+  type SuspensionAcceptanceResult,
+  type SuspensionAnswerInput,
 } from '../storage/career-store.ts';
 import { assertJobUrl } from '../tools/job-url.ts';
 
@@ -46,6 +49,134 @@ function canonicalJobUrl(value: string): string {
   if (url.username || url.password || url.port) throw new Error('Job URL cannot contain credentials or a non-default port.');
   url.hash = '';
   return buildJobIdempotencyKey({ url: url.href }).slice('url:'.length);
+}
+
+export type SuspendedRunEvidence = {
+  runId: string; workflowName: string; resourceId?: string; status: 'pending' | 'running' | 'waiting' | 'suspended' | 'success' | 'failed';
+  suspendedSteps: readonly string[];
+};
+export type PreparedExactResume = { invoke(beforeInvoke: () => void): Promise<{ runId: string }> };
+export type ExactSuspendedResumeAdapter = {
+  inspectExactRun(runId: string, token: import('../contracts/v0.ts').SuspensionTokenV1): Promise<SuspendedRunEvidence | null>;
+  /** Completes all awaited evidence/handle preparation before returning a no-await boundary invocation. */
+  prepareExactResume(input: { token: import('../contracts/v0.ts').SuspensionTokenV1; resumeData: unknown }): Promise<PreparedExactResume>;
+};
+export type ResumeFailpoint = 'afterAccepted' | 'afterApplying' | 'afterCallMarked' | 'duringResumeCall' | 'afterResumeReturned' | 'beforeAppliedProjection';
+
+export function createInstalledMastraResumeAdapter(dependencies: {
+  workflow: {
+    id: string;
+    getWorkflowRunById(runId: string): Promise<{ runId: string; workflowName: string; resourceId?: string; status: SuspendedRunEvidence['status'] } | null>;
+    createRun(options: { runId: string; resourceId: string }): Promise<{ resumeAsync(input: { step: string; resumeData: unknown }): Promise<{ runId: string }> }>;
+  };
+  loadSnapshot(runId: string): Promise<{ status: string; context?: Record<string, { status?: string; suspendPayload?: unknown }> } | null>;
+}): ExactSuspendedResumeAdapter {
+  const inspectExactRun = async (runId: string, token: import('../contracts/v0.ts').SuspensionTokenV1): Promise<SuspendedRunEvidence | null> => {
+    const [run, snapshot] = await Promise.all([dependencies.workflow.getWorkflowRunById(runId), dependencies.loadSnapshot(runId)]);
+    const step = snapshot?.context?.[token.suspendedStep];
+    if (!run || !snapshot || run.runId !== runId || run.workflowName !== dependencies.workflow.id || run.status !== snapshot.status
+      || run.resourceId !== token.resourceId || JSON.stringify(step?.suspendPayload) !== JSON.stringify(token)) return null;
+    const suspendedSteps = Object.entries(snapshot.context ?? {}).filter(([, value]) => value?.status === 'suspended').map(([stepId]) => stepId);
+    return { ...run, suspendedSteps };
+  };
+  return {
+    inspectExactRun,
+    async prepareExactResume({ token, resumeData }) {
+      const evidence = await inspectExactRun(token.runId, token);
+      if (!evidence || evidence.status !== 'suspended' || !evidence.suspendedSteps.includes(token.suspendedStep)) {
+        throw new Error('Exact persisted blocker-bound suspended run evidence is required before reconstruction.');
+      }
+      const handle = await dependencies.workflow.createRun({ runId: token.runId, resourceId: token.resourceId });
+      return { invoke(beforeInvoke) { beforeInvoke(); return handle.resumeAsync({ step: token.suspendedStep, resumeData }); } };
+    },
+  };
+}
+
+export class CareerResumeCoordinator {
+  private readonly store: CareerStore;
+  private readonly adapter: ExactSuspendedResumeAdapter;
+  private readonly acceptanceHashKey: string;
+  constructor(store: CareerStore, adapter: ExactSuspendedResumeAdapter, acceptanceHashKey: string) {
+    this.store = store; this.adapter = adapter; this.acceptanceHashKey = acceptanceHashKey;
+  }
+
+  async acceptAndResume(
+    capability: import('../channels/telegram-auth.ts').OwnerAuthorizationCapability,
+    input: SuspensionAnswerInput,
+    leaseOwner: string,
+    onFailpoint: (point: ResumeFailpoint) => void | Promise<void> = async () => {},
+  ): Promise<SuspensionAcceptanceResult | { outcome: 'applied' | 'resume_unknown' | 'authorization_blocked' }> {
+    const accepted = this.store.acceptSuspension(capability, input, leaseOwner, this.acceptanceHashKey);
+    if (accepted.outcome !== 'accepted') return accepted;
+    await onFailpoint('afterAccepted');
+    return this.recoverAcceptedResume(capability, accepted.suspensionId, onFailpoint);
+  }
+
+  async recoverAcceptedResume(
+    capability: import('../channels/telegram-auth.ts').OwnerAuthorizationCapability,
+    suspensionId: string,
+    onFailpoint: (point: ResumeFailpoint) => void | Promise<void> = async () => {},
+    reclaimLeaseOwner = 'resume-recovery',
+  ): Promise<{ outcome: 'applied' | 'resume_unknown' | 'authorization_blocked' }> {
+    this.store.reclaimAcceptedResume(capability,suspensionId,reclaimLeaseOwner);
+    let work = this.store.loadAcceptedResume(capability, suspensionId, this.acceptanceHashKey);
+    if (!work) throw new Error('No current authorized accepted resume work exists.');
+    if (work.blockerState === 'applied') return { outcome: 'applied' };
+    let evidence = await this.adapter.inspectExactRun(work.fence.runId, work.token);
+    if (!evidence) throw new Error('Persisted workflow suspension token does not match durable blocker authority.');
+    if (evidence.status !== 'suspended') {
+      await onFailpoint('beforeAppliedProjection');
+      const reconciled = this.store.reconcileResume(work.fence, suspensionId, evidence.status === 'pending' ? 'waiting' : evidence.status);
+      return { outcome: reconciled.outcome === 'applied' ? 'applied' : 'resume_unknown' };
+    }
+    if (work.callState === 'resume_unknown') return { outcome: 'resume_unknown' };
+    if (work.callState === 'calling' || work.callState === 'called') {
+      this.store.markResumeUnknown(work.fence, suspensionId);
+      return { outcome: 'resume_unknown' };
+    }
+    if (work.blockerState === 'accepted') {
+      if (!this.store.markResumeApplying(work.fence, suspensionId).applied) throw new Error('Resume application fence was lost.');
+      work = { ...work, blockerState: 'applying' };
+      await onFailpoint('afterApplying');
+    }
+    if (work.callState !== 'not_called') return { outcome: 'resume_unknown' };
+    evidence = await this.adapter.inspectExactRun(work.fence.runId, work.token);
+    if (!evidence || evidence.status !== 'suspended') throw new Error('Exact suspended snapshot disappeared before resume call.');
+    const prepared = await this.adapter.prepareExactResume({ token:work.token,resumeData:JSON.parse(work.responseBytes) });
+    let resumePromise: Promise<{ runId:string }>;
+    let boundaryCrossed = false;
+    try {
+      resumePromise = prepared.invoke(() => {
+        assertCurrentlyValidPrincipalAuthorizationCapability(capability);
+        if (!this.store.markResumeCallStarted(work.fence,suspensionId).applied) throw new Error('Resume call fence was lost.');
+        boundaryCrossed = true;
+        onFailpoint('afterCallMarked');
+      });
+    } catch (error) {
+      if (boundaryCrossed && /^crash:/.test((error as Error)?.message ?? '')) throw error;
+      if (boundaryCrossed) { this.store.markResumeUnknown(work.fence,suspensionId); return { outcome:'resume_unknown' }; }
+      return { outcome:'authorization_blocked' };
+    }
+    await onFailpoint('duringResumeCall');
+    try {
+      const result = await resumePromise;
+      if (result.runId !== work.fence.runId) throw new Error('Resume returned mismatched run correlation.');
+    } catch {
+      this.store.markResumeUnknown(work.fence, suspensionId);
+      return { outcome: 'resume_unknown' };
+    }
+    if (!this.store.markResumeCallReturned(work.fence, suspensionId).applied) return { outcome: 'resume_unknown' };
+    await onFailpoint('afterResumeReturned');
+    const after = await this.adapter.inspectExactRun(work.fence.runId, work.token);
+    if (!after) return { outcome: 'resume_unknown' };
+    if (after.status === 'suspended') {
+      this.store.markResumeUnknown(work.fence, suspensionId);
+      return { outcome: 'resume_unknown' };
+    }
+    await onFailpoint('beforeAppliedProjection');
+    const reconciled = this.store.reconcileResume(work.fence, suspensionId, after.status === 'pending' ? 'waiting' : after.status);
+    return { outcome: reconciled.outcome === 'applied' ? 'applied' : 'resume_unknown' };
+  }
 }
 
 export class CareerCopilotService {

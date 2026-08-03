@@ -173,7 +173,7 @@ export const LEGAL_QUEUE_TRANSITIONS_V0 = Object.freeze({
   starting: Object.freeze(['running', 'timed_out']),
   running: Object.freeze(['retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out']),
   retry_wait: Object.freeze(['resuming', 'timed_out']),
-  suspended: Object.freeze(['resuming', 'timed_out']),
+  suspended: Object.freeze(['resuming', 'failed', 'timed_out']),
   resuming: Object.freeze(['running', 'timed_out']),
   succeeded: Object.freeze([]),
   failed: Object.freeze([]),
@@ -393,6 +393,25 @@ export const StageRecordV1Schema = z.strictObject({
   }
 });
 
+export const SuspensionTokenV1Schema = z.strictObject({
+  schemaVersion: z.literal(1),
+  suspensionId: id,
+  suspensionGeneration: positiveInteger,
+  commandId: id,
+  runId: id,
+  resourceId: id,
+  suspendedStep: id,
+  blockerKind: z.enum(['needs_browser_session', 'reauth_required', 'manual_intervention_required', 'browser_intervention_required', 'clarification_required']),
+  resumeSchemaVersion: z.literal(1),
+  evidenceHash: sha256,
+  sourceHash: sha256,
+  profileHash: sha256,
+  promptVersion: positiveInteger,
+  promptHash: sha256,
+  resumeSchemaHash: sha256,
+});
+export type SuspensionTokenV1 = z.infer<typeof SuspensionTokenV1Schema>;
+
 const AllowedResponseSchema = z.discriminatedUnion('kind', [
   z.strictObject({ kind: z.literal('confirmation'), choices: z.array(id).min(1).max(10) }),
   z.strictObject({ kind: z.literal('text'), minimumLength: positiveInteger, maximumLength: positiveInteger.max(4_000) })
@@ -410,6 +429,7 @@ export const BlockerEnvelopeV1Schema = z.strictObject({
   ...identityFields,
   blockerKind: z.enum(['needs_browser_session', 'reauth_required', 'manual_intervention_required', 'browser_intervention_required', 'clarification_required']),
   state: BlockerStateV0Schema,
+  evidenceHash: sha256,
   sourceHash: sha256,
   profileHash: sha256,
   promptVersion: positiveInteger,
@@ -422,6 +442,8 @@ export const BlockerEnvelopeV1Schema = z.strictObject({
   acceptedAt: isoDateTime.nullable(),
   resumePayload: ResumePayloadV1Schema.nullable(),
   resumePayloadHash: sha256.nullable(),
+  resumeCallState: z.enum(['not_called', 'calling', 'called', 'resume_unknown']),
+  invalidationReason: z.literal('linked_attempt_required').nullable(),
   safeMessage: safeText,
 }).superRefine((blocker, context) => {
   if (Date.parse(blocker.expiresAt) <= Date.parse(blocker.issuedAt)) {
@@ -437,6 +459,15 @@ export const BlockerEnvelopeV1Schema = z.strictObject({
   }
   if (blocker.acceptedAt !== null && (Date.parse(blocker.acceptedAt) < Date.parse(blocker.issuedAt) || Date.parse(blocker.acceptedAt) >= Date.parse(blocker.expiresAt))) {
     context.addIssue({ code: 'custom', path: ['acceptedAt'], message: 'acceptance must occur while the blocker is valid' });
+  }
+  if ((blocker.state === 'invalidated') !== (blocker.invalidationReason === 'linked_attempt_required')) {
+    context.addIssue({ code: 'custom', path: ['invalidationReason'], message: 'only invalidated blockers require a linked attempt' });
+  }
+  if (['pending', 'accepted'].includes(blocker.state) && blocker.resumeCallState !== 'not_called') {
+    context.addIssue({ code: 'custom', path: ['resumeCallState'], message: `${blocker.state} cannot have a resume call` });
+  }
+  if (blocker.state === 'applied' && blocker.resumeCallState !== 'called') {
+    context.addIssue({ code: 'custom', path: ['resumeCallState'], message: 'applied requires proven resume advancement' });
   }
   if (blocker.resumePayload !== null) {
     if (blocker.resumePayload.schemaVersion !== blocker.resumeSchemaVersion) context.addIssue({ code: 'custom', path: ['resumePayload', 'schemaVersion'], message: 'resume payload must match the bound schema version' });

@@ -19,7 +19,7 @@ import { z } from 'zod';
 import { OwnerAuthorization } from '../src/channels/telegram-auth.ts';
 import { resolveRuntimeConfig } from '../src/config/runtime.ts';
 import * as V0Contracts from '../src/contracts/v0.ts';
-import { CareerStore, MIGRATIONS } from '../src/storage/career-store.ts';
+import { CareerStore, MIGRATIONS, buildSuspensionToken } from '../src/storage/career-store.ts';
 import {
   OPERATION_DEADLINES_MS,
   OperationDeadlineExceededError,
@@ -28,7 +28,7 @@ import {
   toMastraNonRetryableError,
   withOperationDeadline,
 } from '../src/workflows/retry-policy.ts';
-import { CareerCopilotService } from '../src/services/career-copilot.ts';
+import { CareerCopilotService, CareerResumeCoordinator, createInstalledMastraResumeAdapter } from '../src/services/career-copilot.ts';
 import { CareerWorker, FirstStartCrashError, type SaveJobWorkflowPort } from '../src/services/career-worker.ts';
 import { createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 import { SAVE_JOB_WORKFLOW_VERSION, saveJobWorkflow } from '../src/workflows/save-job.ts';
@@ -198,6 +198,7 @@ test('enforces run provenance and suspension-envelope blocker linkage', () => {
   });
 });
 
+const task8AcceptanceKey = 'k'.repeat(32);
 const task5Owner = {
   resourceId: 'owner-v0', enabled: true, authorizationRevision: 1,
   telegram: { userIds: new Set(['123', '124']), privateChatIds: new Set(['456']) },
@@ -277,6 +278,25 @@ function claimToFence(claim: ReturnType<CareerStore['claimNextRunnable']> & {}) 
     claimGeneration: claim.claimGeneration, sourceState: claim.queueState };
 }
 
+async function withTask8(run: (fixture: { store: CareerStore; secondStore: CareerStore; workflow: Task7Workflow; fence: ReturnType<typeof claimToFence>; capability: ReturnType<OwnerAuthorization['authorize']>; revoke: () => void; restore: () => void; databasePath: string; hashes: { sourceHash: string; profileHash: string; evidenceHash: string; promptHash: string; schemaHash: string }; token: ReturnType<typeof buildSuspensionToken> }) => Promise<void>, options: { leaseMs?: number } = {}) {
+  return withTask7(async ({ store, secondStore, workflow, claim, databasePath }) => {
+    await new CareerWorker({ store, workflow }).startOrRecover(claim);
+    const fence = { ...claimToFence(claim), sourceState: 'running' as const };
+    const hash = (value: string) => `sha256:${createHash('sha256').update(value).digest('hex')}`;
+    const hashes = { sourceHash: hash('source'), profileHash: hash('profile'), evidenceHash: hash('evidence'), promptHash: hash('prompt'), schemaHash: hash('schema') };
+    const issueInput = { suspensionId: 'task8-blocker', suspendedStep: 'save-job-skeleton-v1', blockerKind: 'clarification_required' as const,
+      ...hashes, promptVersion: 1, resumeSchemaVersion: 1 as const,
+      allowedResponse: { kind: 'confirmation' as const, choices: ['ready'] }, safeMessage: 'Confirm the saved job.' };
+    const token = buildSuspensionToken(fence, issueInput, 1);
+    const issued = store.issueSuspension(fence, issueInput);
+    assert.equal(issued.applied, true);
+    let owner = task5Owner;
+    const authorization = new OwnerAuthorization(() => owner);
+    await run({ store, secondStore, workflow, fence, capability: authorization.authorize({ channel: 'studio', remoteAddress: '127.0.0.1', conversationId: 'task8' }),
+      revoke: () => { owner = { ...owner, enabled:false }; }, restore: () => { owner = task5Owner; }, databasePath, hashes, token });
+  }, options);
+}
+
 async function withTask7(run: (fixture: { store: CareerStore; secondStore: CareerStore; workflow: Task7Workflow; claim: NonNullable<ReturnType<CareerStore['claimNextRunnable']>>; databasePath: string }) => Promise<void>, options: { leaseMs?: number } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-task7-'));
   const databasePath = path.join(dir, 'state.db');
@@ -295,6 +315,250 @@ async function withTask7(run: (fixture: { store: CareerStore; secondStore: Caree
 }
 
 const rows: AcceptanceRow[] = [
+  {
+    id: 'P11-current-generation-only',
+    run: () => withTask8(async ({ store, capability, hashes }) => {
+      const stale = store.acceptSuspension(capability, { commandId: 'task7-command', runId: 'cc-save-v1:task7-command:1', suspensionId: 'task8-blocker', suspendedStep: 'save-job-skeleton-v1', blockerKind: 'clarification_required', suspensionGeneration: 2, response: { schemaVersion: 1, kind: 'confirmation', value: 'ready' }, ...hashes, resumeSchemaVersion: 1 }, 'resume-worker', task8AcceptanceKey);
+      assert.deepEqual(stale, { outcome: 'rejected', reason: 'stale_generation' });
+      assert.equal(store.getCommand('task7-command')!.queueState, 'suspended');
+    }),
+  },
+  {
+    id: 'P11-duplicate-answer-once',
+    run: () => withTask8(async ({ store, secondStore, capability, hashes, databasePath }) => {
+      const input = { commandId: 'task7-command', runId: 'cc-save-v1:task7-command:1', suspensionId: 'task8-blocker', suspendedStep: 'save-job-skeleton-v1', blockerKind: 'clarification_required' as const, suspensionGeneration: 1, response: { schemaVersion: 1 as const, kind: 'confirmation' as const, value: 'ready' }, ...hashes, resumeSchemaVersion: 1 as const };
+      const [first, duplicate] = await Promise.all([Promise.resolve(store.acceptSuspension(capability, input, 'resume-a',task8AcceptanceKey)), Promise.resolve(secondStore.acceptSuspension(capability, input, 'resume-b',task8AcceptanceKey))]);
+      assert.equal([first, duplicate].filter((result) => result.outcome === 'accepted').length, 1);
+      assert.equal([first, duplicate].filter((result) => result.outcome === 'duplicate').length, 1);
+      assert.equal(store.getCommand('task7-command')!.automaticRepeatsUsed, 0);
+      assert.equal(Object.hasOwn(store.getSuspensionStatus(capability,'task8-blocker')!,'resumePayload'),false);
+      assert.throws(() => store.loadAcceptedResume(capability,'task8-blocker','wrong-key'.repeat(8)),/authority|key/i);
+      store.enqueueCommand({ commandId:'forged-command',attemptId:'forged-attempt',requestId:'forged-request',canonicalJobKey:'url:https://example.com/forged',
+        canonicalUrl:'https://example.com/forged',ownerResourceId:'owner-v0',threadId:'studio:task8',originChannel:'studio',originDestination:'studio:loopback' });
+      const forgedClaim = store.claimNextRunnable('forged-worker')!;
+      const forgedWorkflow = new Task7Workflow();
+      await new CareerWorker({ store,workflow:forgedWorkflow }).startOrRecover(forgedClaim);
+      const forgedIssue = { suspensionId:'forged-blocker',suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required' as const,
+        ...hashes,promptVersion:1,resumeSchemaVersion:1 as const,allowedResponse:{kind:'confirmation' as const,choices:['ready']},safeMessage:'Confirm.' };
+      assert.equal(store.issueSuspension({ ...claimToFence(forgedClaim),sourceState:'running' },forgedIssue).applied,true);
+      const direct = new DatabaseSync(databasePath);
+      const copiedTag = direct.prepare("SELECT acceptance_authority_tag tag FROM career_suspensions WHERE suspension_id='task8-blocker'").get()!.tag;
+      const forgedBytes = JSON.stringify({schemaVersion:1,kind:'confirmation',value:'ready'});
+      const forgedHash = `sha256:${createHash('sha256').update(forgedBytes).digest('hex')}`;
+      const now = Number(direct.prepare("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER) now").get()!.now);
+      direct.prepare(`UPDATE career_suspensions SET blocker_state='accepted',accepted_input_generation=generation,accepted_input_hash=?,accepted_at=?,resume_payload=?,
+        resume_claim_generation=2,resume_lease_owner='forged-resumer',resume_lease_expires_at=?,resume_processing_deadline_at=?,acceptance_nonce='forged-acceptance-nonce',
+        acceptance_authority_tag=?,current_resume_claim_generation=2,current_resume_lease_owner='forged-resumer',current_resume_lease_expires_at=?,updated_at=?
+        WHERE suspension_id='forged-blocker'`).run(forgedHash,now,forgedBytes,now+120000,now+store.getCommand('forged-command')!.processingBudgetRemainingMs,copiedTag,now+120000,now);
+      assert.equal(store.getCommand('forged-command')!.queueState,'resuming');
+      assert.throws(() => store.loadAcceptedResume(capability,'forged-blocker',task8AcceptanceKey),/authority|inconsistent/i,'copied valid tag cannot authorize another row');
+      for (const sql of [
+        "UPDATE career_suspensions SET resume_payload='null' WHERE suspension_id='task8-blocker'",
+        "UPDATE career_suspensions SET accepted_input_hash=NULL WHERE suspension_id='task8-blocker'",
+        "UPDATE career_suspensions SET resume_claim_generation=NULL WHERE suspension_id='task8-blocker'",
+        "UPDATE career_suspensions SET acceptance_nonce='changed-nonce' WHERE suspension_id='task8-blocker'",
+        "UPDATE career_suspensions SET acceptance_authority_tag='sha256:" + 'f'.repeat(64) + "' WHERE suspension_id='task8-blocker'",
+        "UPDATE career_suspensions SET resume_call_started_at=0 WHERE suspension_id='task8-blocker'",
+        "UPDATE career_commands SET lease_owner='forged' WHERE command_id='task7-command'",
+      ]) assert.throws(() => direct.exec(sql), /authority|constraint|binding/i, sql);
+      direct.close();
+    }),
+  },
+  {
+    id: 'P11-cross-command-answer-rejected',
+    run: () => withTask8(async ({ store, capability, hashes }) => {
+      const result = store.acceptSuspension(capability, { commandId: 'other-command', runId: 'cc-save-v1:task7-command:1', suspensionId: 'task8-blocker', suspendedStep: 'save-job-skeleton-v1', blockerKind: 'clarification_required', suspensionGeneration: 1, response: { schemaVersion: 1, kind: 'confirmation', value: 'ready' }, ...hashes, resumeSchemaVersion: 1 }, 'resume-worker',task8AcceptanceKey);
+      assert.deepEqual(result, { outcome: 'rejected', reason: 'correlation_mismatch' });
+    }),
+  },
+  {
+    id: 'P11-changed-source-profile-invalidates',
+    run: () => withTask5(async ({ store, service }) => {
+      const intake = await service.process(task5Update(8801));
+      assert.equal(intake.outcome, 'enqueued');
+      if (intake.outcome !== 'enqueued') return;
+      const claim = store.claimNextRunnable('binding-worker')!;
+      const workflow = new Task7Workflow();
+      await new CareerWorker({ store, workflow }).startOrRecover(claim);
+      const hash = `sha256:${'a'.repeat(64)}`;
+      const hashes = { sourceHash:hash,profileHash:hash,evidenceHash:hash,promptHash:hash,schemaHash:hash };
+      const issue = store.issueSuspension({ ...claimToFence(claim),sourceState:'running' }, { suspensionId:'changed-blocker',
+        suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required',...hashes,promptVersion:1,resumeSchemaVersion:1,
+        allowedResponse:{kind:'confirmation',choices:['ready']},safeMessage:'Confirm.' });
+      assert.equal(issue.applied,true);
+      const authorization = new OwnerAuthorization(() => task5Owner);
+      const capability = authorization.authorize({ channel:'telegram',userId:'123',chatId:'456',privateChat:true });
+      const result = store.acceptSuspension(capability, { commandId:intake.commandId,runId:claim.runId,suspensionId:'changed-blocker',
+        suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required',suspensionGeneration:1,
+        response:{schemaVersion:1,kind:'confirmation',value:'ready'},...hashes,sourceHash:`sha256:${'f'.repeat(64)}`,resumeSchemaVersion:1 }, 'resume-worker',task8AcceptanceKey);
+      assert.deepEqual(result,{ outcome:'linked_attempt_required',reason:'bound_inputs_changed' });
+      assert.equal(store.getSuspensionStatus(capability,'changed-blocker')!.state,'invalidated');
+      assert.equal(store.getCommand(intake.commandId)!.queueState,'failed');
+      const linked = store.createLinkedTerminalRetry({ parentCommandId:intake.commandId,commandId:'changed-child',attemptId:'changed-child-attempt',requestId:'telegram:changed-child',freshAuthorization:capability });
+      assert.equal(linked.state,'queued');
+      assert.equal(store.getCommand(intake.commandId)!.queueState,'failed');
+    }),
+  },
+  {
+    id: 'P11-crash-before-after-resume-converges',
+    run: async () => {
+      let appliedRecoveries = 0;
+      for (const crashPoint of ['afterAccepted','afterApplying','afterCallMarked','duringResumeCall','afterResumeReturned','revokedBeforeCall'] as const) {
+        await withTask8(async ({ store, capability, revoke, restore, hashes, token, databasePath }) => {
+          const dir = fs.mkdtempSync(path.join(os.tmpdir(), `career-v0-task8-${crashPoint}-`));
+          try {
+            const mastra = new Mastra({ storage: new LibSQLStore({ id: `task8-${crashPoint}`, url: `file:${path.join(dir, 'mastra.db')}` }), workflows: { saveJobWorkflow } });
+            const workflow = mastra.getWorkflow('saveJobWorkflow');
+            const run = await workflow.createRun({ runId: token.runId, resourceId: token.resourceId });
+            const started = await run.start({ inputData: { schemaVersion:1,workflowVersion:1,commandId:token.commandId,attempt:1,
+              runId:token.runId,resourceId:token.resourceId,canonicalUrl:'https://example.com/job',suspendForClarification:true,suspensionToken:token } });
+            assert.equal(started.status, 'suspended');
+            const workflowStore = await mastra.getStorage()?.getStore('workflows');
+            const base = createInstalledMastraResumeAdapter({ workflow, loadSnapshot: (runId) => workflowStore!.loadWorkflowSnapshot({ workflowName:workflow.id,runId }) });
+            assert.equal(await base.inspectExactRun(token.runId,{ ...token,sourceHash:`sha256:${'f'.repeat(64)}` }),null,'snapshot token mismatch fails closed');
+            let resumeCalls = 0;
+            let revokedOnce = false;
+            const adapter = { ...base, prepareExactResume: async (request: Parameters<typeof base.prepareExactResume>[0]) => {
+              const prepared = await base.prepareExactResume(request);
+              if (crashPoint === 'revokedBeforeCall' && !revokedOnce) { revokedOnce=true; await delay(1); revoke(); }
+              return { invoke(beforeInvoke:()=>void) { return prepared.invoke(() => { beforeInvoke(); resumeCalls += 1; }); } };
+            } };
+            const input = { commandId:token.commandId,runId:token.runId,suspensionId:token.suspensionId,suspendedStep:token.suspendedStep,
+              blockerKind:token.blockerKind,suspensionGeneration:token.suspensionGeneration,response:{schemaVersion:1 as const,kind:'confirmation' as const,value:'ready'},
+              ...hashes,resumeSchemaVersion:1 as const };
+            const coordinator = new CareerResumeCoordinator(store, adapter, task8AcceptanceKey);
+            if (crashPoint === 'revokedBeforeCall') {
+              const blocked = await coordinator.acceptAndResume(capability,input,'resume-worker');
+              assert.deepEqual(blocked,{ outcome:'authorization_blocked' });
+              assert.equal(resumeCalls,0);
+              const blockedDb = new DatabaseSync(databasePath,{readOnly:true});
+              assert.equal(blockedDb.prepare("SELECT resume_call_state state FROM career_suspensions WHERE suspension_id='task8-blocker'").get()!.state,'not_called');
+              blockedDb.close();
+              restore();
+              const retried = await coordinator.recoverAcceptedResume(capability,token.suspensionId);
+              assert.ok(['applied','resume_unknown'].includes(retried.outcome));
+              assert.equal(resumeCalls,1);
+              return;
+            }
+            await assert.rejects(coordinator.acceptAndResume(capability,input,'resume-worker',(point) => {
+              if (point === crashPoint) throw new Error(`crash:${point}`);
+            }), new RegExp(`crash:${crashPoint}`));
+            const reopenedStore = new CareerStore(`file:${databasePath}`);
+            try {
+              const reopened = new CareerResumeCoordinator(reopenedStore, adapter, task8AcceptanceKey);
+              let recovered = await reopened.recoverAcceptedResume(capability, token.suspensionId);
+              for (let attempt = 0; attempt < 50 && recovered.outcome !== 'applied'; attempt += 1) {
+                await delay(10);
+                recovered = await reopened.recoverAcceptedResume(capability, token.suspensionId);
+                if (recovered.outcome === 'resume_unknown' && crashPoint === 'afterCallMarked') break;
+              }
+              if (crashPoint === 'afterCallMarked') {
+                assert.equal(recovered.outcome, 'resume_unknown');
+                assert.equal(resumeCalls, 0);
+              } else {
+                assert.ok(['applied','resume_unknown'].includes(recovered.outcome), crashPoint);
+                if (recovered.outcome === 'applied') appliedRecoveries += 1;
+                assert.equal(resumeCalls, 1, crashPoint);
+              }
+            } finally { reopenedStore.close(); }
+          } finally { fs.rmSync(dir, { recursive:true,force:true }); }
+        });
+      }
+      assert.ok(appliedRecoveries >= 1, 'at least one persisted snapshot advancement reconciles to applied');
+
+      await withTask8(async ({ store,secondStore,capability,hashes,token,databasePath }) => {
+        const input={commandId:token.commandId,runId:token.runId,suspensionId:token.suspensionId,suspendedStep:token.suspendedStep,blockerKind:token.blockerKind,
+          suspensionGeneration:1,response:{schemaVersion:1 as const,kind:'confirmation' as const,value:'ready'},...hashes,resumeSchemaVersion:1 as const};
+        assert.equal(store.acceptSuspension(capability,input,'expired-owner',task8AcceptanceKey).outcome,'accepted');
+        const before=store.loadAcceptedResume(capability,token.suspensionId,task8AcceptanceKey)!;
+        await delay(70);
+        const splitDb=new DatabaseSync(databasePath);
+        assert.throws(()=>splitDb.prepare("UPDATE career_commands SET claim_generation=claim_generation+1,lease_owner='split-owner' WHERE command_id=?").run(token.commandId),/binding|authority/i);
+        splitDb.close();
+        assert.deepEqual(secondStore.reclaimAcceptedResume(capability,token.suspensionId,'reclaimed-owner'),{reclaimed:true});
+        const after=secondStore.loadAcceptedResume(capability,token.suspensionId,task8AcceptanceKey)!;
+        assert.equal(after.fence.claimGeneration,before.fence.claimGeneration+1);
+        assert.equal(after.fence.leaseOwner,'reclaimed-owner');
+      },{leaseMs:50});
+
+      await withTask8(async ({ store,secondStore,capability,hashes,token }) => {
+        const input={commandId:token.commandId,runId:token.runId,suspensionId:token.suspensionId,suspendedStep:token.suspendedStep,blockerKind:token.blockerKind,
+          suspensionGeneration:1,response:{schemaVersion:1 as const,kind:'confirmation' as const,value:'ready'},...hashes,resumeSchemaVersion:1 as const};
+        store.acceptSuspension(capability,input,'ambiguous-owner',task8AcceptanceKey);
+        const work=store.loadAcceptedResume(capability,token.suspensionId,task8AcceptanceKey)!;
+        store.markResumeApplying(work.fence,token.suspensionId); store.markResumeCallStarted(work.fence,token.suspensionId);
+        await delay(70); secondStore.reclaimAcceptedResume(capability,token.suspensionId,'ambiguous-reclaimer');
+        let calls=0;
+        const adapter={ inspectExactRun:async()=>({runId:token.runId,workflowName:'save-job-v1',resourceId:token.resourceId,status:'suspended' as const,suspendedSteps:[token.suspendedStep]}),
+          prepareExactResume:async()=>({invoke:()=>{calls+=1;return Promise.resolve({runId:token.runId});}}) };
+        assert.deepEqual(await new CareerResumeCoordinator(secondStore,adapter,task8AcceptanceKey).recoverAcceptedResume(capability,token.suspensionId),{outcome:'resume_unknown'});
+        assert.equal(calls,0);
+      },{leaseMs:50});
+
+      await withTask8(async ({ store,secondStore,capability,hashes,token }) => {
+        const input={commandId:token.commandId,runId:token.runId,suspensionId:token.suspensionId,suspendedStep:token.suspendedStep,blockerKind:token.blockerKind,
+          suspensionGeneration:1,response:{schemaVersion:1 as const,kind:'confirmation' as const,value:'ready'},...hashes,resumeSchemaVersion:1 as const};
+        store.acceptSuspension(capability,input,'projection-owner',task8AcceptanceKey);
+        const work=store.loadAcceptedResume(capability,token.suspensionId,task8AcceptanceKey)!;
+        store.markResumeApplying(work.fence,token.suspensionId); store.markResumeCallStarted(work.fence,token.suspensionId); store.markResumeCallReturned(work.fence,token.suspensionId);
+        const adapter={ inspectExactRun:async()=>({runId:token.runId,workflowName:'save-job-v1',resourceId:token.resourceId,status:'running' as const,suspendedSteps:[]}),
+          prepareExactResume:async()=>{throw new Error('must not prepare advanced run');} };
+        const first=new CareerResumeCoordinator(store,adapter,task8AcceptanceKey);
+        await assert.rejects(first.recoverAcceptedResume(capability,token.suspensionId,(point)=>{if(point==='beforeAppliedProjection')throw new Error('projection-crash');}),/projection-crash/);
+        const reopened=new CareerResumeCoordinator(secondStore,adapter,task8AcceptanceKey);
+        assert.deepEqual(await reopened.recoverAcceptedResume(capability,token.suspensionId),{outcome:'applied'});
+        assert.equal(secondStore.getCommand(token.commandId)!.queueState,'running');
+        assert.equal(secondStore.getSuspensionStatus(capability,token.suspensionId)!.state,'applied');
+      });
+    },
+  },
+  {
+    id: 'P12-seven-day-expiry-times-out',
+    run: () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(),'career-v0-task8-expired-'));
+      const databasePath = path.join(dir,'operational.db');
+      try {
+        const database = new DatabaseSync(databasePath);
+        database.exec(exactLegacySql);
+        for (const migration of MIGRATIONS.slice(0,6)) {
+          if (migration.version===3) database.exec('PRAGMA foreign_keys=OFF; PRAGMA legacy_alter_table=ON;');
+          database.exec(migration.sql);
+          if (migration.version===3) database.exec('PRAGMA legacy_alter_table=OFF; PRAGMA foreign_keys=ON;');
+          if (migration.version===1) database.exec(`CREATE TABLE schema_migrations (
+            version INTEGER PRIMARY KEY CHECK (version > 0), name TEXT NOT NULL UNIQUE,
+            checksum TEXT NOT NULL CHECK (length(checksum) = 64), applied_at INTEGER NOT NULL CHECK (applied_at >= 0),
+            legacy_outbox_preserved INTEGER NOT NULL CHECK (legacy_outbox_preserved IN (0, 1) AND (version = 1 OR legacy_outbox_preserved = 0))
+          ) STRICT;`);
+          database.prepare('INSERT INTO schema_migrations VALUES (?,?,?,?,?)').run(migration.version,migration.name,migration.checksum,migration.version,migration.version===1?1:0);
+        }
+        const now = Number(database.prepare("SELECT CAST(unixepoch('subsec')*1000 AS INTEGER) now").get()!.now);
+        const hash = `sha256:${'a'.repeat(64)}`;
+        database.prepare(`INSERT INTO career_commands (command_id,attempt_id,request_id,canonical_job_key,canonical_url,owner_resource_id,thread_id,
+          origin_channel,origin_destination,queue_state,run_id,start_dispatch_state,processing_started_at,suspension_generation,blocker_id,
+          processing_budget_remaining_ms,suspension_started_at,created_at,updated_at,queued_at)
+          VALUES ('expired-task8','expired-attempt','expired-request','job:expired','https://example.com/expired','owner-v0','studio:expiry','studio','studio:loopback',
+          'suspended','expired-run','dispatched',?,1,'expired-blocker',123456,?,?,?,?)`).run(now-604800100,now-604800000,now-604800100,now-604800000,now-604800100);
+        database.prepare(`INSERT INTO career_suspensions (suspension_id,command_id,run_id,suspended_step,blocker_kind,blocker_state,blocker_schema_version,generation,
+          safe_payload,payload_hash,source_hash,profile_hash,prompt_version,prompt_hash,resume_schema_version,resume_schema_hash,allowed_response,issued_at,expires_at,created_at,updated_at)
+          VALUES ('expired-blocker','expired-task8','expired-run','save-job-skeleton-v1','clarification_required','pending',1,1,'{}',?,?,?,1,?,1,?,'{}',?,?,?,?)`).run(hash,hash,hash,hash,hash,now-604800100,now-100,now-604800100,now-604800100);
+        database.close();
+        const store = new CareerStore(`file:${databasePath}`);
+        assert.deepEqual(store.expireSuspensions(),{ transitioned:1 });
+        const command = store.getCommand('expired-task8')!;
+        assert.equal(command.queueState,'timed_out');
+        assert.equal(command.terminalGeneration,1);
+        assert.equal(command.processingBudgetRemainingMs,123456);
+        const inspect = new DatabaseSync(databasePath,{readOnly:true});
+        assert.deepEqual({ ...inspect.prepare("SELECT blocker_state state FROM career_suspensions WHERE suspension_id='expired-blocker'").get()! },{ state:'expired' });
+        const terminal = inspect.prepare("SELECT lease_owner leaseOwner,lease_expires_at leaseExpiresAt,heartbeat_at heartbeatAt,error_code errorCode FROM career_commands WHERE command_id='expired-task8'").get()!;
+        assert.deepEqual({ ...terminal },{ leaseOwner:null,leaseExpiresAt:null,heartbeatAt:null,errorCode:'suspension_expired' });
+        inspect.close();
+        assert.deepEqual(store.expireSuspensions(),{ transitioned:0 });
+        assert.equal(store.getCommand('expired-task8')!.terminalGeneration,1);
+        store.close();
+      } finally { fs.rmSync(dir,{recursive:true,force:true}); }
+    },
+  },
   {
     id: 'P4-telegram-user-and-private-chat',
     run: () => {
@@ -544,7 +808,12 @@ const rows: AcceptanceRow[] = [
                 : ['starting', 'running', 'retry_wait', 'resuming'].includes(String(row.queue_state))
                   ? Math.min(1_800_000, Math.max(0, Number(row.processing_deadline_at) - Number(row.updated_at))) : 1_800_000,
               suspension_started_at: row.queue_state === 'suspended' ? row.updated_at : null }))
-            : before[table];
+            : table === 'career_suspensions'
+              ? (before[table] as Array<Record<string, unknown>>).map((row) => ({ ...row, owner_resource_id:'v2-owner', evidence_hash:row.payload_hash,
+                resume_payload:null,resume_call_state:'not_called',invalidation_reason:null,issuance_claim_generation:null,issuance_lease_owner:null,
+                resume_claim_generation:null,resume_lease_owner:null,resume_lease_expires_at:null,resume_processing_deadline_at:null,acceptance_nonce:null,acceptance_authority_tag:null,
+                current_resume_claim_generation:null,current_resume_lease_owner:null,current_resume_lease_expires_at:null,resume_call_started_at:null,resume_observed_status:null,applied_at:null }))
+              : before[table];
           assert.deepEqual(upgraded.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row })), expectedRows, table);
         }
         const v3ObjectsSql = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE (name LIKE 'career_%' OR tbl_name LIKE 'career_%') AND name <> 'career_outbox' AND tbl_name <> 'career_outbox' ORDER BY type,name";
@@ -1499,7 +1768,7 @@ const rows: AcceptanceRow[] = [
         starting: ['running', 'timed_out'],
         running: ['retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out'],
         retry_wait: ['resuming', 'timed_out'],
-        suspended: ['resuming', 'timed_out'],
+        suspended: ['resuming', 'failed', 'timed_out'],
         resuming: ['running', 'timed_out'],
         succeeded: [],
         failed: [],
@@ -1527,9 +1796,9 @@ const rows: AcceptanceRow[] = [
                 ? database.prepare("UPDATE career_commands SET queue_state='resuming', processing_deadline_at=1800001 WHERE command_id=?").run(id)
                 : database.prepare('UPDATE career_commands SET queue_state = ? WHERE command_id = ?').run(to, id);
             const authorityTransition = (from === 'running' && ['retry_wait', 'suspended'].includes(to))
-              || (from === 'suspended' && to === 'resuming') || (from === 'retry_wait' && ['resuming', 'timed_out'].includes(to));
+              || (from === 'suspended' && ['resuming','failed'].includes(to)) || (from === 'retry_wait' && ['resuming', 'timed_out'].includes(to));
             if (expected[from].includes(to as never) && !authorityTransition) assert.doesNotThrow(update, `${from} -> ${to}`);
-            else assert.throws(update, /illegal queue transition|terminal command is immutable|schedule authority|processing time|projection/i, `${from} -/-> ${to}`);
+            else assert.throws(update, /illegal queue transition|terminal command is immutable|schedule authority|processing time|projection|suspension transition requires blocker authority|resume transition requires accepted blocker authority|linked attempt failure requires invalidated blocker/i, `${from} -/-> ${to}`);
           }
         }
         database.close();
@@ -1655,7 +1924,7 @@ const rows: AcceptanceRow[] = [
       store.enqueueCommand(queueInput('reclaimed-command'));
       const first = store.claimNextRunnable('worker-a')!;
       assert.equal(dispatchAndMarkRunning(store, databasePath, first).applied, true);
-      await delay(25);
+      await delay(70);
       const second = store.claimNextRunnable('worker-b')!;
       assert.equal(second.queueState, 'running');
       assert.equal(second.commandId, first.commandId);
@@ -1750,31 +2019,17 @@ const rows: AcceptanceRow[] = [
           'https://example.com/jobs/historical', 'owner-1', 'thread-1', 'telegram', 'chat-1',
           'suspended', 'run-historical', 'dispatched', ?, 1, 'blocker-1', ?, ?, ?)
       `).run(now - 10, now - 10, now - 10, now - 10);
-      database.prepare(`
+      assert.throws(() => database.prepare(`
         UPDATE career_commands
         SET queue_state = 'resuming', claim_generation = 1, lease_owner = 'worker-suspension',
           lease_expires_at = CAST(unixepoch('subsec')*1000 AS INTEGER) + 60000,
           heartbeat_at = CAST(unixepoch('subsec')*1000 AS INTEGER),
           processing_deadline_at = CAST(unixepoch('subsec')*1000 AS INTEGER) + processing_budget_remaining_ms,
-          updated_at = CAST(unixepoch('subsec')*1000 AS INTEGER)
+          suspension_started_at = NULL, updated_at = CAST(unixepoch('subsec')*1000 AS INTEGER)
         WHERE command_id = 'historical-suspension' AND queue_state = 'suspended'
-      `).run();
-      const resumedTimes = database.prepare("SELECT lease_expires_at leaseExpiresAt, heartbeat_at heartbeatAt FROM career_commands WHERE command_id='historical-suspension'").get()!;
+      `).run(), /accepted blocker authority/i);
       database.close();
-
-      const suspensionResume = {
-        commandId: 'historical-suspension', runId: 'run-historical', ownerResourceId: 'owner-1',
-        queueState: 'resuming' as const, leaseOwner: 'worker-suspension', claimGeneration: 1,
-        leaseExpiresAt: Number(resumedTimes.leaseExpiresAt), heartbeatAt: Number(resumedTimes.heartbeatAt),
-      };
-      assert.equal(store.markRunning({ ...suspensionResume, sourceState: 'resuming' }).applied, true);
-      assert.equal(scheduleTestRetry(store, { ...suspensionResume, sourceState: 'running' }).applied, true);
-      const retryResume = store.claimNextRunnable('worker-retry')!;
-      assert.equal(retryResume.queueState, 'resuming');
-      const inspect = new DatabaseSync(databasePath, { readOnly: true });
-      const persisted = inspect.prepare("SELECT suspension_generation, blocker_id FROM career_commands WHERE command_id='historical-suspension'").get()!;
-      inspect.close();
-      assert.deepEqual({ ...persisted }, { suspension_generation: 1, blocker_id: null });
+      assert.equal(store.getCommand('historical-suspension')!.queueState, 'suspended');
     }),
   },
   {
@@ -2221,7 +2476,7 @@ const rows: AcceptanceRow[] = [
       assert.throws(() => lateDb.prepare(`UPDATE career_commands SET queue_state='suspended', suspension_generation=1,
         blocker_id='late-blocker', processing_budget_remaining_ms=1, processing_deadline_at=NULL,
         suspension_started_at=?, lease_owner=NULL, lease_expires_at=NULL, heartbeat_at=NULL, updated_at=?
-        WHERE command_id='late-commit'`).run(lateNow - 10, lateNow - 10), /processing time|deadline/i);
+        WHERE command_id='late-commit'`).run(lateNow - 10, lateNow - 10), /processing time|deadline|suspension transition requires blocker authority/i);
       lateDb.close();
       assert.throws(() => new CareerStore(`file:${path.join(os.tmpdir(), 'deadline-too-long.db')}`, { processingDeadlineMs: 1_800_001 }), /processing deadline/i);
       assert.throws(() => new CareerStore(`file:${path.join(os.tmpdir(), 'deadline-invalid.db')}`, { processingDeadlineMs: 0 }), /processing deadline/i);
@@ -2241,7 +2496,7 @@ const rows: AcceptanceRow[] = [
       dispatchAndMarkRunning(store, databasePath, resume);
       scheduleTestRetry(store, { ...resume, sourceState: 'running' });
       assert.equal(store.claimNextRunnable('worker-resume-2')?.queueState, 'resuming');
-      await delay(25);
+      await delay(70);
       assert.deepEqual(store.expireProcessingDeadlines(), { transitioned: 4 });
       for (const id of ['timeout-starting', 'timeout-running', 'timeout-retry', 'timeout-resuming']) assert.equal(store.getCommand(id)?.queueState, 'timed_out', id);
       assert.equal(store.expireProcessingDeadlines().transitioned, 0);
@@ -2253,26 +2508,22 @@ const rows: AcceptanceRow[] = [
       store.enqueueCommand(queueInput('suspension-budget'));
       const claim = store.claimNextRunnable('worker-suspend')!;
       dispatchAndMarkRunning(store, databasePath, claim);
-      const db = new DatabaseSync(databasePath);
-      db.prepare(`UPDATE career_commands SET queue_state='suspended', suspension_generation=1, blocker_id='future-task-8-blocker',
-        processing_budget_remaining_ms=processing_deadline_at-CAST(unixepoch('subsec')*1000 AS INTEGER), processing_deadline_at=NULL,
-        suspension_started_at=CAST(unixepoch('subsec')*1000 AS INTEGER), lease_owner=NULL,
-        lease_expires_at=NULL, heartbeat_at=NULL, updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
-        WHERE command_id='suspension-budget'`).run();
-      const preserved = Number(db.prepare("SELECT processing_budget_remaining_ms remaining FROM career_commands WHERE command_id='suspension-budget'").get()!.remaining);
-      const future = Date.now() + OPERATION_DEADLINES_MS.humanSuspension;
-      assert.throws(() => db.prepare(`UPDATE career_commands SET queue_state='resuming', claim_generation=claim_generation+1,
-        lease_owner='worker-resume', lease_expires_at=?, heartbeat_at=?, processing_deadline_at=?, suspension_started_at=NULL,
-        updated_at=? WHERE command_id='suspension-budget'`).run(future + 10_000, future, future + preserved, future), /processing time|deadline/i);
-      db.prepare(`UPDATE career_commands SET queue_state='resuming', claim_generation=claim_generation+1,
-        lease_owner='worker-resume', lease_expires_at=CAST(unixepoch('subsec')*1000 AS INTEGER)+10000,
-        heartbeat_at=CAST(unixepoch('subsec')*1000 AS INTEGER),
-        processing_deadline_at=CAST(unixepoch('subsec')*1000 AS INTEGER)+processing_budget_remaining_ms,
-        suspension_started_at=NULL, updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
-        WHERE command_id='suspension-budget'`).run();
-      const resumed = db.prepare("SELECT processing_budget_remaining_ms remaining, processing_deadline_at deadline, updated_at updatedAt FROM career_commands WHERE command_id='suspension-budget'").get()!;
-      assert.deepEqual({ remaining: resumed.remaining, deadline: resumed.deadline }, { remaining: preserved, deadline: Number(resumed.updatedAt) + preserved });
-      db.close();
+      const hash = `sha256:${'a'.repeat(64)}`;
+      const hashes = { sourceHash: hash, profileHash: hash, evidenceHash: hash, promptHash: hash, schemaHash: hash };
+      assert.equal(store.issueSuspension({ ...claimToFence(claim), sourceState: 'running' }, {
+        suspensionId:'budget-blocker',suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required',...hashes,
+        promptVersion:1,resumeSchemaVersion:1,allowedResponse:{kind:'confirmation',choices:['ready']},safeMessage:'Confirm.',
+      }).applied, true);
+      const preserved = store.getCommand('suspension-budget')!.processingBudgetRemainingMs;
+      const auth = new OwnerAuthorization(() => ({ ...task5Owner, resourceId:'owner-1' }));
+      const capability = auth.authorize({ channel:'studio',remoteAddress:'127.0.0.1',conversationId:'budget' });
+      const accepted = store.acceptSuspension(capability, { commandId:'suspension-budget',runId:claim.runId,suspensionId:'budget-blocker',
+        suspendedStep:'save-job-skeleton-v1',blockerKind:'clarification_required',suspensionGeneration:1,...hashes,resumeSchemaVersion:1,
+        response:{schemaVersion:1,kind:'confirmation',value:'ready'} }, 'worker-resume',task8AcceptanceKey);
+      assert.equal(accepted.outcome, 'accepted');
+      const resumed = store.getCommand('suspension-budget')!;
+      assert.equal(resumed.processingBudgetRemainingMs, preserved);
+      assert.ok(resumed.processingDeadlineAt! > Date.now());
     }),
   },
   {
@@ -2284,16 +2535,10 @@ const rows: AcceptanceRow[] = [
       database.prepare("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, run_id, start_dispatch_state, processing_started_at, suspension_generation, blocker_id, created_at, updated_at, queued_at) VALUES ('suspended-expired','suspended-attempt','suspended-request','job:suspended','https://example.com/jobs/suspended','owner-1','thread-1','telegram','chat-1','suspended','run-suspended','dispatched',?,2,'blocker-current',?,?,?)").run(now - 200, now - 200, now - 200, now - 200);
       const insert = database.prepare("INSERT INTO career_suspensions (suspension_id, command_id, run_id, suspended_step, blocker_kind, blocker_state, blocker_schema_version, generation, safe_payload, payload_hash, source_hash, profile_hash, prompt_version, prompt_hash, resume_schema_version, resume_schema_hash, allowed_response, issued_at, expires_at, created_at, updated_at) VALUES (?,'suspended-expired','run-suspended','acquire','reauth_required','pending',1,?,'{}',?,?,?,1,?,1,?,'{}',?,?,?,?)");
       insert.run('blocker-old', 1, hash, hash, hash, hash, hash, now - 200, now - 100, now - 200, now - 200);
-      insert.run('blocker-current', 2, hash, hash, hash, hash, hash, now - 50, now + 10_000, now - 50, now - 50);
+      insert.run('blocker-current', 2, hash, hash, hash, hash, hash, now - 50, now - 1, now - 50, now - 50);
       database.close();
-      assert.deepEqual(store.expireSuspensions(), { transitioned: 0 });
-      let inspect = new DatabaseSync(databasePath);
-      assert.equal(inspect.prepare("SELECT blocker_state FROM career_suspensions WHERE suspension_id='blocker-old'").get()!.blocker_state, 'pending');
-      assert.equal(store.getCommand('suspended-expired')?.queueState, 'suspended');
-      inspect.prepare("UPDATE career_suspensions SET expires_at = ? WHERE suspension_id='blocker-current'").run(now - 1);
-      inspect.close();
       assert.deepEqual(store.expireSuspensions(), { transitioned: 1 });
-      inspect = new DatabaseSync(databasePath, { readOnly: true });
+      let inspect = new DatabaseSync(databasePath, { readOnly: true });
       assert.deepEqual(inspect.prepare('SELECT suspension_id, blocker_state FROM career_suspensions ORDER BY generation').all().map((row) => ({ ...row })), [
         { suspension_id: 'blocker-old', blocker_state: 'pending' },
         { suspension_id: 'blocker-current', blocker_state: 'expired' },
@@ -2411,7 +2656,7 @@ async function waitForWorkflowRun(workflow: { getWorkflowRunById: (runId: string
 async function waitFor(predicate: () => boolean | Promise<boolean>, failureMessage: string) {
   for (let attempt = 0; attempt < 800; attempt += 1) {
     if (await predicate()) return;
-    await delay(25);
+    await delay(70);
   }
   assert.fail(failureMessage);
 }
@@ -2449,13 +2694,17 @@ function contractFixtures(contracts: any): [string, any, any][] {
       externalReference: 'sheet:tracker:row-2', contentHash: hash, safeOutcome: 'effect_verified', plannedAt: at, applyingAt: at,
       completedAt: later, updatedAt: later,
     }],
+    ['SuspensionTokenV1Schema', contracts.SuspensionTokenV1Schema, { schemaVersion:1,suspensionId:'blocker-1',suspensionGeneration:1,
+      commandId:'command-1',runId:'cc-save-v1:command-1:1',resourceId:'owner-1',suspendedStep:'save-job-skeleton-v1',
+      blockerKind:'clarification_required',resumeSchemaVersion:1,evidenceHash:hash,sourceHash:hash,profileHash:hash,promptVersion:1,promptHash:hash,resumeSchemaHash:hash }],
     ['ResumePayloadV1Schema', contracts.ResumePayloadV1Schema, { schemaVersion: 1, kind: 'confirmation', value: 'ready' }],
     ['BlockerEnvelopeV1Schema', contracts.BlockerEnvelopeV1Schema, {
       schemaVersion: 1, blockerId: 'blocker-1', commandId: 'command-1', runId: 'cc-save-v1:command-1:1', suspendedStep: 'acquire_evidence',
-      suspensionGeneration: 1, ...identity, blockerKind: 'reauth_required', state: 'pending', sourceHash: hash, profileHash: hash,
+      suspensionGeneration: 1, ...identity, blockerKind: 'reauth_required', state: 'pending', evidenceHash: hash, sourceHash: hash, profileHash: hash,
       promptVersion: 1, promptHash: hash, resumeSchemaVersion: 1, resumeSchemaHash: hash,
       allowedResponse: { kind: 'confirmation', choices: ['ready'] }, issuedAt: at, expiresAt: later, acceptedAt: null,
-      resumePayload: null, resumePayloadHash: null, safeMessage: 'Reconnect the approved browser session.',
+      resumePayload: null, resumePayloadHash: null, resumeCallState: 'not_called', invalidationReason: null,
+      safeMessage: 'Reconnect the approved browser session.',
     }],
     ['EvidenceRecordV1Schema', contracts.EvidenceRecordV1Schema, {
       schemaVersion: 1, evidenceId: 'evidence-1', commandId: 'command-1', canonicalUrl: 'https://www.linkedin.com/jobs/view/1',
@@ -2561,9 +2810,11 @@ function acceptedBlocker(blocker: any, resumePayloadHash: string) {
 }
 
 function blockerForState(blocker: any, state: string, resumePayloadHash: string) {
-  return ['accepted', 'applying', 'applied'].includes(state)
-    ? { ...acceptedBlocker(blocker, resumePayloadHash), state }
-    : { ...blocker, state };
+  if (['accepted', 'applying', 'applied'].includes(state)) return {
+    ...acceptedBlocker(blocker, resumePayloadHash), state, resumeCallState: state === 'applied' ? 'called' : 'not_called',
+  };
+  if (state === 'invalidated') return { ...blocker, state, invalidationReason: 'linked_attempt_required' };
+  return { ...blocker, state };
 }
 
 function suspensionEnvelope(completion: any) {

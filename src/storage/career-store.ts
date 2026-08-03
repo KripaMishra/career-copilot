@@ -1,10 +1,10 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { assertCurrentlyValidPrincipalAuthorizationCapability, isOwnerAuthorizationCapability, type OwnerAuthorizationCapability } from '../channels/telegram-auth.ts';
 import { assertOperationalDatabaseUrl } from '../config/runtime.ts';
-import type { QueueStateV0 } from '../contracts/v0.ts';
+import { SuspensionTokenV1Schema, type QueueStateV0, type SuspensionTokenV1 } from '../contracts/v0.ts';
 import { STAGE_REPEAT_CAPS, classifyFailure, computeRetrySchedule, type FailureClass, type RetryPolicyResult, type RetryStage, type SafeFailureCode } from '../workflows/retry-policy.ts';
 
 export type JobIdentity = { url?: string; company?: string; title?: string; location?: string };
@@ -936,6 +936,230 @@ BEGIN
 END;
 `;
 
+const task8ProcessingTimeAuthoritySql = retryPolicySql
+  .slice(retryPolicySql.indexOf('CREATE TRIGGER career_commands_processing_time_authority'), retryPolicySql.indexOf('CREATE TRIGGER career_commands_legacy_retry_wait_insert_guard'))
+  .replace(
+    "    OR (OLD.queue_state = 'suspended' AND NEW.queue_state = 'resuming'",
+    "    OR (OLD.queue_state = 'suspended' AND NEW.queue_state = 'failed'\n      AND NEW.processing_started_at = OLD.processing_started_at AND NEW.processing_budget_remaining_ms = OLD.processing_budget_remaining_ms\n      AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) AND NEW.processing_deadline_at = NEW.updated_at\n      AND NEW.suspension_started_at IS NULL)\n    OR (OLD.queue_state = 'suspended' AND NEW.queue_state = 'resuming'",
+  )
+  .replace(
+    "      AND NEW.updated_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)\n      AND NEW.processing_deadline_at = CAST(unixepoch('subsec') * 1000 AS INTEGER) + OLD.processing_budget_remaining_ms\n      AND NEW.suspension_started_at IS NULL AND NEW.claim_generation = OLD.claim_generation + 1\n      AND NEW.lease_owner IS NOT NULL AND NEW.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)\n      AND NEW.heartbeat_at = CAST(unixepoch('subsec') * 1000 AS INTEGER))",
+    "      AND NEW.suspension_started_at IS NULL AND NEW.claim_generation = OLD.claim_generation + 1\n      AND NEW.lease_owner IS NOT NULL AND NEW.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)\n      AND EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=OLD.blocker_id AND s.blocker_state='accepted'\n        AND s.current_resume_claim_generation=NEW.claim_generation AND s.current_resume_lease_owner=NEW.lease_owner\n        AND s.current_resume_lease_expires_at=NEW.lease_expires_at AND s.accepted_at=NEW.heartbeat_at\n        AND s.accepted_at=NEW.updated_at AND s.resume_processing_deadline_at=NEW.processing_deadline_at))",
+  );
+
+const generationBoundSuspensionSql = `
+DROP TRIGGER career_commands_processing_time_authority;
+${task8ProcessingTimeAuthoritySql}
+DROP TRIGGER career_commands_legal_queue_transition;
+CREATE TRIGGER career_commands_legal_queue_transition
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state <> NEW.queue_state AND NOT (
+  (OLD.queue_state = 'queued' AND NEW.queue_state = 'starting') OR
+  (OLD.queue_state = 'starting' AND NEW.queue_state IN ('running', 'timed_out')) OR
+  (OLD.queue_state = 'running' AND NEW.queue_state IN ('retry_wait', 'suspended', 'succeeded', 'failed', 'timed_out')) OR
+  (OLD.queue_state = 'retry_wait' AND NEW.queue_state IN ('resuming', 'timed_out')) OR
+  (OLD.queue_state = 'suspended' AND NEW.queue_state IN ('resuming', 'failed', 'timed_out')) OR
+  (OLD.queue_state = 'resuming' AND NEW.queue_state IN ('running', 'timed_out'))
+)
+BEGIN SELECT RAISE(ABORT, 'illegal queue transition'); END;
+DROP TRIGGER career_commands_terminal_immutable;
+CREATE TRIGGER career_commands_terminal_immutable
+BEFORE UPDATE ON career_commands
+WHEN OLD.queue_state IN ('succeeded','failed','timed_out')
+BEGIN SELECT RAISE(ABORT,'terminal command is immutable'); END;
+ALTER TABLE career_suspensions ADD COLUMN owner_resource_id TEXT;
+ALTER TABLE career_suspensions ADD COLUMN evidence_hash TEXT;
+ALTER TABLE career_suspensions ADD COLUMN resume_payload TEXT CHECK (resume_payload IS NULL OR (json_valid(resume_payload) AND length(resume_payload) BETWEEN 1 AND 8192));
+ALTER TABLE career_suspensions ADD COLUMN resume_call_state TEXT NOT NULL DEFAULT 'not_called' CHECK (resume_call_state IN ('not_called','calling','called','resume_unknown'));
+ALTER TABLE career_suspensions ADD COLUMN invalidation_reason TEXT CHECK (invalidation_reason IS NULL OR invalidation_reason = 'linked_attempt_required');
+ALTER TABLE career_suspensions ADD COLUMN issuance_claim_generation INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN issuance_lease_owner TEXT;
+ALTER TABLE career_suspensions ADD COLUMN resume_claim_generation INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN resume_lease_owner TEXT;
+ALTER TABLE career_suspensions ADD COLUMN resume_lease_expires_at INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN resume_processing_deadline_at INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN acceptance_nonce TEXT;
+ALTER TABLE career_suspensions ADD COLUMN acceptance_authority_tag TEXT;
+ALTER TABLE career_suspensions ADD COLUMN current_resume_claim_generation INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN current_resume_lease_owner TEXT;
+ALTER TABLE career_suspensions ADD COLUMN current_resume_lease_expires_at INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN resume_call_started_at INTEGER;
+ALTER TABLE career_suspensions ADD COLUMN resume_observed_status TEXT CHECK (resume_observed_status IS NULL OR resume_observed_status IN ('running','waiting','success','failed'));
+ALTER TABLE career_suspensions ADD COLUMN applied_at INTEGER;
+UPDATE career_suspensions SET owner_resource_id = (SELECT owner_resource_id FROM career_commands WHERE command_id = career_suspensions.command_id),
+  evidence_hash = payload_hash;
+CREATE UNIQUE INDEX career_suspensions_one_current_generation_idx ON career_suspensions(command_id, generation);
+CREATE TRIGGER career_suspensions_v7_insert_authority
+BEFORE INSERT ON career_suspensions
+WHEN COALESCE(NOT (
+  NEW.owner_resource_id IS NOT NULL AND length(NEW.owner_resource_id) BETWEEN 1 AND 200
+  AND NEW.evidence_hash LIKE 'sha256:%' AND length(NEW.evidence_hash) = 71
+  AND NEW.issuance_claim_generation IS NOT NULL AND NEW.issuance_lease_owner IS NOT NULL
+  AND NEW.blocker_state = 'pending' AND NEW.resume_payload IS NULL AND NEW.resume_call_state = 'not_called'
+  AND NEW.generation = (SELECT suspension_generation + 1 FROM career_commands WHERE command_id = NEW.command_id)
+  AND NEW.issued_at = CAST(unixepoch('subsec') * 1000 AS INTEGER)
+  AND NEW.expires_at = NEW.issued_at + 604800000 AND NEW.created_at = NEW.issued_at AND NEW.updated_at = NEW.issued_at
+  AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id = NEW.command_id AND c.run_id = NEW.run_id
+    AND c.owner_resource_id = NEW.owner_resource_id AND c.queue_state = 'running'
+    AND c.claim_generation = NEW.issuance_claim_generation AND c.lease_owner = NEW.issuance_lease_owner
+    AND c.lease_expires_at > CAST(unixepoch('subsec') * 1000 AS INTEGER)
+    AND c.processing_deadline_at > CAST(unixepoch('subsec') * 1000 AS INTEGER))
+  OR (NEW.owner_resource_id IS NULL AND NEW.evidence_hash IS NULL AND NEW.issuance_claim_generation IS NULL AND NEW.issuance_lease_owner IS NULL
+    AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=NEW.command_id AND c.run_id=NEW.run_id
+      AND c.queue_state='suspended' AND ((c.blocker_id=NEW.suspension_id AND c.suspension_generation=NEW.generation)
+        OR NEW.generation<c.suspension_generation)))
+), 1)
+BEGIN SELECT RAISE(ABORT, 'invalid suspension issuance authority constraint'); END;
+CREATE TRIGGER career_commands_v7_suspension_authority
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state = 'running' AND NEW.queue_state = 'suspended'
+  AND NOT EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id = NEW.blocker_id
+    AND s.command_id = OLD.command_id AND s.run_id = OLD.run_id AND s.owner_resource_id = OLD.owner_resource_id
+    AND s.generation = NEW.suspension_generation AND s.generation = OLD.suspension_generation + 1
+    AND s.issuance_claim_generation = OLD.claim_generation AND s.issuance_lease_owner = OLD.lease_owner
+    AND s.blocker_state = 'pending')
+BEGIN SELECT RAISE(ABORT, 'suspension transition requires blocker authority'); END;
+CREATE TRIGGER career_commands_v7_resume_authority
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state='suspended' AND NEW.queue_state='resuming'
+  AND NOT EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=OLD.blocker_id AND s.command_id=OLD.command_id
+    AND s.run_id=OLD.run_id AND s.owner_resource_id=OLD.owner_resource_id AND s.generation=OLD.suspension_generation
+    AND s.blocker_state='accepted' AND s.current_resume_claim_generation=NEW.claim_generation AND s.current_resume_lease_owner=NEW.lease_owner)
+BEGIN SELECT RAISE(ABORT, 'resume transition requires accepted blocker authority'); END;
+CREATE TRIGGER career_commands_v7_resume_binding_immutable
+BEFORE UPDATE OF claim_generation,lease_owner,blocker_id,suspension_generation,run_id,owner_resource_id ON career_commands
+WHEN OLD.queue_state='resuming' AND OLD.blocker_id IS NOT NULL AND NEW.queue_state='resuming' AND COALESCE(NOT (
+  (NEW.claim_generation IS OLD.claim_generation AND NEW.lease_owner IS OLD.lease_owner
+    AND NEW.blocker_id IS OLD.blocker_id AND NEW.suspension_generation IS OLD.suspension_generation
+    AND NEW.run_id IS OLD.run_id AND NEW.owner_resource_id IS OLD.owner_resource_id)
+  OR (NEW.claim_generation=OLD.claim_generation+1 AND OLD.lease_expires_at<=CAST(unixepoch('subsec')*1000 AS INTEGER)
+    AND NEW.blocker_id IS OLD.blocker_id AND NEW.suspension_generation IS OLD.suspension_generation
+    AND NEW.run_id IS OLD.run_id AND NEW.owner_resource_id IS OLD.owner_resource_id
+    AND EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=OLD.blocker_id AND s.command_id=OLD.command_id
+      AND s.current_resume_claim_generation=NEW.claim_generation AND s.current_resume_lease_owner=NEW.lease_owner))
+),1)
+BEGIN SELECT RAISE(ABORT,'resume command binding is immutable'); END;
+CREATE TRIGGER career_suspensions_v7_identity_immutable
+BEFORE UPDATE OF command_id,run_id,suspended_step,blocker_kind,blocker_schema_version,generation,owner_resource_id,evidence_hash,source_hash,profile_hash,prompt_version,prompt_hash,resume_schema_version,resume_schema_hash,allowed_response,safe_payload,payload_hash,issued_at,expires_at,issuance_claim_generation,issuance_lease_owner ON career_suspensions
+BEGIN SELECT RAISE(ABORT, 'suspension binding is immutable'); END;
+CREATE TRIGGER career_suspensions_v7_state_authority
+BEFORE UPDATE ON career_suspensions
+WHEN COALESCE(NOT (
+  (OLD.blocker_state='pending' AND NEW.blocker_state='accepted'
+    AND NEW.accepted_input_generation=OLD.generation AND NEW.accepted_input_hash IS NOT NULL AND NEW.resume_payload IS NOT NULL
+    AND NEW.accepted_at=NEW.updated_at AND NEW.accepted_at<=CAST(unixepoch('subsec')*1000 AS INTEGER) AND NEW.accepted_at>=CAST(unixepoch('subsec')*1000 AS INTEGER)-5000 AND NEW.accepted_at<OLD.expires_at
+    AND NEW.resume_claim_generation IS NOT NULL AND NEW.resume_lease_owner IS NOT NULL AND NEW.resume_lease_expires_at>NEW.accepted_at
+    AND NEW.resume_processing_deadline_at=NEW.accepted_at+(SELECT processing_budget_remaining_ms FROM career_commands WHERE command_id=OLD.command_id)
+    AND NEW.acceptance_nonce IS NOT NULL AND length(NEW.acceptance_nonce) BETWEEN 16 AND 200
+    AND NEW.acceptance_authority_tag LIKE 'sha256:%' AND length(NEW.acceptance_authority_tag)=71
+    AND NEW.current_resume_claim_generation=NEW.resume_claim_generation AND NEW.current_resume_lease_owner=NEW.resume_lease_owner AND NEW.current_resume_lease_expires_at=NEW.resume_lease_expires_at
+    AND NEW.resume_call_state='not_called' AND NEW.resume_call_started_at IS NULL AND NEW.resume_observed_status IS NULL AND NEW.applied_at IS NULL AND NEW.invalidation_reason IS NULL AND NEW.resolved_at IS NULL
+    AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=OLD.command_id AND c.run_id=OLD.run_id AND c.owner_resource_id=OLD.owner_resource_id
+      AND c.queue_state='suspended' AND c.blocker_id=OLD.suspension_id AND c.suspension_generation=OLD.generation AND NEW.resume_claim_generation=c.claim_generation+1))
+  OR (OLD.blocker_state='pending' AND NEW.blocker_state='invalidated'
+    AND NEW.invalidation_reason='linked_attempt_required' AND NEW.resolved_at=NEW.updated_at
+    AND NEW.accepted_input_generation IS NULL AND NEW.accepted_input_hash IS NULL AND NEW.accepted_at IS NULL AND NEW.resume_payload IS NULL
+    AND NEW.resume_claim_generation IS NULL AND NEW.resume_lease_owner IS NULL AND NEW.resume_lease_expires_at IS NULL AND NEW.resume_processing_deadline_at IS NULL
+    AND NEW.acceptance_nonce IS NULL AND NEW.acceptance_authority_tag IS NULL AND NEW.current_resume_claim_generation IS NULL AND NEW.current_resume_lease_owner IS NULL AND NEW.current_resume_lease_expires_at IS NULL
+    AND NEW.resume_call_state='not_called' AND NEW.resume_call_started_at IS NULL AND NEW.resume_observed_status IS NULL AND NEW.applied_at IS NULL
+    AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=OLD.command_id AND c.run_id=OLD.run_id AND c.owner_resource_id=OLD.owner_resource_id
+      AND c.queue_state='suspended' AND c.blocker_id=OLD.suspension_id AND c.suspension_generation=OLD.generation))
+  OR (OLD.blocker_state='pending' AND NEW.blocker_state='expired'
+    AND OLD.expires_at<=CAST(unixepoch('subsec')*1000 AS INTEGER) AND NEW.resolved_at=NEW.updated_at
+    AND NEW.accepted_input_generation IS NULL AND NEW.accepted_input_hash IS NULL AND NEW.accepted_at IS NULL AND NEW.resume_payload IS NULL
+    AND NEW.resume_claim_generation IS NULL AND NEW.resume_lease_owner IS NULL AND NEW.resume_lease_expires_at IS NULL AND NEW.resume_processing_deadline_at IS NULL
+    AND NEW.acceptance_nonce IS NULL AND NEW.acceptance_authority_tag IS NULL AND NEW.current_resume_claim_generation IS NULL AND NEW.current_resume_lease_owner IS NULL AND NEW.current_resume_lease_expires_at IS NULL
+    AND NEW.resume_call_state='not_called' AND NEW.resume_call_started_at IS NULL AND NEW.resume_observed_status IS NULL AND NEW.applied_at IS NULL)
+  OR (OLD.blocker_state='accepted' AND NEW.blocker_state='applying' AND OLD.resume_call_state='not_called' AND NEW.resume_call_state='not_called'
+    AND NEW.accepted_input_generation IS OLD.accepted_input_generation AND NEW.accepted_input_hash IS OLD.accepted_input_hash AND NEW.accepted_at IS OLD.accepted_at AND NEW.resume_payload IS OLD.resume_payload
+    AND NEW.resume_claim_generation IS OLD.resume_claim_generation AND NEW.resume_lease_owner IS OLD.resume_lease_owner AND NEW.resume_lease_expires_at IS OLD.resume_lease_expires_at
+    AND NEW.resume_processing_deadline_at IS OLD.resume_processing_deadline_at AND NEW.acceptance_nonce IS OLD.acceptance_nonce AND NEW.acceptance_authority_tag IS OLD.acceptance_authority_tag
+    AND NEW.current_resume_claim_generation IS OLD.current_resume_claim_generation AND NEW.current_resume_lease_owner IS OLD.current_resume_lease_owner AND NEW.current_resume_lease_expires_at IS OLD.current_resume_lease_expires_at
+    AND NEW.resume_call_started_at IS NULL AND NEW.resume_observed_status IS NULL AND NEW.applied_at IS NULL AND NEW.invalidation_reason IS NULL AND NEW.resolved_at IS NULL)
+  OR (OLD.blocker_state IN ('accepted','applying') AND NEW.blocker_state=OLD.blocker_state AND NEW.resume_call_state IS OLD.resume_call_state
+    AND NEW.accepted_input_generation IS OLD.accepted_input_generation AND NEW.accepted_input_hash IS OLD.accepted_input_hash AND NEW.accepted_at IS OLD.accepted_at AND NEW.resume_payload IS OLD.resume_payload
+    AND NEW.resume_claim_generation IS OLD.resume_claim_generation AND NEW.resume_lease_owner IS OLD.resume_lease_owner AND NEW.resume_lease_expires_at IS OLD.resume_lease_expires_at
+    AND NEW.resume_processing_deadline_at IS OLD.resume_processing_deadline_at AND NEW.acceptance_nonce IS OLD.acceptance_nonce AND NEW.acceptance_authority_tag IS OLD.acceptance_authority_tag
+    AND NEW.current_resume_claim_generation=OLD.current_resume_claim_generation+1 AND NEW.current_resume_lease_owner IS NOT NULL AND NEW.current_resume_lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+    AND NEW.resume_call_started_at IS OLD.resume_call_started_at AND NEW.resume_observed_status IS OLD.resume_observed_status AND NEW.applied_at IS OLD.applied_at AND NEW.invalidation_reason IS OLD.invalidation_reason AND NEW.resolved_at IS OLD.resolved_at
+    AND NEW.updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+    AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=OLD.command_id AND c.run_id=OLD.run_id AND c.owner_resource_id=OLD.owner_resource_id
+      AND c.queue_state='resuming' AND c.blocker_id=OLD.suspension_id AND c.claim_generation=OLD.current_resume_claim_generation
+      AND c.lease_owner=OLD.current_resume_lease_owner AND c.lease_expires_at<=CAST(unixepoch('subsec')*1000 AS INTEGER) AND c.processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)))
+  OR (OLD.blocker_state='applying' AND NEW.blocker_state='applying'
+    AND NEW.accepted_input_generation IS OLD.accepted_input_generation AND NEW.accepted_input_hash IS OLD.accepted_input_hash AND NEW.accepted_at IS OLD.accepted_at AND NEW.resume_payload IS OLD.resume_payload
+    AND NEW.resume_claim_generation IS OLD.resume_claim_generation AND NEW.resume_lease_owner IS OLD.resume_lease_owner AND NEW.resume_lease_expires_at IS OLD.resume_lease_expires_at
+    AND NEW.resume_processing_deadline_at IS OLD.resume_processing_deadline_at AND NEW.acceptance_nonce IS OLD.acceptance_nonce AND NEW.acceptance_authority_tag IS OLD.acceptance_authority_tag
+    AND NEW.current_resume_claim_generation IS OLD.current_resume_claim_generation AND NEW.current_resume_lease_owner IS OLD.current_resume_lease_owner AND NEW.current_resume_lease_expires_at IS OLD.current_resume_lease_expires_at
+    AND NEW.resume_observed_status IS NULL AND NEW.applied_at IS NULL AND NEW.invalidation_reason IS NULL AND NEW.resolved_at IS NULL
+    AND ((OLD.resume_call_state='not_called' AND NEW.resume_call_state='calling' AND OLD.resume_call_started_at IS NULL AND NEW.resume_call_started_at=NEW.updated_at)
+      OR (OLD.resume_call_state IN ('calling','called') AND NEW.resume_call_state='resume_unknown' AND NEW.resume_call_started_at IS OLD.resume_call_started_at)
+      OR (OLD.resume_call_state='calling' AND NEW.resume_call_state='called' AND NEW.resume_call_started_at IS OLD.resume_call_started_at)))
+  OR (OLD.blocker_state='applying' AND NEW.blocker_state='applied' AND OLD.resume_call_state IN ('calling','called','resume_unknown') AND NEW.resume_call_state='called'
+    AND NEW.accepted_input_generation IS OLD.accepted_input_generation AND NEW.accepted_input_hash IS OLD.accepted_input_hash AND NEW.accepted_at IS OLD.accepted_at AND NEW.resume_payload IS OLD.resume_payload
+    AND NEW.resume_claim_generation IS OLD.resume_claim_generation AND NEW.resume_lease_owner IS OLD.resume_lease_owner AND NEW.resume_lease_expires_at IS OLD.resume_lease_expires_at
+    AND NEW.resume_processing_deadline_at IS OLD.resume_processing_deadline_at AND NEW.acceptance_nonce IS OLD.acceptance_nonce AND NEW.acceptance_authority_tag IS OLD.acceptance_authority_tag
+    AND NEW.current_resume_claim_generation IS OLD.current_resume_claim_generation AND NEW.current_resume_lease_owner IS OLD.current_resume_lease_owner AND NEW.current_resume_lease_expires_at IS OLD.current_resume_lease_expires_at
+    AND NEW.resume_call_started_at IS OLD.resume_call_started_at AND NEW.resume_observed_status IN ('running','waiting','success','failed')
+    AND NEW.applied_at=NEW.updated_at AND NEW.resolved_at=NEW.updated_at AND NEW.invalidation_reason IS NULL)
+),1)
+BEGIN SELECT RAISE(ABORT,'invalid suspension state transition constraint'); END;
+CREATE TRIGGER career_suspensions_v7_accept_projection
+AFTER UPDATE OF blocker_state ON career_suspensions
+WHEN OLD.blocker_state='pending' AND NEW.blocker_state='accepted'
+BEGIN
+  UPDATE career_commands SET queue_state='resuming',claim_generation=NEW.current_resume_claim_generation,
+    lease_owner=NEW.current_resume_lease_owner,lease_expires_at=NEW.current_resume_lease_expires_at,heartbeat_at=NEW.accepted_at,
+    processing_deadline_at=NEW.resume_processing_deadline_at,suspension_started_at=NULL,updated_at=NEW.accepted_at
+  WHERE command_id=NEW.command_id AND run_id=NEW.run_id AND owner_resource_id=NEW.owner_resource_id
+    AND queue_state='suspended' AND blocker_id=NEW.suspension_id AND suspension_generation=NEW.generation
+    AND claim_generation+1=NEW.current_resume_claim_generation;
+  SELECT CASE WHEN changes()<>1 THEN RAISE(ABORT,'accepted blocker projection lost') END;
+END;
+CREATE TRIGGER career_suspensions_v7_reclaim_projection
+AFTER UPDATE OF current_resume_claim_generation ON career_suspensions
+WHEN NEW.current_resume_claim_generation=OLD.current_resume_claim_generation+1
+BEGIN
+  UPDATE career_commands SET claim_generation=NEW.current_resume_claim_generation,lease_owner=NEW.current_resume_lease_owner,
+    lease_expires_at=NEW.current_resume_lease_expires_at,heartbeat_at=NEW.updated_at,updated_at=NEW.updated_at
+  WHERE command_id=NEW.command_id AND run_id=NEW.run_id AND owner_resource_id=NEW.owner_resource_id
+    AND queue_state='resuming' AND blocker_id=NEW.suspension_id AND suspension_generation=NEW.generation
+    AND claim_generation=OLD.current_resume_claim_generation AND lease_owner=OLD.current_resume_lease_owner
+    AND lease_expires_at<=CAST(unixepoch('subsec')*1000 AS INTEGER) AND processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER);
+  SELECT CASE WHEN changes()<>1 THEN RAISE(ABORT,'resume reclaim projection lost') END;
+END;
+CREATE TRIGGER career_suspensions_v7_applied_running_projection
+AFTER UPDATE OF blocker_state ON career_suspensions
+WHEN OLD.blocker_state='applying' AND NEW.blocker_state='applied' AND NEW.resume_observed_status IN ('running','waiting')
+BEGIN
+  UPDATE career_commands SET queue_state='running',blocker_id=NULL,updated_at=NEW.updated_at
+  WHERE command_id=NEW.command_id AND run_id=NEW.run_id AND owner_resource_id=NEW.owner_resource_id
+    AND queue_state='resuming' AND blocker_id=NEW.suspension_id AND suspension_generation=NEW.generation
+    AND claim_generation=NEW.current_resume_claim_generation AND lease_owner=NEW.current_resume_lease_owner
+    AND lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER) AND processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER);
+  SELECT CASE WHEN changes()<>1 THEN RAISE(ABORT,'applied running projection lost') END;
+END;
+CREATE TRIGGER career_commands_v7_invalidation_authority
+BEFORE UPDATE OF queue_state ON career_commands
+WHEN OLD.queue_state='suspended' AND NEW.queue_state='failed'
+  AND NOT EXISTS (SELECT 1 FROM career_suspensions s WHERE s.suspension_id=OLD.blocker_id AND s.command_id=OLD.command_id
+    AND s.run_id=OLD.run_id AND s.owner_resource_id=OLD.owner_resource_id AND s.generation=OLD.suspension_generation
+    AND s.blocker_state='invalidated' AND s.invalidation_reason='linked_attempt_required')
+BEGIN SELECT RAISE(ABORT,'linked attempt failure requires invalidated blocker'); END;
+CREATE TRIGGER career_suspensions_v7_invalidation_projection
+AFTER UPDATE OF blocker_state ON career_suspensions
+WHEN OLD.blocker_state='pending' AND NEW.blocker_state='invalidated'
+BEGIN
+  UPDATE career_commands SET queue_state='failed',blocker_id=NULL,processing_deadline_at=NEW.updated_at,suspension_started_at=NULL,
+    lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,terminal_generation=terminal_generation+1,
+    error_class='evidence',error_code='linked_attempt_required',last_safe_error='Bound evidence changed; an owner-authorized linked attempt is required.',
+    completed_at=NEW.updated_at,resolved_at=NEW.updated_at,updated_at=NEW.updated_at
+  WHERE command_id=NEW.command_id AND run_id=NEW.run_id AND owner_resource_id=NEW.owner_resource_id
+    AND queue_state='suspended' AND blocker_id=NEW.suspension_id AND suspension_generation=NEW.generation;
+  SELECT CASE WHEN changes()<>1 THEN RAISE(ABORT,'invalidation projection lost') END;
+END;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: 'legacy_idempotency_compatibility', sql: legacyCompatibilitySql, checksum: '606b96f6bea28639b2f8699634873cfeb02a1f6ef549bc0b676e2f6c7a8cbd28' }),
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
@@ -943,6 +1167,7 @@ export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 4, name: 'normalized_authorized_intake', sql: normalizedIntakeSql, checksum: 'f4a09f69f4cd9c6c777d5d2a1264a70ca6ad55d1df5a4cd155722681e3b7851b' }),
   Object.freeze({ version: 5, name: 'durable_retry_policy', sql: retryPolicySql, checksum: '025bad062c801c0d130eeeb481355ce662e8a6917d38961856d27689a21ccb38' }),
   Object.freeze({ version: 6, name: 'first_start_dispatch_journal', sql: firstStartDispatchJournalSql, checksum: '1987c52f737eae28f1c87f0e74df062f94a6fb08b961df3d24e404153df2389e' }),
+  Object.freeze({ version: 7, name: 'generation_bound_suspension_resume', sql: generationBoundSuspensionSql, checksum: 'ad1b40ce226beed2096c6d62b72233d079fea4ae6e53275d5c7659ca8c0515fa' }),
 ]);
 
 const LEDGER_SQL = `
@@ -1032,6 +1257,7 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
     if (version >= 4) expected.exec(normalizedIntakeSql);
     if (version >= 5) expected.exec(retryPolicySql);
     if (version >= 6) expected.exec(firstStartDispatchJournalSql);
+    if (version >= 7) expected.exec(generationBoundSuspensionSql);
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -1254,6 +1480,51 @@ export type RetryScheduleInput = {
 export type RetryScheduleResult =
   | { applied: true; duplicate: boolean; automaticRepeatsUsed: number; stageRepeatsUsed: number }
   | { applied: false; reason: 'invalid' | 'lease_lost' | 'deadline_expired' | 'budget_exhausted' | 'stage_cap_exhausted' | 'non_retryable' };
+
+export type SuspensionKind = 'needs_browser_session' | 'reauth_required' | 'manual_intervention_required' | 'browser_intervention_required' | 'clarification_required';
+export type SuspensionHashes = { sourceHash: string; profileHash: string; evidenceHash: string; promptHash: string; schemaHash: string };
+export type SuspensionIssueInput = SuspensionHashes & {
+  suspensionId: string; suspendedStep: string; blockerKind: SuspensionKind; promptVersion: number; resumeSchemaVersion: 1;
+  allowedResponse: { kind: 'confirmation'; choices: string[] } | { kind: 'text'; minimumLength: number; maximumLength: number };
+  safeMessage: string;
+};
+export function buildSuspensionToken(fence: Pick<WorkerFence, 'commandId' | 'runId' | 'ownerResourceId'>, input: SuspensionIssueInput, suspensionGeneration: number): SuspensionTokenV1 {
+  return SuspensionTokenV1Schema.parse({ schemaVersion: 1, suspensionId: input.suspensionId, suspensionGeneration,
+    commandId: fence.commandId, runId: fence.runId, resourceId: fence.ownerResourceId, suspendedStep: input.suspendedStep,
+    blockerKind: input.blockerKind, resumeSchemaVersion: input.resumeSchemaVersion, evidenceHash: input.evidenceHash,
+    sourceHash: input.sourceHash, profileHash: input.profileHash, promptVersion: input.promptVersion, promptHash: input.promptHash,
+    resumeSchemaHash: input.schemaHash });
+}
+
+type ResumeAcceptanceAuthority = {
+  tokenBytes: string; responseBytes: string; responseHash: string; nextClaimGeneration: number; leaseOwner: string;
+  leaseExpiresAt: number; processingDeadlineAt: number; nonce: string; acceptedAt: number;
+};
+function resumeAcceptanceTag(secret: string, authority: ResumeAcceptanceAuthority): string {
+  if (Buffer.byteLength(secret,'utf8') < 32) throw new Error('Resume acceptance hash key must contain at least 32 bytes.');
+  const canonical = JSON.stringify(['career-resume-accept-v1',authority.tokenBytes,authority.responseBytes,authority.responseHash,
+    authority.nextClaimGeneration,authority.leaseOwner,authority.leaseExpiresAt,authority.processingDeadlineAt,authority.nonce,authority.acceptedAt]);
+  return `sha256:${createHmac('sha256',secret).update(canonical).digest('hex')}`;
+}
+function safeTagEqual(left: string, right: string): boolean {
+  const a=Buffer.from(left),b=Buffer.from(right); return a.length===b.length && timingSafeEqual(a,b);
+}
+
+export type SuspensionAnswerInput = SuspensionHashes & {
+  commandId: string; runId: string; suspensionId: string; suspendedStep: string; blockerKind: SuspensionKind;
+  suspensionGeneration: number; resumeSchemaVersion: 1;
+  response: { schemaVersion: 1; kind: 'confirmation' | 'text'; value: string };
+};
+export type SuspensionAcceptanceResult =
+  | { outcome: 'accepted'; suspensionId: string; responseHash: string }
+  | { outcome: 'duplicate' }
+  | { outcome: 'linked_attempt_required'; reason: 'bound_inputs_changed' }
+  | { outcome: 'rejected'; reason: 'unauthorized' | 'correlation_mismatch' | 'stale_generation' | 'expired' | 'invalid_response' | 'duplicate_different' | 'not_suspended' };
+export type AcceptedResumeWorkItem = {
+  suspensionId: string; token: SuspensionTokenV1; responseBytes: string; responseHash: string;
+  blockerState: 'accepted' | 'applying' | 'applied'; callState: 'not_called' | 'calling' | 'called' | 'resume_unknown';
+  fence: WorkerFence;
+};
 
 export class CareerStore {
   private readonly database: DatabaseSync;
@@ -1486,7 +1757,7 @@ export class CareerStore {
         WHERE
           queue_state = 'queued'
           OR (queue_state = 'retry_wait' AND retry_due_at <= ? AND processing_deadline_at > ?)
-          OR (queue_state IN ('starting', 'running', 'resuming') AND lease_expires_at <= ? AND processing_deadline_at > ?)
+          OR ((queue_state IN ('starting', 'running') OR (queue_state='resuming' AND blocker_id IS NULL)) AND lease_expires_at <= ? AND processing_deadline_at > ?)
         ORDER BY queue_sequence
         LIMIT 1
       `).get(now, now, now, now) as { commandId: string; ownerResourceId: string; queueState: QueueStateV0; workflowAttempt: number; runId: string | null } | undefined;
@@ -1932,6 +2203,236 @@ export class CareerStore {
     return authorization.stageRecordId === null
       ? { authorized: false, reason: 'stage_guard_failed' }
       : { authorized: true, stageRecordId: authorization.stageRecordId };
+  }
+
+  issueSuspension(fence: WorkerFence, input: SuspensionIssueInput): { applied: true; suspensionGeneration: number; expiresAt: number } | { applied: false; reason: 'invalid' | 'lease_lost' } {
+    const idPattern = /^[A-Za-z0-9_.:@-]{1,200}$/;
+    const hashPattern = /^sha256:[a-f0-9]{64}$/;
+    const hashes = [input?.sourceHash, input?.profileHash, input?.evidenceHash, input?.promptHash, input?.schemaHash];
+    const allowed = input?.allowedResponse;
+    const allowedValid = allowed?.kind === 'confirmation'
+      ? allowed.choices.length >= 1 && allowed.choices.length <= 10 && allowed.choices.every((choice) => idPattern.test(choice))
+      : allowed?.kind === 'text' && Number.isSafeInteger(allowed.minimumLength) && Number.isSafeInteger(allowed.maximumLength)
+        && allowed.minimumLength >= 1 && allowed.maximumLength <= 4_000 && allowed.minimumLength <= allowed.maximumLength;
+    if (fence?.sourceState !== 'running' || ![fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner,
+      input?.suspensionId, input?.suspendedStep].every((value) => typeof value === 'string' && idPattern.test(value))
+      || !hashes.every((value) => hashPattern.test(value)) || !allowedValid
+      || !Number.isSafeInteger(input.promptVersion) || input.promptVersion < 1 || input.resumeSchemaVersion !== 1
+      || typeof input.safeMessage !== 'string' || input.safeMessage.length < 1 || input.safeMessage.length > 1_000
+      || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input.safeMessage)) return { applied: false, reason: 'invalid' };
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const command = this.database.prepare(`SELECT suspension_generation AS generation FROM career_commands
+        WHERE command_id=? AND run_id=? AND owner_resource_id=? AND lease_owner=? AND claim_generation=? AND queue_state='running'
+          AND lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+          AND processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)`).get(
+        fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration,
+      ) as { generation: number } | undefined;
+      if (!command) { this.database.exec('ROLLBACK'); return { applied: false, reason: 'lease_lost' }; }
+      const generation = Number(command.generation) + 1;
+      const safePayload = JSON.stringify(buildSuspensionToken(fence, input, generation));
+      const payloadHash = `sha256:${createHash('sha256').update(safePayload).digest('hex')}`;
+      this.database.prepare(`INSERT INTO career_suspensions (
+        suspension_id,command_id,run_id,suspended_step,blocker_kind,blocker_state,blocker_schema_version,generation,
+        safe_payload,payload_hash,source_hash,profile_hash,prompt_version,prompt_hash,resume_schema_version,resume_schema_hash,
+        allowed_response,issued_at,expires_at,created_at,updated_at,owner_resource_id,evidence_hash,issuance_claim_generation,issuance_lease_owner
+      ) VALUES (?,?,?,?,?,'pending',1,?,?,?,?,?,?,?,1,?, ?,
+        CAST(unixepoch('subsec')*1000 AS INTEGER),CAST(unixepoch('subsec')*1000 AS INTEGER)+604800000,
+        CAST(unixepoch('subsec')*1000 AS INTEGER),CAST(unixepoch('subsec')*1000 AS INTEGER),?,?,?,?)`).run(
+        input.suspensionId, fence.commandId, fence.runId, input.suspendedStep, input.blockerKind, generation,
+        safePayload, payloadHash, input.sourceHash, input.profileHash, input.promptVersion, input.promptHash, input.schemaHash,
+        JSON.stringify(input.allowedResponse), fence.ownerResourceId, input.evidenceHash, fence.claimGeneration, fence.leaseOwner,
+      );
+      const changed = this.database.prepare(`UPDATE career_commands SET queue_state='suspended', suspension_generation=?, blocker_id=?,
+        processing_budget_remaining_ms=processing_deadline_at-CAST(unixepoch('subsec')*1000 AS INTEGER), processing_deadline_at=NULL,
+        suspension_started_at=CAST(unixepoch('subsec')*1000 AS INTEGER), lease_owner=NULL,lease_expires_at=NULL,heartbeat_at=NULL,
+        updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+        WHERE command_id=? AND run_id=? AND owner_resource_id=? AND lease_owner=? AND claim_generation=? AND queue_state='running'
+          AND lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+          AND processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)`).run(
+        generation, input.suspensionId, fence.commandId, fence.runId, fence.ownerResourceId, fence.leaseOwner, fence.claimGeneration,
+      );
+      if (Number(changed.changes) !== 1) { this.database.exec('ROLLBACK'); return { applied: false, reason: 'lease_lost' }; }
+      const row = this.database.prepare('SELECT expires_at AS expiresAt FROM career_suspensions WHERE suspension_id=?').get(input.suspensionId) as { expiresAt: number };
+      this.database.exec('COMMIT');
+      return { applied: true, suspensionGeneration: generation, expiresAt: Number(row.expiresAt) };
+    } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
+
+  acceptSuspension(capability: OwnerAuthorizationCapability, input: SuspensionAnswerInput, leaseOwner: string, acceptanceHashKey: string): SuspensionAcceptanceResult {
+    try { assertCurrentlyValidPrincipalAuthorizationCapability(capability); } catch { return { outcome: 'rejected', reason: 'unauthorized' }; }
+    const hashPattern = /^sha256:[a-f0-9]{64}$/;
+    const idPattern = /^[A-Za-z0-9_.:@-]{1,200}$/;
+    if (!input || ![input.commandId,input.runId,input.suspensionId,input.suspendedStep,leaseOwner].every((value) => typeof value === 'string' && idPattern.test(value))
+      || ![input.sourceHash,input.profileHash,input.evidenceHash,input.promptHash,input.schemaHash].every((value) => hashPattern.test(value))
+      || input.resumeSchemaVersion !== 1 || input.response?.schemaVersion !== 1 || !['confirmation','text'].includes(input.response?.kind)
+      || typeof input.response?.value !== 'string') return { outcome: 'rejected', reason: 'invalid_response' };
+    const response = { ...input.response, value: input.response.value.trim() };
+    if (!response.value || response.value.length > 4_000 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(response.value)) return { outcome: 'rejected', reason: 'invalid_response' };
+    const serialized = JSON.stringify(response);
+    if (Buffer.byteLength(serialized) > 8_192) return { outcome: 'rejected', reason: 'invalid_response' };
+    const responseHash = `sha256:${createHash('sha256').update(serialized).digest('hex')}`;
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.database.prepare(`SELECT s.command_id AS commandId,s.run_id AS runId,s.suspended_step AS suspendedStep,
+        s.blocker_kind AS blockerKind,s.generation,s.blocker_state AS state,s.accepted_input_hash AS acceptedHash,
+        s.owner_resource_id AS ownerResourceId,s.source_hash AS sourceHash,s.profile_hash AS profileHash,s.evidence_hash AS evidenceHash,
+        s.prompt_hash AS promptHash,s.resume_schema_hash AS schemaHash,s.resume_schema_version AS schemaVersion,s.allowed_response AS allowedResponse,
+        s.expires_at AS expiresAt,c.queue_state AS queueState,c.suspension_generation AS currentGeneration,c.blocker_id AS blockerId,
+        c.processing_budget_remaining_ms AS remaining
+        FROM career_suspensions s JOIN career_commands c ON c.command_id=s.command_id AND c.run_id=s.run_id
+        WHERE s.suspension_id=?`).get(input.suspensionId) as any;
+      if (!row || row.commandId !== input.commandId || row.runId !== input.runId || row.suspendedStep !== input.suspendedStep
+        || row.blockerKind !== input.blockerKind || row.ownerResourceId !== capability.resourceId) {
+        this.database.exec('ROLLBACK'); return { outcome: 'rejected', reason: 'correlation_mismatch' };
+      }
+      if (row.generation !== input.suspensionGeneration || row.currentGeneration !== input.suspensionGeneration || row.blockerId !== input.suspensionId) {
+        this.database.exec('ROLLBACK'); return { outcome: 'rejected', reason: 'stale_generation' };
+      }
+      if (['accepted','applying','applied'].includes(row.state)) {
+        this.database.exec('COMMIT');
+        return row.acceptedHash === responseHash ? { outcome: 'duplicate' } : { outcome: 'rejected', reason: 'duplicate_different' };
+      }
+      if (row.queueState !== 'suspended' || row.state !== 'pending') { this.database.exec('ROLLBACK'); return { outcome: 'rejected', reason: 'not_suspended' }; }
+      const now = this.databaseNow();
+      if (row.expiresAt <= now) { this.database.exec('ROLLBACK'); return { outcome: 'rejected', reason: 'expired' }; }
+      if (row.sourceHash !== input.sourceHash || row.profileHash !== input.profileHash || row.evidenceHash !== input.evidenceHash
+        || row.promptHash !== input.promptHash || row.schemaHash !== input.schemaHash || row.schemaVersion !== input.resumeSchemaVersion) {
+        this.database.prepare(`UPDATE career_suspensions SET blocker_state='invalidated',invalidation_reason='linked_attempt_required',
+          resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER),updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+          WHERE suspension_id=? AND blocker_state='pending'`).run(input.suspensionId);
+        this.database.exec('COMMIT'); return { outcome: 'linked_attempt_required', reason: 'bound_inputs_changed' };
+      }
+      const allowed = JSON.parse(row.allowedResponse);
+      const valid = response.kind === allowed.kind && (allowed.kind === 'confirmation'
+        ? Array.isArray(allowed.choices) && allowed.choices.includes(response.value)
+        : Number.isSafeInteger(allowed.minimumLength) && Number.isSafeInteger(allowed.maximumLength)
+          && response.value.length >= allowed.minimumLength && response.value.length <= allowed.maximumLength);
+      if (!valid) { this.database.exec('ROLLBACK'); return { outcome: 'rejected', reason: 'invalid_response' }; }
+      const nextGeneration = Number((this.database.prepare('SELECT claim_generation AS generation FROM career_commands WHERE command_id=?').get(input.commandId) as { generation: number }).generation) + 1;
+      const acceptedAt = this.databaseNow();
+      const leaseExpiresAt = acceptedAt + this.leaseMs;
+      const processingDeadlineAt = acceptedAt + Number(row.remaining);
+      const nonce = randomUUID();
+      const tokenBytes = String((this.database.prepare('SELECT safe_payload payload FROM career_suspensions WHERE suspension_id=?').get(input.suspensionId) as { payload:string }).payload);
+      const authorityTag = resumeAcceptanceTag(acceptanceHashKey,{ tokenBytes,responseBytes:serialized,responseHash,nextClaimGeneration:nextGeneration,
+        leaseOwner,leaseExpiresAt,processingDeadlineAt,nonce,acceptedAt });
+      const accepted = this.database.prepare(`UPDATE career_suspensions SET blocker_state='accepted',accepted_input_generation=generation,
+        accepted_input_hash=?,accepted_at=?,resume_payload=?,resume_claim_generation=?,resume_lease_owner=?,resume_lease_expires_at=?,
+        resume_processing_deadline_at=?,acceptance_nonce=?,acceptance_authority_tag=?,current_resume_claim_generation=?,
+        current_resume_lease_owner=?,current_resume_lease_expires_at=?,updated_at=?
+        WHERE suspension_id=? AND blocker_state='pending' AND expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+        RETURNING accepted_input_hash AS responseHash`).get(responseHash,acceptedAt,serialized,nextGeneration,leaseOwner,leaseExpiresAt,
+          processingDeadlineAt,nonce,authorityTag,nextGeneration,leaseOwner,leaseExpiresAt,acceptedAt,input.suspensionId) as { responseHash: string } | undefined;
+      if (!accepted) throw new Error('Accepted suspension projection was lost.');
+      this.database.exec('COMMIT');
+      return { outcome: 'accepted', suspensionId: input.suspensionId, responseHash: accepted.responseHash };
+    } catch (error) { this.database.exec('ROLLBACK'); throw error; }
+  }
+
+  reclaimAcceptedResume(capability: OwnerAuthorizationCapability, suspensionId: string, leaseOwner: string): { reclaimed: boolean } {
+    assertCurrentlyValidPrincipalAuthorizationCapability(capability);
+    if (!/^[A-Za-z0-9_.:@-]{1,200}$/.test(leaseOwner)) throw new Error('Resume reclaim lease owner is invalid.');
+    const result = this.database.prepare(`UPDATE career_suspensions AS s SET
+      current_resume_claim_generation=current_resume_claim_generation+1,current_resume_lease_owner=?,
+      current_resume_lease_expires_at=CAST(unixepoch('subsec')*1000 AS INTEGER)+?,updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+      WHERE suspension_id=? AND owner_resource_id=? AND blocker_state IN ('accepted','applying')
+        AND current_resume_claim_generation IS NOT NULL AND current_resume_lease_owner IS NOT NULL
+        AND EXISTS (SELECT 1 FROM career_commands c WHERE c.command_id=s.command_id AND c.run_id=s.run_id
+          AND c.owner_resource_id=s.owner_resource_id AND c.queue_state='resuming' AND c.blocker_id=s.suspension_id
+          AND c.suspension_generation=s.generation AND c.claim_generation=s.current_resume_claim_generation
+          AND c.lease_owner=s.current_resume_lease_owner AND c.lease_expires_at<=CAST(unixepoch('subsec')*1000 AS INTEGER)
+          AND c.processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER))`).run(leaseOwner,this.leaseMs,suspensionId,capability.resourceId);
+    return { reclaimed:Number(result.changes)===1 };
+  }
+
+  getSuspensionStatus(capability: OwnerAuthorizationCapability, suspensionId: string): { state: string; resumeCallState: string; acceptedInputHash: string | null; issuedAt: number; expiresAt: number } | undefined {
+    assertCurrentlyValidPrincipalAuthorizationCapability(capability);
+    return this.database.prepare(`SELECT blocker_state AS state,resume_call_state AS resumeCallState,
+      accepted_input_hash AS acceptedInputHash,issued_at AS issuedAt,expires_at AS expiresAt
+      FROM career_suspensions WHERE suspension_id=? AND owner_resource_id=?`).get(suspensionId, capability.resourceId) as any;
+  }
+
+  loadAcceptedResume(capability: OwnerAuthorizationCapability, suspensionId: string, acceptanceHashKey: string): AcceptedResumeWorkItem | undefined {
+    assertCurrentlyValidPrincipalAuthorizationCapability(capability);
+    const row = this.database.prepare(`SELECT s.*,c.queue_state AS command_queue_state,c.blocker_id AS command_blocker_id,
+      c.suspension_generation AS command_suspension_generation,c.claim_generation AS command_claim_generation,
+      c.lease_owner AS command_lease_owner,c.lease_expires_at AS command_lease_expires_at
+      FROM career_suspensions s JOIN career_commands c ON c.command_id=s.command_id AND c.run_id=s.run_id
+      WHERE s.suspension_id=? AND s.owner_resource_id=? AND s.blocker_state IN ('accepted','applying','applied')`).get(
+      suspensionId, capability.resourceId,
+    ) as Record<string, any> | undefined;
+    if (!row || !row.resume_payload || !row.accepted_input_hash || !row.acceptance_authority_tag || !row.acceptance_nonce) return undefined;
+    const token = SuspensionTokenV1Schema.parse(JSON.parse(row.safe_payload));
+    const canonicalToken = JSON.stringify(token);
+    const responseHash = `sha256:${createHash('sha256').update(row.resume_payload).digest('hex')}`;
+    const expectedAuthorityTag = resumeAcceptanceTag(acceptanceHashKey,{ tokenBytes:row.safe_payload,responseBytes:row.resume_payload,responseHash,
+      nextClaimGeneration:row.resume_claim_generation,leaseOwner:row.resume_lease_owner,leaseExpiresAt:row.resume_lease_expires_at,
+      processingDeadlineAt:row.resume_processing_deadline_at,nonce:row.acceptance_nonce,acceptedAt:row.accepted_at });
+    if (!safeTagEqual(expectedAuthorityTag,row.acceptance_authority_tag)
+      || canonicalToken !== row.safe_payload || `sha256:${createHash('sha256').update(row.safe_payload).digest('hex')}` !== row.payload_hash
+      || responseHash !== row.accepted_input_hash || token.suspensionId !== row.suspension_id || token.suspensionGeneration !== row.generation
+      || token.commandId !== row.command_id || token.runId !== row.run_id || token.resourceId !== row.owner_resource_id
+      || token.suspendedStep !== row.suspended_step || token.blockerKind !== row.blocker_kind
+      || token.resumeSchemaVersion !== row.resume_schema_version || token.evidenceHash !== row.evidence_hash
+      || token.sourceHash !== row.source_hash || token.profileHash !== row.profile_hash || token.promptVersion !== row.prompt_version
+      || token.promptHash !== row.prompt_hash || token.resumeSchemaHash !== row.resume_schema_hash
+      || row.command_suspension_generation !== row.generation || row.command_claim_generation !== row.current_resume_claim_generation
+      || row.command_lease_owner !== row.current_resume_lease_owner || !['resuming','running'].includes(row.command_queue_state)
+      || (row.command_queue_state === 'resuming' && row.command_blocker_id !== row.suspension_id)) throw new Error('Durable accepted resume authority is inconsistent.');
+    return { suspensionId: row.suspension_id, token, responseBytes: row.resume_payload, responseHash,
+      blockerState: row.blocker_state, callState: row.resume_call_state,
+      fence: { commandId: row.command_id, runId: row.run_id, ownerResourceId: row.owner_resource_id,
+        leaseOwner: row.current_resume_lease_owner, claimGeneration: row.current_resume_claim_generation, sourceState: 'resuming' } };
+  }
+
+  private updateResumeState(fence: WorkerFence, suspensionId: string, set: string, predicate: string): WorkerWriteResult {
+    const row = this.database.prepare(`UPDATE career_suspensions AS s SET ${set},updated_at=CAST(unixepoch('subsec')*1000 AS INTEGER)
+      WHERE suspension_id=? AND (${predicate}) AND s.command_id=? AND s.run_id=? AND s.owner_resource_id=?
+        AND s.current_resume_claim_generation=? AND s.current_resume_lease_owner=? AND EXISTS (SELECT 1 FROM career_commands c
+          WHERE c.command_id=s.command_id AND c.run_id=s.run_id AND c.owner_resource_id=s.owner_resource_id
+            AND c.queue_state='resuming' AND c.blocker_id=s.suspension_id AND c.claim_generation=? AND c.lease_owner=?
+            AND c.lease_expires_at>CAST(unixepoch('subsec')*1000 AS INTEGER)
+            AND c.processing_deadline_at>CAST(unixepoch('subsec')*1000 AS INTEGER)) RETURNING updated_at AS updatedAt`).get(
+      suspensionId,fence.commandId,fence.runId,fence.ownerResourceId,fence.claimGeneration,fence.leaseOwner,fence.claimGeneration,fence.leaseOwner,
+    ) as { updatedAt: number } | undefined;
+    return row ? { applied: true,updatedAt:Number(row.updatedAt) } : { applied: false,reason:'lease_lost' };
+  }
+
+  markResumeApplying(fence: WorkerFence, suspensionId: string): WorkerWriteResult {
+    if (fence.sourceState !== 'resuming') return { applied:false,reason:'lease_lost' };
+    return this.updateResumeState(fence,suspensionId,"blocker_state='applying'","blocker_state='accepted' AND resume_call_state='not_called'");
+  }
+
+  markResumeCallStarted(fence: WorkerFence, suspensionId: string): WorkerWriteResult {
+    if (fence.sourceState !== 'resuming') return { applied:false,reason:'lease_lost' };
+    return this.updateResumeState(fence,suspensionId,"resume_call_state='calling',resume_call_started_at=CAST(unixepoch('subsec')*1000 AS INTEGER)","blocker_state='applying' AND resume_call_state='not_called'");
+  }
+
+  markResumeCallReturned(fence: WorkerFence, suspensionId: string): WorkerWriteResult {
+    return this.updateResumeState(fence,suspensionId,"resume_call_state='called'","blocker_state='applying' AND resume_call_state='calling'");
+  }
+
+  markResumeUnknown(fence: WorkerFence, suspensionId: string): WorkerWriteResult {
+    return this.updateResumeState(fence,suspensionId,"resume_call_state='resume_unknown'","blocker_state='applying' AND resume_call_state IN ('calling','called')");
+  }
+
+  reconcileResume(fence: WorkerFence, suspensionId: string, snapshotStatus: 'suspended' | 'running' | 'waiting' | 'success' | 'failed'): { outcome: 'ready' | 'resume_unknown' | 'applied' | 'lost' } {
+    const blocker = this.database.prepare(`SELECT blocker_state AS state,resume_call_state AS resumeCallState
+      FROM career_suspensions WHERE suspension_id=?`).get(suspensionId) as { state: string; resumeCallState: string } | undefined;
+    if (!blocker || !['applying','applied'].includes(blocker.state)) return { outcome:'lost' };
+    if (blocker.state === 'applied') return { outcome:'applied' };
+    if (snapshotStatus === 'suspended') {
+      if (blocker.resumeCallState === 'not_called') return { outcome:'ready' };
+      if (blocker.resumeCallState === 'calling') {
+        const result = this.updateResumeState(fence,suspensionId,"resume_call_state='resume_unknown'","blocker_state='applying' AND resume_call_state='calling'");
+        return { outcome: result.applied ? 'resume_unknown' : 'lost' };
+      }
+      return { outcome:'resume_unknown' };
+    }
+    if (blocker.resumeCallState === 'calling') this.markResumeCallReturned(fence,suspensionId);
+    const applied = this.updateResumeState(fence,suspensionId,`blocker_state='applied',resume_call_state='called',resume_observed_status='${snapshotStatus}',applied_at=CAST(unixepoch('subsec')*1000 AS INTEGER),resolved_at=CAST(unixepoch('subsec')*1000 AS INTEGER)`,`blocker_state='applying' AND resume_call_state IN ('called','resume_unknown')`);
+    return applied.applied ? { outcome:'applied' } : { outcome:'lost' };
   }
 
   expireProcessingDeadlines(): { transitioned: number } {
