@@ -258,3 +258,225 @@ test('duplicates record a sighting without replacing the original request', asyn
   store.close();
   fs.rmSync(dir, { recursive: true });
 });
+
+test('rejects unsafe transport correlation IDs before persistence', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-correlation-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const base = {
+    channel: 'telegram' as const, payloadHash: `sha256:${'1'.repeat(64)}`, ownerResourceId: 'owner',
+    threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4,
+    intentKind: 'parked_job' as const, requestId: 'telegram:1',
+  };
+  for (const transportEventId of ['', 'x'.repeat(257), 'bad\nevent', 'bad\u0000event']) {
+    assert.throws(() => store.recordInboundAndEnqueue({ ...base, transportEventId }), /transport event ID/i);
+  }
+  store.close();
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  assert.equal(database.prepare('SELECT count(*) count FROM career_inbound_events').get()!.count, 0);
+  assert.equal(database.prepare('SELECT count(*) count FROM career_commands').get()!.count, 0);
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('validates the complete discriminated atomic intake before persistence', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-shape-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const parked = {
+    channel: 'telegram' as const, transportEventId: '1', payloadHash: `sha256:${'1'.repeat(64)}`,
+    ownerResourceId: 'owner', threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4,
+    intentKind: 'parked_job' as const, requestId: 'telegram:1',
+  };
+  const save = {
+    ...parked, intentKind: 'save_job' as const, canonicalUrl: 'https://example.com/jobs/1',
+    canonicalJobKey: 'url:https://example.com/jobs/1', commandId: 'command-1', attemptId: 'attempt-1',
+  };
+  const invalid = [
+    { ...parked, channel: 'email' },
+    { ...parked, intentKind: 'unknown' },
+    { ...parked, canonicalUrl: save.canonicalUrl },
+    { ...parked, canonicalUrl: undefined },
+    { ...save, canonicalUrl: undefined },
+    { ...save, canonicalJobKey: 'url:https://example.com/jobs/other' },
+    { ...save, canonicalUrl: 'http://example.com/jobs/1', canonicalJobKey: 'url:http://example.com/jobs/1' },
+    { ...save, canonicalUrl: 'https://user:pass@example.com/jobs/1', canonicalJobKey: 'url:https://user:pass@example.com/jobs/1' },
+    { ...save, canonicalUrl: 'https://example.com:8443/jobs/1', canonicalJobKey: 'url:https://example.com:8443/jobs/1' },
+    { ...save, canonicalUrl: 'https://example.com/jobs/1#fragment', canonicalJobKey: 'url:https://example.com/jobs/1#fragment' },
+    { ...save, canonicalUrl: 'HTTPS://EXAMPLE.COM/jobs/1', canonicalJobKey: 'url:HTTPS://EXAMPLE.COM/jobs/1' },
+    { ...save, commandId: 'bad\ncommand' },
+    { ...save, attemptId: 'x'.repeat(257) },
+    { ...save, authorizationRevision: -1 },
+    Object.fromEntries(Object.entries(save).filter(([key]) => key !== 'authorizationRevision')),
+  ];
+  for (const input of invalid) assert.throws(() => store.recordInboundAndEnqueue(input as never));
+  store.close();
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  assert.equal(database.prepare('SELECT count(*) count FROM career_inbound_events').get()!.count, 0);
+  assert.equal(database.prepare('SELECT count(*) count FROM career_commands').get()!.count, 0);
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('parked intake returns its stored issuance authorization for new and duplicate results', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-parked-authorization-'));
+  const store = new CareerStore(`file:${path.join(dir, 'state.db')}`);
+  const input = {
+    channel: 'telegram' as const, transportEventId: 'parked', payloadHash: `sha256:${'2'.repeat(64)}`,
+    ownerResourceId: 'owner', threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4,
+    intentKind: 'parked_job' as const, requestId: 'telegram:parked',
+  };
+  const first = store.recordInboundAndEnqueue(input);
+  assert.deepEqual(first, {
+    intentKind: 'parked_job', duplicate: false,
+    issuanceAuthorization: { channel: 'telegram', ownerResourceId: 'owner', threadId: 'telegram:2', destination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4 },
+  });
+  assert.deepEqual(store.recordInboundAndEnqueue(input), { ...first, duplicate: true });
+  store.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('v4 normalized SQL rejects NULL bypasses and preserves legacy compatibility', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-null-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`); store.close();
+  const database = new DatabaseSync(databasePath);
+  const columns = `event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, rejection_reason, created_at,
+    intent_kind, canonical_url, thread_id, origin_destination, principal_key, authorization_revision`;
+  const insert = database.prepare(`INSERT INTO career_inbound_events (${columns}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+  const required = ['owner', 'telegram:2', '2', 'telegram:1:2', 4] as const;
+  for (let index = 0; index < required.length; index += 1) {
+    const values = [...required]; values[index] = null as never;
+    assert.throws(() => insert.run(`event-${index}`, 'telegram', String(index), `sha256:${'1'.repeat(64)}`, values[0], 'accepted', null, 1,
+      'parked_job', null, values[1], values[2], values[3], values[4]), /invalid normalized inbound event/i);
+  }
+  for (const [eventId, channel, transportId] of [
+    ['telegram:wrong', 'Telegram', 'wrong'],
+    ['forged-event-id', 'telegram', 'right'],
+  ]) {
+    assert.throws(() => insert.run(eventId, channel, transportId, `sha256:${'1'.repeat(64)}`, ...required.slice(0, 1), 'accepted', null, 1,
+      'parked_job', null, ...required.slice(1)), /invalid normalized inbound event/i);
+  }
+  database.exec(`INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at)
+    VALUES ('legacy', 'telegram', 'legacy', 'sha256:${'2'.repeat(64)}', 'owner', 'accepted', 1)`);
+  assert.throws(() => database.exec("UPDATE career_inbound_events SET owner_resource_id = 'other' WHERE event_id = 'legacy'"), /immutable/i);
+  assert.equal((database.prepare("SELECT authorization_revision FROM career_inbound_events WHERE event_id = 'legacy'").get() as { authorization_revision: null }).authorization_revision, null);
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('v4 accepted saves require exact command correlations on insert and pending promotion', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-correlation-sql-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`); store.close();
+  const database = new DatabaseSync(databasePath);
+  database.exec('PRAGMA foreign_keys = ON');
+  const command = database.prepare(`INSERT INTO career_commands
+    (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id,
+     origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at, authorization_revision)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 1, 1, 1, ?)`);
+  const inbound = database.prepare(`INSERT INTO career_inbound_events
+    (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, rejection_reason, created_at,
+     intent_kind, canonical_url, thread_id, origin_destination, principal_key, authorization_revision, command_id, enqueue_position)
+    VALUES (?, ?, ?, 'sha256:${'4'.repeat(64)}', ?, ?, ?, 1, 'save_job', ?, ?, ?, 'telegram:1:2', ?, ?, ?)`);
+  const expected = {
+    canonicalUrl: 'https://example.com/jobs/1', canonicalJobKey: 'url:https://example.com/jobs/1', owner: 'owner',
+    thread: 'telegram:2', channel: 'telegram', destination: '2', revision: 4,
+  };
+  const mismatches = [
+    ['command_id', { commandId: 'missing-command' }],
+    ['owner_resource_id', { owner: 'other-owner' }],
+    ['thread_id', { thread: 'telegram:other' }],
+    ['origin_channel', { channel: 'api' }],
+    ['origin_destination', { destination: 'other-destination' }],
+    ['canonical_url', { canonicalUrl: 'https://example.com/jobs/other' }],
+    ['authorization_revision', { revision: 5 }],
+    ['request_id', { requestId: 'telegram:wrong' }],
+    ['canonical_job_key', { canonicalJobKey: 'url:https://example.com/jobs/forged' }],
+    ['enqueue_position', { enqueuePosition: 2 }],
+  ] as const;
+  for (const mode of ['direct', 'pending'] as const) {
+    for (const [field, override] of mismatches) {
+      database.exec('BEGIN');
+      const transportId = `${mode}-${field}`;
+      const eventId = `${expected.channel}:${transportId}`;
+      const values = { commandId: `command-${mode}-${field}`, requestId: eventId, enqueuePosition: 1, ...expected, ...override };
+      if (field !== 'command_id') command.run(values.commandId, `attempt-${mode}-${field}`, values.requestId, values.canonicalJobKey,
+        values.canonicalUrl, values.owner, values.thread, values.channel, values.destination, values.revision);
+      if (mode === 'direct') {
+        assert.throws(() => inbound.run(eventId, expected.channel, transportId, expected.owner, 'accepted', null,
+          expected.canonicalUrl, expected.thread, expected.destination, expected.revision, values.commandId, values.enqueuePosition),
+        /constraint|correlation|invalid normalized/i, `${field} direct insert`);
+      } else {
+        inbound.run(eventId, expected.channel, transportId, expected.owner, 'rejected', 'intake_pending',
+          expected.canonicalUrl, expected.thread, expected.destination, expected.revision, null, null);
+        assert.throws(() => database.prepare(`UPDATE career_inbound_events SET result = 'accepted', rejection_reason = NULL,
+          command_id = ?, enqueue_position = ? WHERE event_id = ?`).run(values.commandId, values.enqueuePosition, eventId),
+        /constraint|correlation|immutable/i, `${field} pending promotion`);
+      }
+      database.exec('ROLLBACK');
+    }
+  }
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('actual store writes satisfy v4 request, canonical-key, and enqueue-position provenance', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-correlation-store-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const result = store.recordInboundAndEnqueue({
+    channel: 'telegram', transportEventId: 'actual', payloadHash: `sha256:${'5'.repeat(64)}`,
+    ownerResourceId: 'owner', threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4,
+    intentKind: 'save_job', canonicalUrl: 'https://example.com/jobs/1', canonicalJobKey: 'url:https://example.com/jobs/1',
+    commandId: 'actual-command', attemptId: 'actual-attempt', requestId: 'telegram:actual',
+  });
+  assert.equal(result.queuePosition, 1);
+  store.close();
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  assert.deepEqual({ ...database.prepare(`SELECT e.event_id eventId, e.channel, e.transport_event_id transportEventId,
+    c.request_id requestId, c.canonical_job_key canonicalJobKey, e.enqueue_position enqueuePosition
+    FROM career_commands c JOIN career_inbound_events e ON e.command_id = c.command_id`).get() },
+  { eventId: 'telegram:actual', channel: 'telegram', transportEventId: 'actual', requestId: 'telegram:actual',
+    canonicalJobKey: 'url:https://example.com/jobs/1', enqueuePosition: 1 });
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('normalized commands persist immutable issuance revision while hash-identical replay returns the original receipt', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-revision-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const input = {
+    channel: 'telegram' as const, transportEventId: '1', payloadHash: `sha256:${'3'.repeat(64)}`,
+    ownerResourceId: 'owner', threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 7,
+    intentKind: 'save_job' as const, canonicalUrl: 'https://linkedin.com/jobs/1', canonicalJobKey: 'url:https://linkedin.com/jobs/1',
+    commandId: 'command-revision', attemptId: 'attempt-revision', requestId: 'telegram:1',
+  };
+  const first = store.recordInboundAndEnqueue(input);
+  assert.deepEqual(first.issuanceAuthorization, {
+    channel: 'telegram', ownerResourceId: 'owner', threadId: 'telegram:2', destination: '2',
+    principalKey: 'telegram:1:2', authorizationRevision: 7,
+  });
+  assert.deepEqual(store.recordInboundAndEnqueue({ ...input, authorizationRevision: 8 }), { ...first, duplicate: true });
+  store.close();
+  const database = new DatabaseSync(databasePath);
+  assert.equal((database.prepare("SELECT authorization_revision FROM career_commands WHERE command_id = 'command-revision'").get() as { authorization_revision: number }).authorization_revision, 7);
+  assert.equal((database.prepare("SELECT authorization_revision FROM career_inbound_events WHERE event_id = 'telegram:1'").get() as { authorization_revision: number }).authorization_revision, 7);
+  assert.throws(() => database.exec("UPDATE career_commands SET authorization_revision = 8 WHERE command_id = 'command-revision'"), /immutable/i);
+  database.close(); fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('atomic inbound dedupe and enqueue rolls back both records on command failure', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-intake-atomic-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const base = {
+    channel: 'telegram', transportEventId: '1', payloadHash: `sha256:${'1'.repeat(64)}`,
+    ownerResourceId: 'owner', threadId: 'telegram:2', originDestination: '2', principalKey: 'telegram:1:2', authorizationRevision: 4,
+    intentKind: 'save_job' as const, canonicalUrl: 'https://linkedin.com/jobs/1', canonicalJobKey: 'url:https://linkedin.com/jobs/1',
+    commandId: 'command-1', attemptId: 'attempt-1', requestId: 'telegram:1',
+  };
+  store.recordInboundAndEnqueue(base);
+  assert.throws(() => store.recordInboundAndEnqueue({ ...base, transportEventId: '2', commandId: 'command-1', attemptId: 'attempt-2', requestId: 'telegram:2' }));
+  store.close();
+  const database = new DatabaseSync(databasePath, { readOnly: true });
+  assert.equal(database.prepare('SELECT count(*) count FROM career_inbound_events').get()!.count, 1);
+  assert.equal(database.prepare('SELECT count(*) count FROM career_commands').get()!.count, 1);
+  database.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -2,7 +2,7 @@
 
 Career Copilot is a personal job-search assistant built with Mastra. It helps turn a job-search workflow into a repeatable, reviewable process: find relevant roles, prepare application materials, and keep work inside an approval-controlled local workspace.
 
-> **Status:** active V0 implementation. Direct Telegram job review, Google Sheets tracking, local OAuth bootstrap, durable idempotency, guarded local profile/report/topic boundaries, and automated boundary tests are in place. Browser-assisted discovery and application submission remain later V0 slices.
+> **Status:** active V0 implementation. Authorized Telegram `/save` intake and durable enqueueing, Google Sheets setup, local OAuth bootstrap, durable idempotency, guarded local profile/report/topic boundaries, and automated boundary tests are in place. Job processing, delivery, browser-assisted discovery, and application submission remain later V0 slices.
 
 ## What it does today
 
@@ -34,11 +34,13 @@ npm install
 cp .env.example .env
 ```
 
-Set the model values in `.env`:
+Set the model values and single-owner intake credentials in `.env`:
 
 ```dotenv
 OPENCODE_API_KEY=...
 GOOGLE_GENERATIVE_AI_API_KEY=...
+CAREER_COPILOT_OWNER_RESOURCE_ID=career-owner-v0
+CAREER_COPILOT_INTAKE_HASH_KEY=<secret value of at least 32 bytes>
 ```
 
 Use absolute, distinct local paths. The profile directory must contain only approved profile/resume sources:
@@ -86,7 +88,7 @@ CAREER_COPILOT_TOPICS_DIR=/absolute/path/to/career-copilot-topics
    npm run dev
    ```
 
-   Local Telegram polling starts automatically. Send `/job https://...` with a supported HTTPS job URL. The bot fetches the page, writes a local review artifact, records the topic and audit trail, updates the Sheet row to `reviewed`, and replies when complete.
+   Local Telegram polling starts automatically. Send `/save <supported HTTPS job URL>`. The authorized intake is durably enqueued before acknowledgement; it does not fetch, review, write files, update Sheets, or deliver results. Structurally valid rejected updates are deduplicated by a keyed normalized-envelope HMAC and retain only fixed safe correlation—never message text, URLs, or sender profiles. Those processing and delivery steps arrive in later V0 tasks. `/job` is parked and reserved.
 
 Open [http://localhost:4111](http://localhost:4111) for the local Mastra editor. Never expose it publicly without authentication.
 
@@ -128,8 +130,14 @@ Copy `.env.example` and keep secrets out of source control.
 | `OPENCODE_API_KEY` | OpenCode model provider authentication |
 | `GOOGLE_GENERATIVE_AI_API_KEY` | Google Search tool authentication |
 | `MASTRA_DATA_DIR` | Absolute directory for database and workspace state |
-| `MASTRA_DATABASE_URL` | Absolute `file:` URL, `libsql:` URL, or HTTPS database URL |
-| `TURSO_AUTH_TOKEN` | Authentication when using a remote Turso/libSQL database |
+| `MASTRA_DATABASE_URL` | One absolute local `file:` database URL; remote libSQL/Turso URLs are not supported |
+| `CAREER_COPILOT_OWNER_RESOURCE_ID` | Stable single-owner resource identifier |
+| `CAREER_COPILOT_INTAKE_HASH_KEY` | Secret intake HMAC key containing at least 32 bytes |
+| `CAREER_COPILOT_OWNER_ENABLED` | Owner authorization kill switch (`false` revokes access) |
+| `CAREER_COPILOT_AUTHORIZATION_REVISION` | Non-negative authorization revision used to revoke prior bindings |
+| `CAREER_COPILOT_STUDIO_ENABLED` | Enables loopback Studio owner intake |
+| `CAREER_COPILOT_STDIO_ENABLED` | Enables local STDIO owner intake |
+| `CAREER_COPILOT_API_IDENTITY` | Optional authenticated API identity; API intake is disabled when absent |
 
 The Telegram, Google Sheets/OAuth, and private-path variables in `.env.example` are required when the Mastra entrypoint starts. Keep `.env` local and gitignored; use a managed secret store or protected environment file for deployment.
 
@@ -177,13 +185,13 @@ The required tabs are configurable through `.env` and default to `Applications`,
 
 Local development uses Telegram polling automatically, so no public URL is needed. Production should use an HTTPS webhook with `TELEGRAM_WEBHOOK_SECRET_TOKEN`; keep the token, webhook secret, and allowlist values in deployment secrets. The verified local private chat is documented in the vault guide, not in this repository.
 
-`/start` is not a supported Career Copilot command yet. The V0 direct-review command is:
+`/start` is not a supported Career Copilot command yet. The current V0 intake command is:
 
 ```text
-/job <supported HTTPS job URL>
+/save <supported HTTPS job URL>
 ```
 
-Supported hosts currently include LinkedIn, Foundit, Cutshort, Naukri, and Indeed. The current flow reviews and tracks the job; it never submits an application.
+Supported hosts currently include LinkedIn, Foundit, Cutshort, Naukri, and Indeed. Authorization and durable enqueueing are implemented; processing and delivery arrive in later V0 tasks. `/job` is parked and reserved, and no intake submits an application.
 
 ## Safety boundaries
 

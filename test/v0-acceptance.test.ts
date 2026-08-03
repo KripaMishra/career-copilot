@@ -16,9 +16,12 @@ import { LibSQLStore } from '@mastra/libsql';
 import { Memory } from '@mastra/memory';
 import { z } from 'zod';
 
+import { OwnerAuthorization } from '../src/channels/telegram-auth.ts';
 import { resolveRuntimeConfig } from '../src/config/runtime.ts';
 import * as V0Contracts from '../src/contracts/v0.ts';
 import { CareerStore, MIGRATIONS } from '../src/storage/career-store.ts';
+import { CareerCopilotService } from '../src/services/career-copilot.ts';
+import { createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 
 const exactLegacySql = `
   CREATE TABLE career_requests (request_id TEXT PRIMARY KEY) STRICT;
@@ -185,7 +188,166 @@ test('enforces run provenance and suspension-envelope blocker linkage', () => {
   });
 });
 
+const task5Owner = {
+  resourceId: 'owner-v0', enabled: true, authorizationRevision: 1,
+  telegram: { userIds: new Set(['123', '124']), privateChatIds: new Set(['456']) },
+  studioEnabled: true, stdioEnabled: true,
+};
+const task5Update = (id: number, text = '/save https://linkedin.com/jobs/1', userId = 123) => ({
+  update_id: id,
+  message: { message_id: id + 1, date: 1, from: { id: userId, is_bot: false }, chat: { id: 456, type: 'private' }, text },
+});
+function withTask5(run: (fixture: { store: CareerStore; secondStore: CareerStore; service: CareerCopilotService; secondService: CareerCopilotService; databasePath: string }) => Promise<void> | void) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-task5-'));
+  const databasePath = path.join(dir, 'state.db');
+  const store = new CareerStore(`file:${databasePath}`);
+  const secondStore = new CareerStore(`file:${databasePath}`);
+  const service = (target: CareerStore) => new CareerCopilotService({ authorization: new OwnerAuthorization(() => task5Owner), store: target, intakeHashKey: 'k'.repeat(32) });
+  return Promise.resolve(run({ store, secondStore, service: service(store), secondService: service(secondStore), databasePath }))
+    .finally(() => { secondStore.close(); store.close(); fs.rmSync(dir, { recursive: true, force: true }); });
+}
+
 const rows: AcceptanceRow[] = [
+  {
+    id: 'P4-telegram-user-and-private-chat',
+    run: () => {
+      let current = task5Owner;
+      const auth = new OwnerAuthorization(() => current);
+      const binding = auth.authorize({ channel: 'telegram', userId: '123', chatId: '456', privateChat: true });
+      assert.equal(binding.threadId, 'telegram:456');
+      assert.throws(() => auth.authorize({ channel: 'telegram', userId: '124', chatId: '999', privateChat: true }), /unauthorized/i);
+      for (const boundary of ['delivery', 'effect'] as const) {
+        assert.deepEqual(auth.reauthorize(binding, boundary), binding);
+        assert.throws(() => auth.reauthorize({ ...binding, destination: '999' }, boundary), /revoked|unauthorized/i);
+      }
+      current = { ...task5Owner, telegram: { ...task5Owner.telegram, userIds: new Set(['124']) } };
+      for (const boundary of ['delivery', 'effect'] as const) assert.throws(() => auth.reauthorize(binding, boundary), /revoked|unauthorized/i);
+    },
+  },
+  {
+    id: 'P4-cross-principal-denied',
+    run: () => {
+      const auth = new OwnerAuthorization(() => task5Owner);
+      const stored = auth.authorize({ channel: 'telegram', userId: '123', chatId: '456', privateChat: true });
+      const studio = { channel: 'studio' as const, remoteAddress: '127.0.0.1', conversationId: '456' };
+      assert.equal(auth.authorize(studio).resourceId, stored.resourceId);
+      for (const boundary of ['enqueue', 'read', 'resume'] as const) assert.throws(() => auth.reauthorize(stored, boundary, studio), /unauthorized/i);
+    },
+  },
+  {
+    id: 'P4-studio-ui-loopback-owner',
+    run: () => {
+      const auth = new OwnerAuthorization(() => task5Owner);
+      const binding = auth.authorize({ channel: 'studio', remoteAddress: '::1', conversationId: 'one' });
+      assert.equal(binding.threadId, 'studio:one');
+      assert.throws(() => auth.authorize({ channel: 'studio', remoteAddress: '192.0.2.1', conversationId: 'one' }), /unauthorized/i);
+      for (const boundary of ['delivery', 'effect'] as const) {
+        for (const forged of [{ ...binding, destination: 'forged' }, { ...binding, threadId: 'forged' }, { ...binding, principalKey: 'forged' }]) {
+          assert.throws(() => auth.reauthorize(forged, boundary), /unauthorized|revoked/i);
+        }
+      }
+    },
+  },
+  {
+    id: 'P4-stdio-configured-local-owner',
+    run: () => {
+      const auth = new OwnerAuthorization(() => task5Owner);
+      const binding = auth.authorize({ channel: 'stdio' });
+      assert.equal(binding.resourceId, 'owner-v0');
+      for (const boundary of ['delivery', 'effect'] as const) {
+        for (const forged of [{ ...binding, destination: 'forged' }, { ...binding, threadId: 'forged' }, { ...binding, principalKey: 'forged' }]) {
+          assert.throws(() => auth.reauthorize(forged, boundary), /unauthorized|revoked/i);
+        }
+      }
+    },
+  },
+  {
+    id: 'P4-api-disabled-until-authenticated-binding',
+    run: () => {
+      assert.throws(() => new OwnerAuthorization(() => task5Owner).authorize({ channel: 'api', authenticatedIdentity: 'owner', conversationId: 'one' }), /disabled/i);
+      const auth = new OwnerAuthorization(() => ({ ...task5Owner, apiIdentity: 'api-owner' }));
+      const binding = auth.authorize({ channel: 'api', authenticatedIdentity: 'api-owner', conversationId: 'one' });
+      assert.equal(binding.principalKey, 'api:api-owner:one');
+      for (const boundary of ['delivery', 'effect'] as const) {
+        for (const forged of [{ ...binding, destination: 'forged' }, { ...binding, threadId: 'forged' }, { ...binding, principalKey: 'forged' }]) {
+          assert.throws(() => auth.reauthorize(forged, boundary), /unauthorized|revoked/i);
+        }
+        assert.throws(() => auth.reauthorize({ ...binding, channel: 'unknown' as 'api' }, boundary), /unauthorized|revoked/i);
+      }
+    },
+  },
+  {
+    id: 'P4-forged-resource-thread-ignored',
+    run: () => withTask5(async ({ service, databasePath }) => {
+      const result = await service.process({ ...task5Update(1), resourceId: 'attacker', threadId: 'attacker' });
+      assert.equal(result.outcome, 'enqueued');
+      const db = new DatabaseSync(databasePath, { readOnly: true });
+      assert.deepEqual({ ...db.prepare('SELECT owner_resource_id owner, thread_id thread FROM career_commands').get() }, { owner: 'owner-v0', thread: 'telegram:456' });
+      db.close();
+      for (const inaccessible of ['dependencies', 'hashKey', 'payloadHash', 'store', 'processTrustedTransport', 'processTransport']) {
+        assert.equal(inaccessible in service, false, `${inaccessible} must not be runtime-accessible`);
+      }
+    }),
+  },
+  {
+    id: 'P13-duplicate-transport-event-one-intent',
+    run: () => withTask5(async ({ service, secondService, store }) => {
+      const [first, second] = await Promise.all([service.process(task5Update(2)), secondService.process(task5Update(2))]);
+      assert.equal(first.outcome, 'enqueued'); assert.equal(second.outcome, 'enqueued');
+      if (first.outcome !== 'enqueued' || second.outcome !== 'enqueued') return;
+      assert.equal(first.commandId, second.commandId); assert.equal(store.getCommandCount(), 1);
+    }),
+  },
+  {
+    id: 'P13-enqueue-before-ack',
+    run: async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-ack-'));
+      const config = resolveRuntimeConfig({ dataDir: root, env: { CAREER_COPILOT_OWNER_RESOURCE_ID: 'owner-v0', CAREER_COPILOT_INTAKE_HASH_KEY: 'k'.repeat(32), TELEGRAM_ALLOWED_USER_IDS: '123', CAREER_COPILOT_PRIVATE_CHAT_IDS: '456', GOOGLE_SHEETS_SPREADSHEET_ID: 'sheet' } });
+      const runtime = createCareerCopilotRuntime(config);
+      try {
+        const observed: number[] = [];
+        await runtime.handleTelegramUpdate(task5Update(3), async () => { observed.push(runtime.store.getCommandCount()); });
+        assert.deepEqual(observed, [1]);
+        runtime.store.recordInboundAndEnqueue = () => { throw new Error('rollback'); };
+        let replied = false;
+        await assert.rejects(() => runtime.handleTelegramUpdate(task5Update(4), async () => { replied = true; }), /rollback/);
+        assert.equal(replied, false);
+      } finally { runtime.close(); fs.rmSync(root, { recursive: true, force: true }); }
+    },
+  },
+  {
+    id: 'P13-two-save-commands-preserve-order',
+    run: () => withTask5(async ({ service, secondService, databasePath }) => {
+      const results = await Promise.all([secondService.process(task5Update(11, '/save https://linkedin.com/jobs/11/?src=task%2F5')), service.process(task5Update(10, '/save https://linkedin.com/jobs/10'))]);
+      assert.deepEqual(results.map((result) => result.outcome), ['enqueued', 'enqueued']);
+      assert.deepEqual(results.map((result) => result.outcome === 'enqueued' ? result.queueSequence : 0), [1, 2]);
+      const database = new DatabaseSync(databasePath, { readOnly: true });
+      const stored = database.prepare('SELECT command_id commandId, queue_sequence queueSequence, canonical_url canonicalUrl FROM career_commands ORDER BY queue_sequence').all().map((row) => ({ ...row }));
+      database.close();
+      assert.deepEqual(stored, [
+        { commandId: results[0].outcome === 'enqueued' ? results[0].commandId : '', queueSequence: 1, canonicalUrl: 'https://linkedin.com/jobs/11?src=task%2F5' },
+        { commandId: results[1].outcome === 'enqueued' ? results[1].commandId : '', queueSequence: 2, canonicalUrl: 'https://linkedin.com/jobs/10' },
+      ]);
+    }),
+  },
+  {
+    id: 'scope-job-command-parked',
+    run: () => withTask5(async ({ service, store }) => {
+      const result = await service.process(task5Update(20, '/job https://linkedin.com/jobs/20'));
+      assert.deepEqual({ outcome: result.outcome, command: result.outcome === 'parked' ? result.command : undefined, duplicate: result.outcome === 'parked' ? result.duplicate : undefined },
+        { outcome: 'parked', command: 'job', duplicate: false });
+      assert.equal(store.getCommandCount(), 0);
+    }),
+  },
+  {
+    id: 'privacy-raw-update-not-retained',
+    run: () => withTask5(async ({ service, databasePath }) => {
+      await service.process({ ...task5Update(30), message: { ...task5Update(30).message, first_name: 'RAW_CANARY' } });
+      const db = new DatabaseSync(databasePath, { readOnly: true });
+      const retained = JSON.stringify(db.prepare('SELECT * FROM career_inbound_events').all()); db.close();
+      assert.equal(retained.includes('RAW_CANARY'), false); assert.equal(retained.includes('/save'), false);
+    }),
+  },
   {
     id: 'P18-empty-migration',
     run: () => {
@@ -217,7 +379,7 @@ const rows: AcceptanceRow[] = [
         const fifo = database.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'career_commands_fifo_idx'").get() as { sql: string };
         assert.match(fifo.sql, /\(queue_state, queue_sequence\)/);
         const commandColumns = (database.prepare('PRAGMA table_info(career_commands)').all() as Array<{ name: string }>).map(({ name }) => name);
-        for (const column of ['queue_sequence', 'workflow_attempt', 'processing_started_at', 'retention_deadline_at']) assert.ok(commandColumns.includes(column), `missing command.${column}`);
+        for (const column of ['queue_sequence', 'workflow_attempt', 'processing_started_at', 'retention_deadline_at', 'authorization_revision']) assert.ok(commandColumns.includes(column), `missing command.${column}`);
         const deliveryColumns = (database.prepare('PRAGMA table_info(career_deliveries)').all() as Array<{ name: string }>).map(({ name }) => name);
         for (const column of ['source_kind', 'envelope_id', 'turn_delivery_id', 'claim_generation', 'claim_owner', 'claim_expires_at', 'heartbeat_at', 'attempt_count', 'first_attempt_at', 'next_attempt_at', 'retry_deadline_at', 'provider', 'provider_outcome', 'retention_deadline_at']) assert.ok(deliveryColumns.includes(column), `missing delivery.${column}`);
         for (const table of ['career_stage_journal', 'career_suspensions', 'career_evidence_records', 'career_completion_outbox', 'career_deliveries']) {
@@ -282,7 +444,12 @@ const rows: AcceptanceRow[] = [
         expectedStore.close();
         const upgraded = new DatabaseSync(databasePath, { readOnly: true });
         const expected = new DatabaseSync(expectedPath, { readOnly: true });
-        for (const table of tables) assert.deepEqual(upgraded.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row })), before[table], table);
+        for (const table of tables) {
+          const expectedRows = table === 'career_commands'
+            ? (before[table] as Array<Record<string, unknown>>).map((row) => ({ ...row, authorization_revision: null }))
+            : before[table];
+          assert.deepEqual(upgraded.prepare(`SELECT * FROM ${table}`).all().map((row) => ({ ...row })), expectedRows, table);
+        }
         const v3ObjectsSql = "SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE (name LIKE 'career_%' OR tbl_name LIKE 'career_%') AND name <> 'career_outbox' AND tbl_name <> 'career_outbox' ORDER BY type,name";
         assert.deepEqual(
           upgraded.prepare(v3ObjectsSql).all().map((row) => ({ ...row })),
@@ -467,6 +634,12 @@ const rows: AcceptanceRow[] = [
         const hash = `sha256:${'a'.repeat(64)}`;
         assert.throws(() => db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run('a'.repeat(64)), /constraint/i);
         db.prepare("INSERT INTO career_inbound_events (event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, created_at) VALUES ('e1','telegram','t1',?,'owner','accepted',1)").run(hash);
+        assert.throws(() => db.prepare("INSERT INTO career_inbound_events (event_id,channel,transport_event_id,normalized_hash,owner_resource_id,result,created_at,intent_kind,canonical_url,thread_id,origin_destination,principal_key) VALUES ('bad-save','telegram','bad',?,'owner','accepted',1,'save_job','https://linkedin.com/jobs/1','telegram:2','2','telegram:1:2')").run(hash), /invalid normalized/i);
+        for (const sql of [
+          "UPDATE career_inbound_events SET result='rejected' WHERE event_id='e1'",
+          "UPDATE career_inbound_events SET rejection_reason='changed' WHERE event_id='e1'",
+          "UPDATE career_inbound_events SET created_at=2 WHERE event_id='e1'",
+        ]) assert.throws(() => db.exec(sql), /immutable/i);
         const insertCommand = db.prepare("INSERT INTO career_commands (command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at) VALUES (?, ?, ?, 'job','https://example.com/job','owner','thread','telegram','chat','queued',10,10,20)");
         insertCommand.run('c1', 'a1', 'r1'); insertCommand.run('c2', 'a2', 'r2');
         assert.throws(() => db.exec("INSERT INTO career_commands (queue_sequence, command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id, thread_id, origin_channel, origin_destination, queue_state, created_at, updated_at, queued_at) VALUES (99,'forged','forged-attempt','forged-request','job','https://example.com/job','owner','thread','telegram','chat','queued',10,10,20)"), /database-assigned/i);
@@ -549,7 +722,7 @@ const rows: AcceptanceRow[] = [
     run: async () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'career-v0-shared-'));
       try {
-        const config = resolveRuntimeConfig({ dataDir: dir, env: {} });
+        const config = resolveRuntimeConfig({ dataDir: dir, env: { CAREER_COPILOT_OWNER_RESOURCE_ID: 'owner-v0', CAREER_COPILOT_INTAKE_HASH_KEY: 'k'.repeat(32) } });
         const applicationStore = new CareerStore(config.databaseUrl);
         const mastraStorage = new LibSQLStore({ id: 'shared-operational-storage', url: config.databaseUrl });
         await mastraStorage.init();

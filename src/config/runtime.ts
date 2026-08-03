@@ -20,6 +20,15 @@ export type RuntimeConfig = {
   reportsPath: string;
   topicsPath: string;
   databaseUrl: string;
+  owner: {
+    resourceId: string;
+    intakeHashKey: string;
+    enabled: boolean;
+    authorizationRevision: number;
+    studioEnabled: boolean;
+    stdioEnabled: boolean;
+    apiIdentity?: string;
+  };
   telegram: {
     botToken: string;
     secretToken?: string;
@@ -117,6 +126,23 @@ export function resolveRuntimeConfig(input: RuntimeConfigInput = {}): RuntimeCon
   const auditTab = requireDeployment ? requiredValue(env, 'GOOGLE_SHEETS_APPLICATION_LOG_TAB') : env.GOOGLE_SHEETS_APPLICATION_LOG_TAB ?? 'Application Log';
   const topicsTab = requireDeployment ? requiredValue(env, 'GOOGLE_SHEETS_TOPICS_TAB') : env.GOOGLE_SHEETS_TOPICS_TAB ?? 'Topics';
   const botToken = requireDeployment ? requiredValue(env, 'TELEGRAM_BOT_TOKEN') : env.TELEGRAM_BOT_TOKEN ?? '';
+  const resourceId = requiredValue(env, 'CAREER_COPILOT_OWNER_RESOURCE_ID');
+  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(resourceId)) throw new Error('CAREER_COPILOT_OWNER_RESOURCE_ID is invalid.');
+  const intakeHashKey = requiredValue(env, 'CAREER_COPILOT_INTAKE_HASH_KEY');
+  if (Buffer.byteLength(intakeHashKey, 'utf8') < 32) throw new Error('CAREER_COPILOT_INTAKE_HASH_KEY must contain at least 32 bytes.');
+  const apiIdentity = env.CAREER_COPILOT_API_IDENTITY?.trim();
+  if (apiIdentity && !/^[A-Za-z0-9_.:@-]{1,200}$/.test(apiIdentity)) throw new Error('CAREER_COPILOT_API_IDENTITY is invalid.');
+  const authorizationRevision = Number(env.CAREER_COPILOT_AUTHORIZATION_REVISION ?? '1');
+  if (!Number.isSafeInteger(authorizationRevision) || authorizationRevision < 0) throw new Error('CAREER_COPILOT_AUTHORIZATION_REVISION must be a non-negative integer.');
+  const owner = {
+    resourceId,
+    intakeHashKey,
+    enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false',
+    authorizationRevision,
+    studioEnabled: env.CAREER_COPILOT_STUDIO_ENABLED !== 'false',
+    stdioEnabled: env.CAREER_COPILOT_STDIO_ENABLED !== 'false',
+    ...(apiIdentity ? { apiIdentity } : {}),
+  };
   const allowedUserIds = numericIds(env.TELEGRAM_ALLOWED_USER_IDS, 'TELEGRAM_ALLOWED_USER_IDS', requireDeployment);
   const privateChatIds = numericIds(env.CAREER_COPILOT_PRIVATE_CHAT_IDS, 'CAREER_COPILOT_PRIVATE_CHAT_IDS', requireDeployment);
   const sheetsOAuth = {
@@ -137,6 +163,7 @@ export function resolveRuntimeConfig(input: RuntimeConfigInput = {}): RuntimeCon
     reportsPath,
     topicsPath,
     databaseUrl,
+    owner,
     telegram: { botToken, secretToken: env.TELEGRAM_WEBHOOK_SECRET_TOKEN, allowedUserIds, privateChatIds },
     sheetsTarget: { spreadsheetId, trackerTab, auditTab, topicsTab },
     sheetsOAuth,

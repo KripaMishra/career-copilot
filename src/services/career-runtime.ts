@@ -1,67 +1,41 @@
-import crypto from 'node:crypto';
-import { assertJobUrl, assertSameJobSite } from '../tools/job-url.ts';
-import { createCareerFilesystemBoundaries } from '../integrations/local-files.ts';
 import { GoogleOAuthRefreshProvider, GoogleSheetsBoundary, GoogleSheetsHttpApi, createGoogleSheetsTools, type SheetsApi } from '../integrations/google-sheets.ts';
 import { CareerStore } from '../storage/career-store.ts';
-import { CareerCopilotService, type CareerCopilotDependencies, type CareerJob } from './career-copilot.ts';
+import { CareerCopilotService } from './career-copilot.ts';
 import { createTelegramIngress } from '../channels/telegram-ingress.ts';
+import { OwnerAuthorization } from '../channels/telegram-auth.ts';
 import type { RuntimeConfig } from '../config/runtime.ts';
 
-export type CareerCopilotRuntimeOverrides = Partial<CareerCopilotDependencies> & {
-  sheetsApi?: SheetsApi;
-  fetchJob?: (url: string) => Promise<CareerJob>;
-};
-
-async function fetchUntrustedJob(url: string): Promise<CareerJob> {
-  const jobUrl = assertJobUrl(url);
-  const response = await fetch(jobUrl, { headers: { 'user-agent': 'Career Copilot/1.0', accept: 'text/html,text/plain' }, signal: AbortSignal.timeout(15_000) });
-  const finalUrl = assertSameJobSite(jobUrl, response.url);
-  const description = await response.text();
-  return {
-    url: finalUrl.toString(),
-    company: '', title: '', location: '',
-    description: description.slice(0, 100_000),
-    sourceHash: crypto.createHash('sha256').update(description).digest('hex'),
-  };
-}
+export type CareerCopilotRuntimeOverrides = { sheetsApi?: SheetsApi; store?: CareerStore };
 
 export function createCareerCopilotRuntime(config: RuntimeConfig, overrides: CareerCopilotRuntimeOverrides = {}) {
-  const filesystem = createCareerFilesystemBoundaries({ profile: config.profilePath, reports: config.reportsPath, topics: config.topicsPath });
-  const idempotency = overrides.idempotency ?? new CareerStore(config.databaseUrl);
+  const store = overrides.store ?? new CareerStore(config.databaseUrl);
+  const authorization = new OwnerAuthorization(() => ({
+    resourceId: config.owner.resourceId,
+    enabled: config.owner.enabled,
+    authorizationRevision: config.owner.authorizationRevision,
+    telegram: { userIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds },
+    studioEnabled: config.owner.studioEnabled,
+    stdioEnabled: config.owner.stdioEnabled,
+    apiIdentity: config.owner.apiIdentity,
+  }));
+  const service = new CareerCopilotService({ authorization, store, intakeHashKey: config.owner.intakeHashKey });
+  const ingress = createTelegramIngress({ service });
+
+  // Existing tools remain registered for later worker tasks; transport intake never invokes them.
   const oauth = new GoogleOAuthRefreshProvider(config.sheetsOAuth);
-  const concreteSheets = new GoogleSheetsBoundary({
+  const sheets = new GoogleSheetsBoundary({
     target: config.sheetsTarget,
     authorize: () => oauth.getAccessToken(),
     api: overrides.sheetsApi ?? new GoogleSheetsHttpApi(),
   });
-  const sheets = overrides.sheets ?? concreteSheets;
-  const dependencies: CareerCopilotDependencies = {
-    allowlist: { userIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds },
-    audit: { append: (row) => sheets.appendAudit(row) },
-    fetchJob: overrides.fetchJob ?? fetchUntrustedJob,
-    idempotency,
-    sheets: sheets as CareerCopilotDependencies['sheets'],
-    profile: overrides.profile ?? filesystem.profile,
-    report: overrides.report ?? filesystem.report,
-    topics: overrides.topics ?? filesystem.topic,
-    alert: overrides.alert ?? (async () => {}),
-  };
-  const service = new CareerCopilotService(dependencies);
-  const ingress = createTelegramIngress({ service });
 
   return {
     service,
-    sheets,
-    tools: createGoogleSheetsTools(concreteSheets),
+    store,
+    tools: createGoogleSheetsTools(sheets),
+    close: () => store.close(),
     async handleTelegramUpdate(update: unknown, reply: (text: string) => Promise<void> = async () => {}) {
-      const result = await ingress.handle(update, reply);
-      if (result && typeof result === 'object' && 'outcome' in result) {
-        const outcome = (result as { outcome: string }).outcome;
-        if (outcome === 'rejected') await reply('Request rejected.');
-        else if (outcome === 'duplicate') await reply('Previously seen job recorded.');
-        else if (outcome === 'reviewed') await reply('Job review completed.');
-      }
-      return result;
+      return ingress.handle(update, reply);
     },
   };
 }

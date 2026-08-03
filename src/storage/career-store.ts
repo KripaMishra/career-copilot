@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
@@ -478,10 +478,106 @@ END;
 PRAGMA legacy_alter_table = OFF;
 `;
 
+const normalizedIntakeSql = `
+ALTER TABLE career_inbound_events ADD COLUMN intent_kind TEXT CHECK (intent_kind IS NULL OR intent_kind IN ('rejected', 'save_job', 'parked_job'));
+ALTER TABLE career_inbound_events ADD COLUMN canonical_url TEXT;
+ALTER TABLE career_inbound_events ADD COLUMN thread_id TEXT;
+ALTER TABLE career_inbound_events ADD COLUMN origin_destination TEXT;
+ALTER TABLE career_inbound_events ADD COLUMN principal_key TEXT;
+ALTER TABLE career_inbound_events ADD COLUMN authorization_revision INTEGER CHECK (authorization_revision IS NULL OR authorization_revision >= 0);
+ALTER TABLE career_inbound_events ADD COLUMN command_id TEXT REFERENCES career_commands(command_id) ON DELETE RESTRICT;
+ALTER TABLE career_inbound_events ADD COLUMN enqueue_position INTEGER CHECK (enqueue_position IS NULL OR enqueue_position > 0);
+ALTER TABLE career_commands ADD COLUMN authorization_revision INTEGER CHECK (authorization_revision IS NULL OR authorization_revision >= 0);
+CREATE INDEX career_inbound_command_idx ON career_inbound_events(command_id) WHERE command_id IS NOT NULL;
+CREATE TRIGGER career_inbound_normalized_insert_valid
+BEFORE INSERT ON career_inbound_events
+WHEN NEW.intent_kind IS NOT NULL AND COALESCE(NOT (
+  length(NEW.owner_resource_id) BETWEEN 1 AND 200
+  AND length(NEW.thread_id) BETWEEN 1 AND 256
+  AND length(NEW.origin_destination) BETWEEN 1 AND 256
+  AND length(NEW.principal_key) BETWEEN 1 AND 256
+  AND NEW.authorization_revision IS NOT NULL AND NEW.authorization_revision >= 0
+  AND NEW.channel IN ('telegram', 'studio', 'stdio', 'api')
+  AND NEW.event_id = NEW.channel || ':' || NEW.transport_event_id
+  AND NEW.normalized_hash GLOB 'sha256:[0-9a-f]*'
+  AND (
+    (NEW.intent_kind = 'rejected' AND NEW.result = 'rejected'
+      AND NEW.rejection_reason IN ('unauthorized', 'unsupported_job_url', 'invalid_command', 'edited_message', 'replayed_update',
+        'forwarded_message', 'bot_sender', 'non_private_chat', 'missing_sender', 'unauthorized_request')
+      AND NEW.canonical_url IS NULL AND NEW.command_id IS NULL AND NEW.enqueue_position IS NULL
+      AND NEW.thread_id = 'intake:rejected' AND NEW.origin_destination = 'intake:rejected' AND NEW.principal_key = 'intake:rejected')
+    OR
+    (NEW.intent_kind = 'parked_job' AND NEW.result = 'accepted' AND NEW.rejection_reason IS NULL
+      AND NEW.canonical_url IS NULL AND NEW.command_id IS NULL AND NEW.enqueue_position IS NULL)
+    OR
+    (NEW.intent_kind = 'save_job' AND NEW.canonical_url IS NOT NULL AND (
+      (NEW.result = 'rejected' AND NEW.rejection_reason = 'intake_pending' AND NEW.command_id IS NULL AND NEW.enqueue_position IS NULL)
+      OR (NEW.result = 'accepted' AND NEW.rejection_reason IS NULL AND NEW.command_id IS NOT NULL AND NEW.enqueue_position IS NOT NULL
+        AND EXISTS (
+          SELECT 1 FROM career_commands AS command
+          WHERE command.command_id = NEW.command_id
+            AND command.owner_resource_id = NEW.owner_resource_id
+            AND command.thread_id = NEW.thread_id
+            AND command.origin_channel = NEW.channel
+            AND command.origin_destination = NEW.origin_destination
+            AND command.canonical_url = NEW.canonical_url
+            AND command.canonical_job_key = 'url:' || NEW.canonical_url
+            AND command.request_id = NEW.channel || ':' || NEW.transport_event_id
+            AND command.authorization_revision = NEW.authorization_revision
+            AND NEW.enqueue_position = (SELECT count(*) FROM career_commands AS queued
+              WHERE queued.queue_state = 'queued' AND queued.queue_sequence <= command.queue_sequence)
+        ))
+    ))
+  )
+), 1)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid normalized inbound event');
+END;
+CREATE TRIGGER career_inbound_normalized_identity_immutable
+BEFORE UPDATE ON career_inbound_events
+WHEN COALESCE(NOT (
+  OLD.intent_kind = 'save_job' AND OLD.result = 'rejected' AND OLD.rejection_reason = 'intake_pending'
+  AND OLD.command_id IS NULL AND OLD.enqueue_position IS NULL
+  AND NEW.event_id = OLD.event_id AND NEW.schema_version = OLD.schema_version
+  AND NEW.channel = OLD.channel AND NEW.transport_event_id = OLD.transport_event_id
+  AND NEW.normalized_hash = OLD.normalized_hash AND NEW.owner_resource_id = OLD.owner_resource_id
+  AND NEW.intent_kind = OLD.intent_kind AND NEW.canonical_url = OLD.canonical_url
+  AND NEW.thread_id = OLD.thread_id AND NEW.origin_destination = OLD.origin_destination
+  AND NEW.principal_key = OLD.principal_key AND NEW.authorization_revision = OLD.authorization_revision
+  AND NEW.result = 'accepted' AND NEW.rejection_reason IS NULL
+  AND NEW.command_id IS NOT NULL AND NEW.enqueue_position IS NOT NULL
+  AND EXISTS (
+    SELECT 1 FROM career_commands AS command
+    WHERE command.command_id = NEW.command_id
+      AND command.owner_resource_id = NEW.owner_resource_id
+      AND command.thread_id = NEW.thread_id
+      AND command.origin_channel = NEW.channel
+      AND command.origin_destination = NEW.origin_destination
+      AND command.canonical_url = NEW.canonical_url
+      AND command.canonical_job_key = 'url:' || NEW.canonical_url
+      AND command.request_id = NEW.channel || ':' || NEW.transport_event_id
+      AND command.authorization_revision = NEW.authorization_revision
+      AND NEW.enqueue_position = (SELECT count(*) FROM career_commands AS queued
+        WHERE queued.queue_state = 'queued' AND queued.queue_sequence <= command.queue_sequence)
+  )
+  AND NEW.created_at = OLD.created_at
+), 1)
+BEGIN
+  SELECT RAISE(ABORT, 'normalized inbound event is immutable');
+END;
+CREATE TRIGGER career_commands_authorization_revision_immutable
+BEFORE UPDATE OF authorization_revision ON career_commands
+WHEN NOT (NEW.authorization_revision IS OLD.authorization_revision)
+BEGIN
+  SELECT RAISE(ABORT, 'command authorization revision is immutable');
+END;
+`;
+
 export const MIGRATIONS: readonly Migration[] = Object.freeze([
   Object.freeze({ version: 1, name: 'legacy_idempotency_compatibility', sql: legacyCompatibilitySql, checksum: '606b96f6bea28639b2f8699634873cfeb02a1f6ef549bc0b676e2f6c7a8cbd28' }),
   Object.freeze({ version: 2, name: 'durable_v0_records', sql: durableRecordsSql, checksum: '0ba6f834821ae214eb0c168c89417f4a66faf03d0c205cb79ab87ff7182b8617' }),
   Object.freeze({ version: 3, name: 'queue_fencing', sql: queueFencingSql, checksum: 'befa6ba8eec3fcca3fe235e29c6f162ad83482b6f268d073a45534b43ba73d09' }),
+  Object.freeze({ version: 4, name: 'normalized_authorized_intake', sql: normalizedIntakeSql, checksum: 'f4a09f69f4cd9c6c777d5d2a1264a70ca6ad55d1df5a4cd155722681e3b7851b' }),
 ]);
 
 const LEDGER_SQL = `
@@ -568,6 +664,7 @@ function expectedSchema(version: number, includeLegacyOutbox: boolean): SchemaOb
       expected.exec('PRAGMA foreign_keys = OFF; PRAGMA legacy_alter_table = ON;');
       expected.exec(queueFencingSql);
     }
+    if (version >= 4) expected.exec(normalizedIntakeSql);
     const objects = schemaObjects(expected, true);
     return includeLegacyOutbox ? objects : objects.filter((object) => !isAllowedLegacyOutboxObject(object));
   } finally {
@@ -646,6 +743,105 @@ export type EnqueueCommandInput = {
   originChannel: string;
   originDestination: string;
 };
+
+type AtomicIntakeCommon = {
+  channel: 'telegram' | 'studio' | 'stdio' | 'api';
+  transportEventId: string;
+  payloadHash: string;
+  ownerResourceId: string;
+  threadId: string;
+  originDestination: string;
+  principalKey: string;
+  authorizationRevision: number;
+};
+export type IntakeRejectionReason = 'unauthorized' | 'unsupported_job_url' | 'invalid_command'
+  | 'edited_message' | 'replayed_update' | 'forwarded_message' | 'bot_sender' | 'non_private_chat' | 'missing_sender' | 'unauthorized_request';
+export type AtomicIntakeInput = AtomicIntakeCommon & (
+  | { intentKind: 'rejected'; rejectionReason: IntakeRejectionReason }
+  | { intentKind: 'parked_job'; requestId: string }
+  | { intentKind: 'save_job'; canonicalUrl: string; canonicalJobKey: string; commandId: string; attemptId: string; requestId: string }
+);
+export type StoredIssuanceAuthorization = {
+  channel: AtomicIntakeCommon['channel'];
+  ownerResourceId: string;
+  threadId: string;
+  destination: string;
+  principalKey: string;
+  authorizationRevision: number;
+};
+type AcceptedAtomicIntakeResult = { duplicate: boolean; issuanceAuthorization: StoredIssuanceAuthorization };
+export type AtomicIntakeResult =
+  | { intentKind: 'rejected'; duplicate: boolean; rejectionReason: IntakeRejectionReason }
+  | ({ intentKind: 'parked_job' } & AcceptedAtomicIntakeResult)
+  | ({ intentKind: 'save_job'; commandId: string; queueSequence: number; queuePosition: number; state: 'queued' } & AcceptedAtomicIntakeResult);
+
+function storedIssuanceAuthorization(row: {
+  channel: unknown; ownerResourceId: unknown; threadId: unknown; originDestination: unknown;
+  principalKey: unknown; authorizationRevision: unknown;
+}): StoredIssuanceAuthorization {
+  if (!['telegram', 'studio', 'stdio', 'api'].includes(row.channel as string)
+    || typeof row.ownerResourceId !== 'string' || !row.ownerResourceId
+    || typeof row.threadId !== 'string' || !row.threadId
+    || typeof row.originDestination !== 'string' || !row.originDestination
+    || typeof row.principalKey !== 'string' || !row.principalKey
+    || !Number.isSafeInteger(row.authorizationRevision) || (row.authorizationRevision as number) < 0) {
+    throw new Error('Stored accepted inbound event has incomplete issuance authorization.');
+  }
+  return {
+    channel: row.channel as StoredIssuanceAuthorization['channel'], ownerResourceId: row.ownerResourceId,
+    threadId: row.threadId, destination: row.originDestination, principalKey: row.principalKey,
+    authorizationRevision: row.authorizationRevision as number,
+  };
+}
+
+const atomicIntakeFields = new Set([
+  'channel', 'transportEventId', 'payloadHash', 'ownerResourceId', 'threadId', 'originDestination',
+  'principalKey', 'authorizationRevision', 'intentKind', 'rejectionReason', 'canonicalUrl', 'canonicalJobKey', 'commandId', 'attemptId', 'requestId',
+]);
+
+function assertAtomicIntakeInput(input: AtomicIntakeInput): void {
+  if (!input || typeof input !== 'object' || Object.keys(input).some((key) => !atomicIntakeFields.has(key))) {
+    throw new Error('Inbound intake shape is invalid.');
+  }
+  if (!['telegram', 'studio', 'stdio', 'api'].includes(input.channel)) throw new Error('Inbound channel is invalid.');
+  if (!['rejected', 'save_job', 'parked_job'].includes(input.intentKind)) throw new Error('Inbound intent is invalid.');
+  const safeCorrelation = /^[A-Za-z0-9_.:@-]{1,256}$/;
+  for (const [name, value] of [
+    ['transport event ID', input.transportEventId], ['owner resource ID', input.ownerResourceId],
+    ['thread ID', input.threadId], ['origin destination', input.originDestination], ['principal key', input.principalKey],
+  ] as const) if (typeof value !== 'string' || !safeCorrelation.test(value)) throw new Error(`Inbound ${name} is invalid.`);
+  if (!/^sha256:[a-f0-9]{64}$/.test(input.payloadHash)) throw new Error('Inbound payload hash must be a safe SHA-256 value.');
+  if (!Number.isSafeInteger(input.authorizationRevision) || input.authorizationRevision < 0) throw new Error('Inbound authorization revision is invalid.');
+
+  const saveFieldNames = ['canonicalUrl', 'canonicalJobKey', 'commandId', 'attemptId'] as const;
+  const saveFields = saveFieldNames.map((name) => input.intentKind === 'save_job' ? input[name] : undefined);
+  if (input.intentKind === 'rejected') {
+    const reasons: readonly string[] = ['unauthorized', 'unsupported_job_url', 'invalid_command', 'edited_message', 'replayed_update',
+      'forwarded_message', 'bot_sender', 'non_private_chat', 'missing_sender', 'unauthorized_request'];
+    if (!reasons.includes(input.rejectionReason) || input.threadId !== 'intake:rejected'
+      || input.originDestination !== 'intake:rejected' || input.principalKey !== 'intake:rejected'
+      || ['requestId', ...saveFieldNames].some((name) => Object.hasOwn(input, name))) throw new Error('Rejected intake correlation is invalid.');
+    return;
+  }
+  if (Object.hasOwn(input, 'rejectionReason')) throw new Error('Accepted intake forbids rejection correlation.');
+  if (typeof input.requestId !== 'string' || !safeCorrelation.test(input.requestId)
+    || input.requestId !== `${input.channel}:${input.transportEventId}`) throw new Error('Inbound request ID is invalid.');
+  if (input.intentKind === 'parked_job') {
+    if (saveFieldNames.some((name) => Object.hasOwn(input, name))) throw new Error('Parked intake forbids save command correlation.');
+    return;
+  }
+  if (saveFieldNames.some((name) => !Object.hasOwn(input, name)) || saveFields.some((value) => typeof value !== 'string')) {
+    throw new Error('Save intake requires complete command correlation.');
+  }
+  if (!safeCorrelation.test(input.commandId!) || !safeCorrelation.test(input.attemptId!)) throw new Error('Save command correlation is invalid.');
+  const value = input.canonicalUrl!;
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error('Save intake canonical URL is invalid.'); }
+  if (value.length > 2048 || url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.port
+    || url.hash || url.href !== value || input.canonicalJobKey !== buildJobIdempotencyKey({ url: value })) {
+    throw new Error('Save intake canonical URL or job key is invalid.');
+  }
+}
 
 export type QueueClaim = {
   commandId: string;
@@ -767,6 +963,94 @@ export class CareerStore {
 
   private databaseNow(): number {
     return Number((this.database.prepare("SELECT CAST(unixepoch('subsec') * 1000 AS INTEGER) AS now").get() as { now: number }).now);
+  }
+
+  recordInboundAndEnqueue(input: AtomicIntakeInput): AtomicIntakeResult {
+    assertAtomicIntakeInput(input);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const duplicate = this.database.prepare(`
+        SELECT normalized_hash AS payloadHash, channel, owner_resource_id AS ownerResourceId, thread_id AS threadId,
+          origin_destination AS originDestination, principal_key AS principalKey, authorization_revision AS authorizationRevision,
+          intent_kind AS intentKind, canonical_url AS canonicalUrl, command_id AS commandId, enqueue_position AS queuePosition,
+          result, rejection_reason AS rejectionReason
+        FROM career_inbound_events WHERE channel = ? AND transport_event_id = ?
+      `).get(input.channel, input.transportEventId) as {
+        payloadHash: string; channel: string; ownerResourceId: string; threadId: string | null; originDestination: string | null; principalKey: string | null;
+        authorizationRevision: number | null; intentKind: 'rejected' | 'save_job' | 'parked_job' | null; canonicalUrl: string | null;
+        commandId: string | null; queuePosition: number | null; result: 'accepted' | 'rejected'; rejectionReason: IntakeRejectionReason | 'intake_pending' | null;
+      } | undefined;
+      if (duplicate) {
+        const storedHash = Buffer.from(duplicate.payloadHash, 'utf8');
+        const candidateHash = Buffer.from(input.payloadHash, 'utf8');
+        const hashMatches = storedHash.byteLength === candidateHash.byteLength && timingSafeEqual(storedHash, candidateHash);
+        if (!hashMatches) throw new Error('Conflicting transport replay.');
+        if (duplicate.intentKind === 'rejected') {
+          if (!duplicate.rejectionReason || duplicate.rejectionReason === 'intake_pending') throw new Error('Stored rejected inbound event is invalid.');
+          this.database.exec('COMMIT');
+          return { intentKind: 'rejected', duplicate: true, rejectionReason: duplicate.rejectionReason };
+        }
+        const issuanceAuthorization = storedIssuanceAuthorization(duplicate);
+        if (duplicate.intentKind === 'parked_job') {
+          this.database.exec('COMMIT');
+          return { intentKind: 'parked_job', duplicate: true, issuanceAuthorization };
+        }
+        if (!duplicate.commandId || duplicate.queuePosition === null) throw new Error('Stored inbound event is missing command correlation.');
+        const command = this.database.prepare('SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ?').get(duplicate.commandId) as { queueSequence: number } | undefined;
+        if (!command) throw new Error('Stored inbound command correlation is unavailable.');
+        this.database.exec('COMMIT');
+        return { intentKind: 'save_job', duplicate: true, commandId: duplicate.commandId, queueSequence: command.queueSequence, queuePosition: duplicate.queuePosition, state: 'queued', issuanceAuthorization };
+      }
+
+      const now = this.databaseNow();
+      const eventId = `${input.channel}:${input.transportEventId}`;
+      const isRejected = input.intentKind === 'rejected';
+      this.database.prepare(`
+        INSERT INTO career_inbound_events (
+          event_id, channel, transport_event_id, normalized_hash, owner_resource_id, result, rejection_reason, created_at,
+          intent_kind, canonical_url, thread_id, origin_destination, principal_key, authorization_revision
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(eventId, input.channel, input.transportEventId, input.payloadHash, input.ownerResourceId,
+        input.intentKind === 'parked_job' ? 'accepted' : 'rejected', isRejected ? input.rejectionReason : input.intentKind === 'save_job' ? 'intake_pending' : null,
+        now, input.intentKind, input.intentKind === 'save_job' ? input.canonicalUrl : null,
+        input.threadId, input.originDestination, input.principalKey, input.authorizationRevision);
+
+      if (isRejected) {
+        this.database.exec('COMMIT');
+        return { intentKind: 'rejected', duplicate: false, rejectionReason: input.rejectionReason };
+      }
+      const issuanceAuthorization = storedIssuanceAuthorization(this.database.prepare(`
+        SELECT channel, owner_resource_id AS ownerResourceId, thread_id AS threadId,
+          origin_destination AS originDestination, principal_key AS principalKey, authorization_revision AS authorizationRevision
+        FROM career_inbound_events WHERE event_id = ?
+      `).get(eventId) as Parameters<typeof storedIssuanceAuthorization>[0]);
+      if (input.intentKind === 'parked_job') {
+        this.database.exec('COMMIT');
+        return { intentKind: 'parked_job', duplicate: false, issuanceAuthorization };
+      }
+      if (!input.canonicalUrl || !input.canonicalJobKey || !input.commandId || !input.attemptId) throw new Error('Save intake requires complete command correlation.');
+      this.database.prepare(`
+        INSERT INTO career_commands (
+          command_id, attempt_id, request_id, canonical_job_key, canonical_url, owner_resource_id,
+          thread_id, origin_channel, origin_destination, authorization_revision, queue_state, created_at, updated_at, queued_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+      `).run(
+        input.commandId, input.attemptId, input.requestId, input.canonicalJobKey, input.canonicalUrl,
+        input.ownerResourceId, input.threadId, input.channel, input.originDestination, input.authorizationRevision, now, now, now,
+      );
+      const command = this.database.prepare('SELECT queue_sequence AS queueSequence FROM career_commands WHERE command_id = ?').get(input.commandId) as { queueSequence: number };
+      const queuePosition = Number((this.database.prepare("SELECT count(*) AS count FROM career_commands WHERE queue_state = 'queued' AND queue_sequence <= ?").get(command.queueSequence) as { count: number }).count);
+      this.database.prepare("UPDATE career_inbound_events SET result = 'accepted', rejection_reason = NULL, command_id = ?, enqueue_position = ? WHERE event_id = ? AND result = 'rejected' AND rejection_reason = 'intake_pending' AND command_id IS NULL").run(input.commandId, queuePosition, eventId);
+      this.database.exec('COMMIT');
+      return { intentKind: 'save_job', duplicate: false, commandId: input.commandId, queueSequence: command.queueSequence, queuePosition, state: 'queued', issuanceAuthorization };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  getCommandCount(): number {
+    return Number((this.database.prepare('SELECT count(*) AS count FROM career_commands').get() as { count: number }).count);
   }
 
   enqueueCommand(input: EnqueueCommandInput): { commandId: string; queueSequence: number; position: number; state: 'queued' } {
