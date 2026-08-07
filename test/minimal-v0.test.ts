@@ -95,38 +95,38 @@ test('agent responder binds Telegram turns to persistent owner memory and truste
   const create = (module as { createAgentResponder?: (agent: unknown, ownerId: string) => (turn: Record<string, string>) => Promise<string> }).createAgentResponder;
   assert.equal(typeof create, 'function'); let received: Record<string, unknown> | undefined;
   const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received = options; return { text: 'remembered' }; } }, 'owner');
-  assert.equal(await respond({ text: 'My profile details', userId: '1', chatId: '2', transportEventId: '70' }), 'remembered');
-  assert.deepEqual(received?.memory, { resource: 'owner', thread: 'telegram:2' });
-  const context = received?.requestContext as { get: (key: string) => unknown }; assert.equal(context.get('ownerId'), 'owner'); assert.equal(context.get('userId'), '1'); assert.equal(context.get('chatId'), '2'); assert.equal(context.get('transportEventId'), '70');
+  assert.equal(await respond({ text: 'My profile details', actorId: 'stdio-owner', conversationId: 'terminal-1', requestId: '70' }), 'remembered');
+  assert.deepEqual(received?.memory, { resource: 'owner', thread: 'conversation:terminal-1' });
+  const context = received?.requestContext as { get: (key: string) => unknown }; assert.equal(context.get('ownerId'), 'owner'); assert.equal(context.get('actorId'), 'stdio-owner'); assert.equal(context.get('conversationId'), 'terminal-1'); assert.equal(context.get('requestId'), '70');
 });
 
 test('career tools reject caller-forged request context', async () => {
   const module = await import('../src/tools/career-context.ts').catch(() => ({})); const schema = (module as { careerToolContextSchema?: { safeParse: (value: unknown) => { success: boolean } }; careerToolCapability?: unknown }).careerToolContextSchema; const capability = (module as { careerToolCapability?: unknown }).careerToolCapability;
-  assert.ok(schema); assert.equal(schema!.safeParse({ ownerId: 'owner', userId: '1', chatId: '2', transportEventId: '3', capability: {} }).success, false); assert.equal(schema!.safeParse({ ownerId: 'owner', userId: '1', chatId: '2', transportEventId: '3', capability }).success, true);
+  assert.ok(schema); assert.equal(schema!.safeParse({ ownerId: 'owner', actorId: '1', conversationId: '2', requestId: '3', capability: {} }).success, false); assert.equal(schema!.safeParse({ ownerId: 'owner', actorId: '1', conversationId: '2', requestId: '3', capability }).success, true);
 });
 
 test('runtime routes save prompts and profile replies through one conversational agent', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-conversation-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const turns: Array<{ text: string; userId: string; chatId: string; transportEventId: string }> = []; const replies: string[] = [];
+  const turns: Array<{ text: string; actorId: string; conversationId: string; requestId: string }> = []; const replies: string[] = [];
   const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { turns.push(turn); return turns.length === 1 ? 'Please share your profile.' : 'Thanks, I will continue.'; } });
   const update = (id: number, text: string) => ({ update_id: id, message: { message_id: id, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text } });
   assert.equal((await runtime.handleTelegramUpdate(update(70, '/save https://linkedin.com/jobs/70'), async (text) => { replies.push(text); })).outcome, 'accepted');
   assert.equal((await runtime.handleTelegramUpdate(update(71, 'I am a GenAI engineer with five years of experience.'), async (text) => { replies.push(text); })).outcome, 'accepted');
   assert.match(turns[0].text, /save this job/i); assert.match(turns[0].text, /https:\/\/linkedin\.com\/jobs\/70/); assert.equal(turns[1].text, 'I am a GenAI engineer with five years of experience.');
-  assert.deepEqual(turns.map(({ userId, chatId, transportEventId }) => ({ userId, chatId, transportEventId })), [{ userId: '1', chatId: '2', transportEventId: '70' }, { userId: '1', chatId: '2', transportEventId: '71' }]);
+  assert.deepEqual(turns.map(({ actorId, conversationId, requestId }) => ({ actorId, conversationId, requestId })), [{ actorId: '1', conversationId: '2', requestId: '70' }, { actorId: '1', conversationId: '2', requestId: '71' }]);
   assert.deepEqual(replies, ['Please share your profile.', 'Thanks, I will continue.']); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('durable agent work remains stored when its Telegram reply fails', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-ack-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-ack', userId: turn.userId, ownerId: 'owner', chatId: turn.chatId, transportEventId: turn.transportEventId, originalUrl: 'https://linkedin.com/jobs/30', canonicalUrl: 'https://linkedin.com/jobs/30' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-ack', userId: turn.actorId, ownerId: 'owner', chatId: turn.conversationId, transportEventId: turn.requestId, originalUrl: 'https://linkedin.com/jobs/30', canonicalUrl: 'https://linkedin.com/jobs/30' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
   await assert.rejects(() => runtime.handleTelegramUpdate({ update_id: 30, message: { message_id: 30, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/save https://linkedin.com/jobs/30' } }, async () => { throw new Error('telegram unavailable'); }));
   assert.equal(store.get('job-ack')?.status, 'succeeded'); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('successful Telegram reply marks the completed agent job notified', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-notified-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-notified', userId: turn.userId, ownerId: 'owner', chatId: turn.chatId, transportEventId: turn.transportEventId, originalUrl: 'https://linkedin.com/jobs/notified', canonicalUrl: 'https://linkedin.com/jobs/notified' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-notified', userId: turn.actorId, ownerId: 'owner', chatId: turn.conversationId, transportEventId: turn.requestId, originalUrl: 'https://linkedin.com/jobs/notified', canonicalUrl: 'https://linkedin.com/jobs/notified' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
   await runtime.handleTelegramUpdate({ update_id: 32, message: { message_id: 32, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'save my job' } }, async () => {});
   assert.ok(store.get('job-notified')?.notifiedAt); runtime.close(); await rm(dir, { recursive: true, force: true });
 });

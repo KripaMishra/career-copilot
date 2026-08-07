@@ -7,11 +7,11 @@ type Command = { kind: 'save'; url: string } | { kind: 'job'; jobId?: string } |
 export function parseCommand(text: string | undefined): Command | null { if (!text) return null; const save = text.match(/^\/save[ \t]+(\S+)$/); if (save) return { kind: 'save', url: save[1] }; const job = text.match(/^\/job(?:[ \t]+(\S+))?$/); if (job) return { kind: 'job', ...(job[1] ? { jobId: job[1] } : {}) }; if (text === '/queue') return { kind: 'queue' }; return null; }
 export function injectCommand(text: string) { const command = parseCommand(text); if (command?.kind === 'save') return `Save this job now: ${command.url}. Use the save-job tool after you have enough profile context; otherwise ask the owner for the missing context.`; if (command?.kind === 'job') return `Report the status of ${command.jobId ? `job ${command.jobId}` : 'the latest job'} using the job-status tool.`; if (command?.kind === 'queue') return 'List my saved jobs using the job-queue tool.'; return text; }
 
-export type AgentTurn = { text: string; userId: string; chatId: string; transportEventId: string; resumeJobId?: string };
+export type AgentTurn = { text: string; actorId: string; conversationId: string; requestId: string; resumeJobId?: string };
 export function createAgentResponder(agent: { generate: (text: string, options: Record<string, unknown>) => Promise<{ text?: string }> }, ownerId: string) {
   return async (turn: AgentTurn) => {
-    const requestContext = createCareerToolContext({ ownerId, userId: turn.userId, chatId: turn.chatId, transportEventId: turn.transportEventId, ...(turn.resumeJobId ? { resumeJobId: turn.resumeJobId } : {}) });
-    const result = await agent.generate(turn.text, { memory: { resource: ownerId, thread: `telegram:${turn.chatId}` }, requestContext, maxSteps: 8 });
+    const requestContext = createCareerToolContext({ ownerId, actorId: turn.actorId, conversationId: turn.conversationId, requestId: turn.requestId, ...(turn.resumeJobId ? { resumeJobId: turn.resumeJobId } : {}) });
+    const result = await agent.generate(turn.text, { memory: { resource: ownerId, thread: `conversation:${turn.conversationId}` }, requestContext, maxSteps: 8 });
     return result.text?.trim() || 'Done.';
   };
 }
@@ -34,7 +34,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
     if (!authorized(request.userId, request.chatId, request.isPrivateChat) || request.isBot || request.isEdited || request.isForwarded) return { outcome: 'rejected', reason: 'unauthorized' };
     if (seenUpdates.has(raw.update_id)) return { outcome: 'rejected', reason: 'replayed_update' };
     if (!message?.text?.trim()) return { outcome: 'rejected', reason: 'invalid_message' };
-    const transportEventId = String(raw.update_id); const response = await respond({ text: injectCommand(message.text), userId: request.userId, chatId: request.chatId, transportEventId });
+    const transportEventId = String(raw.update_id); const response = await respond({ text: injectCommand(message.text), actorId: request.userId, conversationId: request.chatId, requestId: transportEventId });
     await reply(response); const completed = store.getByTransportEventId(transportEventId); if (completed?.status === 'succeeded' && completed.ownerId === options.ownerId && completed.userId === request.userId && completed.chatId === request.chatId) store.markNotified(completed.jobId); seenUpdates.add(raw.update_id);
     return { outcome: 'accepted', command: command?.kind ?? 'chat' };
   };
@@ -46,7 +46,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
       const unfinished = store.unfinished(); observe('info', 'recovery.started', { unfinishedJobs: unfinished.length });
       for (const job of unfinished) if (reauthorized(job)) {
         try {
-          const response = await respond({ text: `Resume saving the previously persisted job ${job.originalUrl}. Use the save-job tool with the profile context already in memory.`, userId: job.userId!, chatId: job.chatId, transportEventId: job.transportEventId, resumeJobId: job.jobId });
+          const response = await respond({ text: `Resume saving the previously persisted job ${job.originalUrl}. Use the save-job tool with the profile context already in memory.`, actorId: job.userId!, conversationId: job.chatId, requestId: job.transportEventId, resumeJobId: job.jobId });
           if (notify) { const current = store.get(job.jobId); await reply(current?.safeResult?.summary ?? response, job.chatId); if (current?.status === 'succeeded') store.markNotified(job.jobId); }
         } catch (error) { if (store.get(job.jobId)?.status !== 'succeeded') store.fail(job.jobId, error); observe('error', 'job.failed', { jobId: job.jobId, errorName: error instanceof Error ? error.name : 'UnknownError' }); }
       }
