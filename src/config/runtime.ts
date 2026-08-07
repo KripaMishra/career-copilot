@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { chmodSync, mkdirSync } from 'node:fs';
 import { resolve, join, isAbsolute } from 'node:path';
 import { assertSafeWorkspaceRoots } from '../integrations/local-files.ts';
 import { SHEETS_SCOPE } from '../integrations/google-sheets.ts';
@@ -17,7 +17,7 @@ export function assertOperationalDatabaseUrl(value: string) {
   return value;
 }
 export function resolveRuntimeConfig(input: Input = {}): RuntimeConfig {
-  const env = input.env ?? process.env; const requiredDeployment = input.requireDeployment === true; const dataDir = resolve(input.dataDir ?? env.MASTRA_DATA_DIR ?? join(process.cwd(), '.mastra', 'career-copilot')); mkdirSync(dataDir, { recursive: true });
+  const env = input.env ?? process.env; const requiredDeployment = input.requireDeployment === true; const dataDir = resolve(input.dataDir ?? env.MASTRA_DATA_DIR ?? join(process.cwd(), '.mastra', 'career-copilot')); mkdirSync(dataDir, { recursive: true }); chmodSync(dataDir, 0o700);
   const databaseUrl = assertOperationalDatabaseUrl(input.databaseUrl ?? env.MASTRA_DATABASE_URL ?? `file:${join(dataDir, 'mastra.db')}`); const ownerId = requiredDeployment ? required(env, 'CAREER_COPILOT_OWNER_RESOURCE_ID') : (env.CAREER_COPILOT_OWNER_RESOURCE_ID ?? 'career-owner-v0');
   const profilePath = resolve(input.profileDir ?? env.CAREER_COPILOT_PROFILE_DIR ?? join(dataDir, 'profile')); const reportsPath = resolve(input.reportsDir ?? env.CAREER_COPILOT_REPORTS_DIR ?? join(dataDir, 'reports')); const topicsPath = resolve(join(dataDir, 'topics')); mkdirSync(reportsPath, { recursive: true }); assertSafeWorkspaceRoots(profilePath, reportsPath, topicsPath);
   const allowedUserIds = ids(env.TELEGRAM_ALLOWED_USER_IDS, 'TELEGRAM_ALLOWED_USER_IDS', requiredDeployment);

@@ -8,11 +8,10 @@ import { CareerStore } from '../src/storage/career-store.ts';
 import { acquireJobText, normalizeResponseStatus, validateJobUrl } from '../src/tools/web-fetch-tool.ts';
 import { readProfile, writeAtomicReport } from '../src/integrations/local-files.ts';
 import { GoogleSheetsBoundary, upsertSheetRow, type SheetAdapter } from '../src/integrations/google-sheets.ts';
-import { createSaveJobWorkflow } from '../src/workflows/save-job.ts';
-import { isRestartableWorkflowSnapshot } from '../src/workflows/run-selection.ts';
 import { parseCommand, createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 import { assertOperationalDatabaseUrl, resolveRuntimeConfig } from '../src/config/runtime.ts';
 import { createTelegramPollingTransport } from '../src/channels/telegram-transport.ts';
+import { analyzeJob } from '../src/agents/agent.ts';
 
 test('one career_jobs table deduplicates transport events and has minimal statuses', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-'));
@@ -22,6 +21,24 @@ test('one career_jobs table deduplicates transport events and has minimal status
   assert.equal(store.enqueue(input).duplicate, true);
   assert.deepEqual(store.statuses(), ['queued', 'running', 'needs_input', 'succeeded', 'failed']);
   store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('one Career Copilot agent owns memory and all career tools', async () => {
+  const module = await import('../src/agents/agent.ts');
+  const create = (module as { createCareerAgent?: (options: Record<string, unknown>) => { getMemory: () => Promise<unknown>; listTools: () => Promise<Record<string, unknown>> | Record<string, unknown> } }).createCareerAgent;
+  assert.equal(typeof create, 'function');
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const agent = create!({ store, reportsRoot: dir, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} } });
+  assert.ok(await agent.getMemory()); assert.deepEqual(Object.keys(await agent.listTools()).sort(), ['job-queue', 'job-status', 'save-job']);
+  store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('analysis avoids provider-native response_format', async () => {
+  let options: unknown;
+  const expected = { schemaVersion: 1 as const, title: 'title', company: 'company', location: 'remote', summary: 'summary', fitScore: 1, nextStep: 'next' };
+  const result = await analyzeJob({ generate: async (_prompt: unknown, received: unknown) => { options = received; return { object: expected }; } } as never, 'job', 'profile');
+  assert.equal((options as { structuredOutput?: { jsonPromptInjection?: unknown } }).structuredOutput?.jsonPromptInjection, 'inline');
+  assert.deepEqual(result, expected);
 });
 
 test('bounded acquisition validates redirects, content type, and decoded size', async () => {
@@ -65,87 +82,112 @@ test('commands are deterministic and owner-only', async () => {
   assert.deepEqual(parseCommand('/job job-1'), { kind: 'job', jobId: 'job-1' });
   assert.deepEqual(parseCommand('/queue'), { kind: 'queue' });
   assert.equal(parseCommand('save this job'), null);
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']) });
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), respond: async () => 'unused' });
   const replies: string[] = [];
   const rejected = await runtime.handleTelegramUpdate({ update_id: 1, message: { message_id: 1, date: 1, chat: { id: 2, type: 'private' }, from: { id: 9 }, text: '/queue' } }, (text) => { replies.push(text); return Promise.resolve(); });
   assert.equal(rejected.outcome, 'rejected');
   assert.equal(replies.length, 0);
 });
 
-test('authorized save completes through a fake adapter and stores before notification', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-e2e-'));
-  const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const replies: string[] = [];
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async (job) => { store.complete(job.jobId, { summary: 'done', reportPath: '/safe/report.md', sheetReference: job.jobId }, '/safe/report.md', job.jobId); } });
-  const result = await runtime.handleTelegramUpdate({ update_id: 2, message: { message_id: 2, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/save https://linkedin.com/jobs/1' } }, (text) => { replies.push(text); return Promise.resolve(); });
-  assert.equal(result.outcome, 'accepted'); assert.equal(runtime.store.get((result as { jobId: string }).jobId)?.userId, '1');
-  for (let i = 0; i < 20 && replies.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.deepEqual(replies, [`Accepted job ${(result as { jobId: string }).jobId}.`, 'done']);
-  await new Promise((resolve) => setTimeout(resolve, 0));
-  assert.ok(store.get((result as { jobId: string }).jobId)?.notifiedAt);
-  runtime.close(); await rm(dir, { recursive: true, force: true });
+test('agent responder binds Telegram turns to persistent owner memory and trusted context', async () => {
+  const module = await import('../src/services/career-runtime.ts');
+  const create = (module as { createAgentResponder?: (agent: unknown, ownerId: string) => (turn: Record<string, string>) => Promise<string> }).createAgentResponder;
+  assert.equal(typeof create, 'function'); let received: Record<string, unknown> | undefined;
+  const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received = options; return { text: 'remembered' }; } }, 'owner');
+  assert.equal(await respond({ text: 'My profile details', userId: '1', chatId: '2', transportEventId: '70' }), 'remembered');
+  assert.deepEqual(received?.memory, { resource: 'owner', thread: 'telegram:2' });
+  const context = received?.requestContext as { get: (key: string) => unknown }; assert.equal(context.get('ownerId'), 'owner'); assert.equal(context.get('userId'), '1'); assert.equal(context.get('chatId'), '2'); assert.equal(context.get('transportEventId'), '70');
 });
 
-test('save schedules processing before an acknowledgement can fail', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-ack-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async (job) => { store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: null }, '', job.jobId); } });
+test('career tools reject caller-forged request context', async () => {
+  const module = await import('../src/tools/career-context.ts').catch(() => ({})); const schema = (module as { careerToolContextSchema?: { safeParse: (value: unknown) => { success: boolean } }; careerToolCapability?: unknown }).careerToolContextSchema; const capability = (module as { careerToolCapability?: unknown }).careerToolCapability;
+  assert.ok(schema); assert.equal(schema!.safeParse({ ownerId: 'owner', userId: '1', chatId: '2', transportEventId: '3', capability: {} }).success, false); assert.equal(schema!.safeParse({ ownerId: 'owner', userId: '1', chatId: '2', transportEventId: '3', capability }).success, true);
+});
+
+test('runtime routes save prompts and profile replies through one conversational agent', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-conversation-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const turns: Array<{ text: string; userId: string; chatId: string; transportEventId: string }> = []; const replies: string[] = [];
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { turns.push(turn); return turns.length === 1 ? 'Please share your profile.' : 'Thanks, I will continue.'; } });
+  const update = (id: number, text: string) => ({ update_id: id, message: { message_id: id, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text } });
+  assert.equal((await runtime.handleTelegramUpdate(update(70, '/save https://linkedin.com/jobs/70'), async (text) => { replies.push(text); })).outcome, 'accepted');
+  assert.equal((await runtime.handleTelegramUpdate(update(71, 'I am a GenAI engineer with five years of experience.'), async (text) => { replies.push(text); })).outcome, 'accepted');
+  assert.match(turns[0].text, /save this job/i); assert.match(turns[0].text, /https:\/\/linkedin\.com\/jobs\/70/); assert.equal(turns[1].text, 'I am a GenAI engineer with five years of experience.');
+  assert.deepEqual(turns.map(({ userId, chatId, transportEventId }) => ({ userId, chatId, transportEventId })), [{ userId: '1', chatId: '2', transportEventId: '70' }, { userId: '1', chatId: '2', transportEventId: '71' }]);
+  assert.deepEqual(replies, ['Please share your profile.', 'Thanks, I will continue.']); runtime.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('durable agent work remains stored when its Telegram reply fails', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-ack-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-ack', userId: turn.userId, ownerId: 'owner', chatId: turn.chatId, transportEventId: turn.transportEventId, originalUrl: 'https://linkedin.com/jobs/30', canonicalUrl: 'https://linkedin.com/jobs/30' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
   await assert.rejects(() => runtime.handleTelegramUpdate({ update_id: 30, message: { message_id: 30, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/save https://linkedin.com/jobs/30' } }, async () => { throw new Error('telegram unavailable'); }));
-  for (let i = 0; i < 20 && store.list('succeeded').length === 0; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(store.list('succeeded').length, 1); runtime.close(); await rm(dir, { recursive: true, force: true });
+  assert.equal(store.get('job-ack')?.status, 'succeeded'); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('job lookup includes the stored safe completion summary', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-job-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  store.enqueue({ jobId: 'job-summary', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'event-summary', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' }); store.complete('job-summary', { summary: 'safe summary', reportPath: '/safe/report.md', sheetReference: 'job-summary' }, '/safe/report.md', 'job-summary');
-  const replies: string[] = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store });
-  await runtime.handleTelegramUpdate({ update_id: 31, message: { message_id: 31, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/job job-summary' } }, (text) => { replies.push(text); return Promise.resolve(); });
-  assert.match(replies[0], /safe summary/); runtime.close(); await rm(dir, { recursive: true, force: true });
-});
-
-test('failed processors persist a safe failure and queued jobs continue after the active job', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-runtime-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const updates = (id: number, url: string) => ({ update_id: id, message: { message_id: id, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: `/save ${url}` } });
-  let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); const processed: string[] = [];
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async (job) => { processed.push(job.jobId); if (processed.length === 1) { await gate; throw new Error('provider secret=do-not-store'); } store.complete(job.jobId, { summary: 'done', reportPath: null, sheetReference: null }, '', job.jobId); } });
-  const first = await runtime.handleTelegramUpdate(updates(3, 'https://linkedin.com/jobs/1')); const second = await runtime.handleTelegramUpdate(updates(4, 'https://linkedin.com/jobs/2'));
-  release();
-  for (let i = 0; i < 50 && processed.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 5));
-  assert.equal(store.get((first as { jobId: string }).jobId)?.status, 'failed'); assert.match(store.get((first as { jobId: string }).jobId)?.safeError ?? '', /processing failed/i); assert.doesNotMatch(store.get((first as { jobId: string }).jobId)?.safeError ?? '', /secret|do-not-store/);
-  assert.equal(store.get((second as { jobId: string }).jobId)?.status, 'succeeded'); runtime.close(); await rm(dir, { recursive: true, force: true });
+test('successful Telegram reply marks the completed agent job notified', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-notified-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = store.enqueue({ jobId: 'job-notified', userId: turn.userId, ownerId: 'owner', chatId: turn.chatId, transportEventId: turn.transportEventId, originalUrl: 'https://linkedin.com/jobs/notified', canonicalUrl: 'https://linkedin.com/jobs/notified' }).job; store.markRunning(job.jobId, 'agent-run'); store.complete(job.jobId, { summary: 'stored', reportPath: null, sheetReference: job.jobId }, '', job.jobId); return 'stored'; } });
+  await runtime.handleTelegramUpdate({ update_id: 32, message: { message_id: 32, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'save my job' } }, async () => {});
+  assert.ok(store.get('job-notified')?.notifiedAt); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('notification failure leaves stored success for one restart retry', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-notify-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
   const queued = store.enqueue({ jobId: 'job-notify', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'event-notify', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' });
   store.markRunning(queued.job.jobId, 'run-1'); store.complete(queued.job.jobId, { summary: 'stored', reportPath: null, sheetReference: null }, '', 'job-notify');
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store }); let attempts = 0;
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => 'unused' }); let attempts = 0;
   await runtime.recoverUnfinished(async () => { attempts++; throw new Error('telegram unavailable'); });
   assert.equal(store.get('job-notify')?.status, 'succeeded'); assert.equal(store.get('job-notify')?.notifiedAt, null);
   await runtime.recoverUnfinished(async () => { attempts++; }); assert.equal(attempts, 2); runtime.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('recovery resumes unfinished work through the same conversational agent', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-recovery-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  store.enqueue({ jobId: 'agent-recovery', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'recovery-event', originalUrl: 'https://linkedin.com/jobs/recovery', canonicalUrl: 'https://linkedin.com/jobs/recovery' });
+  const turns: Array<Record<string, unknown>> = []; const replies: Array<[string, string | undefined]> = [];
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { turns.push(turn); store.markRunning('agent-recovery', 'agent-run'); store.complete('agent-recovery', { summary: 'Recovered.', reportPath: null, sheetReference: 'agent-recovery' }, '', 'agent-recovery'); return 'Recovered.'; } });
+  await runtime.recoverUnfinished(async (text, chatId) => { replies.push([text, chatId]); });
+  assert.equal(turns[0].resumeJobId, 'agent-recovery'); assert.match(String(turns[0].text), /resume saving/i); assert.deepEqual(replies, [['Recovered.', '2']]);
+  runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('recovery delivers completion to the job chat', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-recovery-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
   store.enqueue({ jobId: 'job-recovery', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'event-recovery', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' });
   store.markRunning('job-recovery', 'run-1'); store.complete('job-recovery', { summary: 'recovered', reportPath: null, sheetReference: null }, '', 'job-recovery');
-  const delivered: Array<[string, string]> = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store });
+  const delivered: Array<[string, string]> = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => 'unused' });
   await runtime.recoverUnfinished((text, chatId) => { delivered.push([chatId ?? '', text]); return Promise.resolve(); });
   assert.deepEqual(delivered, [['2', 'recovered']]); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('workflow rejects an unbound input before acquisition and Sheets effects', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-workflow-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let acquired = false; let sheeted = false;
-  const workflow = createSaveJobWorkflow({ store, reportsRoot: dir, profileText: 'profile', acquire: async () => { acquired = true; return { contentType: 'text/plain', text: 'job' }; }, analyze: async () => ({ schemaVersion: 1, title: 'title', company: 'company', location: 'remote', summary: 'summary', fitScore: 1, nextStep: 'next' }), report: async () => ({ path: '/tmp/report.md', hash: 'sha256:x' }), sheet: { async findByJobId() { return null; }, async write() { sheeted = true; } } });
-  const run = await workflow.createRun(); const originalError = console.error; console.error = () => {};
-  let result; try { result = await run.start({ inputData: { jobId: 'unbound', userId: '1', ownerId: 'owner', chatId: 'chat', transportEventId: 'event', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' } }); } finally { console.error = originalError; }
-  assert.equal(result.status, 'failed'); assert.equal(acquired, false); assert.equal(sheeted, false); store.close(); await rm(dir, { recursive: true, force: true });
+test('single-agent save operation persists before completing the full pipeline', async () => {
+  const module = await import('../src/tools/save-job-tool.ts').catch(() => ({}));
+  const execute = (module as { executeSaveJob?: (options: Record<string, unknown>) => Promise<{ jobId: string; summary: string }> }).executeSaveJob;
+  assert.equal(typeof execute, 'function');
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-save-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>(); const events: string[] = []; let persistedBeforeAcquire = false;
+  const input = { jobId: 'agent-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'agent-event', originalUrl: 'https://linkedin.com/jobs/agent', canonicalUrl: 'https://linkedin.com/jobs/agent' };
+  const result = await execute!({ input, profileContext: 'GenAI engineer with five years of experience.', store, reportsRoot: dir, acquire: async () => { persistedBeforeAcquire = store.get(input.jobId)?.status === 'running'; return { contentType: 'text/plain', text: 'GenAI role' }; }, analyze: async () => ({ schemaVersion: 1, title: 'GenAI Engineer', company: 'Example', location: 'Remote', summary: 'Good fit.', fitScore: 90, nextStep: 'Apply.' }), sheet: { async findByJobId(id: string) { return rows.get(id) ?? null; }, async write(row: Record<string, unknown>) { rows.set(String(row.jobId), row); } }, observe: (_level: string, event: string) => { events.push(event); } });
+  assert.equal(persistedBeforeAcquire, true); assert.equal(result.jobId, input.jobId); assert.match(result.summary, /GenAI Engineer/); assert.equal(store.get(input.jobId)?.status, 'succeeded'); assert.equal(rows.get(input.jobId)?.status, 'succeeded'); assert.deepEqual(events, ['job.queued', 'job.started', 'job.succeeded']);
+  store.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('any non-success workflow result fails the durable job', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-workflow-status-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  store.enqueue({ jobId: 'job-status', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'event-status', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' });
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async () => ({ status: 'suspended' }) });
-  await runtime.recoverUnfinished(async () => {}); assert.equal(store.get('job-status')?.status, 'failed'); runtime.close(); await rm(dir, { recursive: true, force: true });
+test('duplicate transport events continue with the persisted job identity', async () => {
+  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-duplicate-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>();
+  store.enqueue({ jobId: 'persisted-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'duplicate-event', originalUrl: 'https://linkedin.com/jobs/duplicate', canonicalUrl: 'https://linkedin.com/jobs/duplicate' });
+  const result = await executeSaveJob({ input: { jobId: 'new-random-id', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'duplicate-event', originalUrl: 'https://linkedin.com/jobs/duplicate', canonicalUrl: 'https://linkedin.com/jobs/duplicate' }, profileContext: 'profile', store, reportsRoot: dir, acquire: async () => ({ contentType: 'text/plain', text: 'job' }), analyze: async () => ({ schemaVersion: 1, title: 'Title', company: 'Company', location: 'Remote', summary: 'Summary', fitScore: 1, nextStep: 'Apply' }), sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } } });
+  assert.equal(result.jobId, 'persisted-job'); assert.equal(store.get('persisted-job')?.status, 'succeeded'); assert.equal(store.get('new-random-id'), null); store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('single-agent save persists only a redacted failure', async () => {
+  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-failure-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let sheeted = false;
+  const input = { jobId: 'failed-agent-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'failed-agent-event', originalUrl: 'https://linkedin.com/jobs/fail', canonicalUrl: 'https://linkedin.com/jobs/fail' };
+  await assert.rejects(() => executeSaveJob({ input, profileContext: 'profile', store, reportsRoot: dir, acquire: async () => { throw new Error('provider secret=do-not-store'); }, analyze: async () => { throw new Error('unreachable'); }, sheet: { findByJobId: async () => null, write: async () => { sheeted = true; } } }), /Job processing failed/);
+  assert.equal(store.get(input.jobId)?.status, 'failed'); assert.doesNotMatch(store.get(input.jobId)?.safeError ?? '', /secret|do-not-store/); assert.equal(sheeted, false); store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('single-agent save is not broken by observability failures', async () => {
+  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-observe-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>(); const input = { jobId: 'observed-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'observed-event', originalUrl: 'https://linkedin.com/jobs/observe', canonicalUrl: 'https://linkedin.com/jobs/observe' };
+  const result = await executeSaveJob({ input, profileContext: 'profile', store, reportsRoot: dir, acquire: async () => ({ contentType: 'text/plain', text: 'job' }), analyze: async () => ({ schemaVersion: 1, title: 'Title', company: 'Company', location: 'Remote', summary: 'Summary', fitScore: 1, nextStep: 'Apply' }), sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } }, observe: () => { throw new Error('logger unavailable'); } });
+  assert.equal(result.jobId, input.jobId); assert.equal(store.get(input.jobId)?.status, 'succeeded'); store.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('Sheets updates existing rows using their declared header order', async () => {
@@ -182,6 +224,12 @@ test('readProfile ingests only visible markdown and text files and rejects unsaf
   await rm(dir, { recursive: true, force: true });
 });
 
+test('runtime data directory is owner-only because memory stores personal context', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-memory-permissions-')); await (await import('node:fs/promises')).chmod(dir, 0o755);
+  resolveRuntimeConfig({ env: {}, dataDir: dir }); const mode = (await (await import('node:fs/promises')).stat(dir)).mode & 0o777;
+  assert.equal(mode, 0o700); await rm(dir, { recursive: true, force: true });
+});
+
 test('deployment config requires one Telegram principal and Sheets credentials', () => {
   const env = { CAREER_COPILOT_OWNER_RESOURCE_ID: 'owner', TELEGRAM_BOT_TOKEN: 'token', TELEGRAM_ALLOWED_USER_IDS: '1,2', CAREER_COPILOT_PRIVATE_CHAT_IDS: '2', GOOGLE_SHEETS_SPREADSHEET_ID: 'sheet', GOOGLE_OAUTH_CLIENT_ID: 'id', GOOGLE_OAUTH_CLIENT_SECRET: 'secret', GOOGLE_OAUTH_REFRESH_TOKEN: 'refresh' };
   assert.throws(() => resolveRuntimeConfig({ env, requireDeployment: true }), /exactly one/);
@@ -192,26 +240,23 @@ test('deployment config requires one Telegram principal and Sheets credentials',
 test('recovery rejects revoked persisted Telegram users before effects', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-revoke-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
   store.enqueue({ jobId: 'job-revoke', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'event-revoke', originalUrl: 'https://linkedin.com/jobs/1', canonicalUrl: 'https://linkedin.com/jobs/1' }); let processed = 0;
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['9']), privateChatIds: new Set(['2']), store, processor: async () => { processed++; } }); await runtime.recoverUnfinished(async () => {});
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['9']), privateChatIds: new Set(['2']), store, respond: async () => { processed++; return 'unexpected'; } }); await runtime.recoverUnfinished(async () => {});
   assert.equal(processed, 0); assert.equal(store.get('job-revoke')?.status, 'queued'); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('legacy jobs migrate with null user IDs and fail closed', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-legacy-')); const filename = path.join(dir, 'jobs.db'); const db = new DatabaseSync(filename);
   db.exec(`CREATE TABLE career_jobs (job_id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, chat_id TEXT NOT NULL, transport_event_id TEXT NOT NULL UNIQUE, original_url TEXT NOT NULL, canonical_url TEXT NOT NULL, status TEXT NOT NULL, mastra_run_id TEXT, attempts INTEGER NOT NULL DEFAULT 0, report_path TEXT, sheet_reference TEXT, safe_result TEXT, safe_error TEXT, notified_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT; INSERT INTO career_jobs (job_id,owner_id,chat_id,transport_event_id,original_url,canonical_url,status,created_at,updated_at) VALUES ('legacy','owner','2','legacy-event','https://linkedin.com/jobs/1','https://linkedin.com/jobs/1','queued',1,1);`); db.close();
-  const store = new CareerStore(`file:${filename}`); assert.equal(store.get('legacy')?.userId, null); let processed = 0; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async () => { processed++; } }); await runtime.recoverUnfinished(async () => {});
+  const store = new CareerStore(`file:${filename}`); assert.equal(store.get('legacy')?.userId, null); let processed = 0; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => { processed++; return 'unexpected'; } }); await runtime.recoverUnfinished(async () => {});
   assert.equal(processed, 0); assert.equal(store.get('legacy')?.status, 'queued'); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('live and recovery drains serialize one job without duplication', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-drain-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); let active = 0; let maximum = 0; let calls = 0;
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, processor: async (job) => { calls++; active++; maximum = Math.max(maximum, active); await gate; store.complete(job.jobId, { summary: 'done', reportPath: null, sheetReference: null }, '', job.jobId); active--; } });
-  const live = runtime.handleTelegramUpdate({ update_id: 40, message: { message_id: 40, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/save https://linkedin.com/jobs/40' } }); const recovery = runtime.recoverUnfinished(async () => {}); await new Promise((resolve) => setImmediate(resolve)); release(); await Promise.all([live, recovery]);
-  assert.equal(calls, 1); assert.equal(maximum, 1); runtime.close(); await rm(dir, { recursive: true, force: true });
-});
-
-test('workflow snapshot restartability requires persisted active state', () => {
-  assert.equal(isRestartableWorkflowSnapshot(null), false); assert.equal(isRestartableWorkflowSnapshot({ status: 'running', isFromInMemory: true }), false); assert.equal(isRestartableWorkflowSnapshot({ status: 'running' }), true); assert.equal(isRestartableWorkflowSnapshot({ status: 'pending' }), false); assert.equal(isRestartableWorkflowSnapshot({ status: 'pending', payload: {} }), true); assert.equal(isRestartableWorkflowSnapshot({ status: 'failed' }), false);
+test('conversational turns are serialized for one memory thread', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-turns-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let release!: () => void; const gate = new Promise<void>((resolve) => { release = resolve; }); let active = 0; let maximum = 0; let calls = 0;
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => { calls++; active++; maximum = Math.max(maximum, active); if (calls === 1) await gate; active--; return 'done'; } });
+  const update = (id: number) => ({ update_id: id, message: { message_id: id, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: `turn ${id}` } });
+  const first = runtime.handleTelegramUpdate(update(40)); const second = runtime.handleTelegramUpdate(update(41)); await new Promise((resolve) => setImmediate(resolve)); assert.equal(calls, 1); release(); await Promise.all([first, second]);
+  assert.equal(calls, 2); assert.equal(maximum, 1); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('injected acquisition aborts on the overall timeout', async () => {
@@ -224,17 +269,26 @@ test('Sheets update verification rejects when the stale row remains', async () =
   await assert.rejects(() => boundary.upsert({ jobId: 'stale-job', status: 'succeeded', title: 'New', company: 'New Co', reportPath: '/safe/new.md' }), /could not be verified/);
 });
 
-test('transient enqueue failure does not poison runtime replay state', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-retry-update-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const enqueue = store.enqueue.bind(store); let first = true;
-  store.enqueue = ((input) => { if (first) { first = false; throw new Error('database busy'); } return enqueue(input); }) as typeof store.enqueue;
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store }); const update = { update_id: 50, message: { message_id: 50, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/save https://linkedin.com/jobs/50' } };
-  await assert.rejects(() => runtime.handleTelegramUpdate(update)); const retried = await runtime.handleTelegramUpdate(update); assert.equal(retried.outcome, 'accepted'); runtime.close(); await rm(dir, { recursive: true, force: true });
+test('transient agent failure does not poison runtime replay state', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-retry-update-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let calls = 0;
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => { calls++; if (calls === 1) throw new Error('database busy'); return 'recovered'; } }); const update = { update_id: 50, message: { message_id: 50, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'remember this profile' } };
+  await assert.rejects(() => runtime.handleTelegramUpdate(update)); const retried = await runtime.handleTelegramUpdate(update); assert.equal(retried.outcome, 'accepted'); assert.equal(calls, 2); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('Telegram polling advances offset only after durable handling', async () => {
   const originalFetch = globalThis.fetch; const offsets: number[] = []; let handled = 0; let transport!: ReturnType<typeof createTelegramPollingTransport>;
   globalThis.fetch = async (_input, init) => { const body = JSON.parse(String(init?.body)); offsets.push(body.offset); return new Response(JSON.stringify({ ok: true, result: [{ update_id: 60, message: { message_id: 60, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/queue' } }] }), { headers: { 'content-type': 'application/json' } }); };
   try { transport = createTelegramPollingTransport('bot-token', async () => { handled++; if (handled === 1) throw new Error('database busy'); transport.stop(); }); await transport.start(); assert.deepEqual(offsets.slice(0, 2), [0, 0]); } finally { transport?.stop(); globalThis.fetch = originalFetch; }
+});
+
+test('Telegram polling reports transport failures', async () => {
+  const originalFetch = globalThis.fetch; const events: string[] = [];
+  globalThis.fetch = async () => new Response('conflict', { status: 409 });
+  try {
+    const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level: string, event: string) => { events.push(event); });
+    setTimeout(() => transport.stop(), 20); await transport.start();
+    assert.deepEqual(events, ['telegram.poll.started', 'telegram.poll.failed', 'telegram.poll.stopped']);
+  } finally { globalThis.fetch = originalFetch; }
 });
 
 test('Telegram stop aborts an in-flight long poll', async () => {
@@ -247,4 +301,12 @@ test('Telegram transport can deliver a recovery message before polling', async (
   const originalFetch = globalThis.fetch; const calls: unknown[] = [];
   globalThis.fetch = async (_input, init) => { calls.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ ok: true, result: true }), { headers: { 'content-type': 'application/json' } }); };
   try { const transport = createTelegramPollingTransport('bot-token', async () => {}); await transport.sendMessage('chat-1', 'recovered'); assert.deepEqual(calls, [{ chat_id: 'chat-1', text: 'recovered' }]); transport.stop(); } finally { globalThis.fetch = originalFetch; }
+});
+
+test('local observability exporter only accepts trace events', async () => {
+  const module = await import('../src/observability.ts').catch(() => ({}));
+  const factory = (module as { createTraceStorageExporter?: () => Record<string, unknown> }).createTraceStorageExporter;
+  assert.equal(typeof factory, 'function');
+  const exporter = factory!();
+  assert.equal(typeof exporter.onTracingEvent, 'function'); assert.equal('onMetricEvent' in exporter, false); assert.equal('onLogEvent' in exporter, false);
 });

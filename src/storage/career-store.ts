@@ -64,6 +64,7 @@ export class CareerStore {
     return { job: this.get(value.jobId)!, duplicate: false };
   }
   get(jobId: string): Job | null { const row = this.#db.prepare('SELECT * FROM career_jobs WHERE job_id = ?').get(jobId) as Record<string, unknown> | undefined; return row ? rowToJob(row) : null; }
+  getByTransportEventId(transportEventId: string): Job | null { const row = this.#db.prepare('SELECT * FROM career_jobs WHERE transport_event_id = ?').get(transportEventId) as Record<string, unknown> | undefined; return row ? rowToJob(row) : null; }
   assertRunningInput(input: JobInput): Job {
     const value = JobInputSchema.parse(input); const job = this.get(value.jobId);
     if (!job || job.status !== 'running'
