@@ -68,7 +68,7 @@ export async function acquireJobText(value: string, deps: FetchDeps = {}) {
     const addresses = await publicAddresses(url.hostname, resolve, signal);
     const response = fetcher ? await fetcher(url, { redirect: 'manual', headers: requestHeaders, signal }) : await pinnedFetch(url, addresses[0], limit, timeoutMs, signal);
     if ([301, 302, 303, 307, 308].includes(response.status)) { const location = response.headers.get('location'); if (!location) throw new Error('Redirect response has no location.'); url = assertSameJobSite(original, new URL(location, url).href); continue; }
-    if (!response.ok) throw new Error(`Job fetch failed (${response.status}).`);
+    if (!response.ok) throw Object.assign(new Error(`Job fetch failed (${response.status}).`), { status: response.status });
     const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase(); if (!allowedTypes.has(contentType)) throw new Error('Job response content type is not supported.');
     const text = await bodyText(response, limit, signal); return { url: url.href, contentType, text: text.slice(0, MAX_MODEL_CHARS) };
   }

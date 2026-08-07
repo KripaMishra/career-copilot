@@ -16,8 +16,8 @@ export type JobInput = z.infer<typeof JobInputSchema>;
 
 export const AnalysisSchema = z.object({
   schemaVersion: z.literal(1),
-  title: z.string().trim().max(500),
-  company: z.string().trim().max(500),
+  title: z.string().trim().min(1).max(500),
+  company: z.string().trim().min(1).max(500),
   location: z.string().trim().max(500),
   summary: z.string().trim().min(1).max(8000),
   fitScore: z.number().int().min(0).max(100),

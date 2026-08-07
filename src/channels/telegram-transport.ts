@@ -11,7 +11,7 @@ export function createTelegramPollingTransport(token: string, handle: (update: u
     if (!response.ok) throw Object.assign(new Error('Telegram API request failed.'), { status: response.status });
     const result = await response.json() as TelegramResponse<T>; if (!result.ok) throw new Error('Telegram API request failed.'); return result.result;
   };
-  const sendMessage = async (chatId: string, text: string) => { await call('sendMessage', { chat_id: chatId, text }); };
+  const sendMessage = async (chatId: string, text: string) => { const characters = Array.from(text); for (let start = 0; start < characters.length; start += 4096) await call('sendMessage', { chat_id: chatId, text: characters.slice(start, start + 4096).join('') }); };
   const start = async () => {
     if (!token) return;
     observe('info', 'telegram.poll.started');

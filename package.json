@@ -5,8 +5,8 @@
   "main": "index.js",
   "private": true,
   "scripts": {
-    "dev": "mastra dev --dir src",
-    "build": "mastra build --dir src",
+    "dev": "mastra dev --dir src/mastra",
+    "build": "mastra build --dir src/mastra",
     "start": "mastra start",
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },

@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdirSync, lstatSync, realpathSync, renameSync, writeFileSync, readdirSync, readFileSync, chmodSync } from 'node:fs';
+import { mkdirSync, lstatSync, realpathSync, renameSync, writeFileSync, readdirSync, openSync, readSync, closeSync, chmodSync } from 'node:fs';
 import { dirname, extname, join, relative, resolve } from 'node:path';
 
 function contained(root: string, candidate: string) { const rel = relative(root, candidate); if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || rel.startsWith('/')) throw new Error('Filesystem path resolves outside its guarded root.'); }
@@ -19,7 +19,7 @@ export function readProfile(root: string) {
       if (entry.isSymbolicLink()) throw new Error('symlinked profile files are rejected.');
       if (entry.isDirectory()) { contained(base, realpathSync.native(path)); visit(path); continue; }
       if (!entry.isFile() || !['.md', '.txt'].includes(extname(entry.name)) || /credential|secret|private|token|password|passwd|api[_-]?key|id[_-]?rsa/i.test(entry.name)) throw new Error(`unsupported profile file: ${entry.name}.`);
-      contained(base, realpathSync.native(path)); chmodSync(path, 0o600); const text = readFileSync(path, 'utf8').slice(0, 100_000);
+      contained(base, realpathSync.native(path)); chmodSync(path, 0o600); const buffer = Buffer.allocUnsafe(100_000); const fd = openSync(path, 'r'); let bytesRead: number; try { bytesRead = readSync(fd, buffer, 0, buffer.length, 0); } finally { closeSync(fd); } const text = buffer.toString('utf8', 0, bytesRead);
       if (/-----BEGIN [^-]+-----|(?:api[_ -]?key|password|secret|token)\s*[:=]/i.test(text)) throw new Error('unsafe profile content is rejected.');
       output[relative(base, path)] = text;
     }

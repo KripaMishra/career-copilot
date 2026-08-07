@@ -4,6 +4,7 @@ import { z } from 'zod';
 
 export const SHEETS_SCOPE = 'https://www.googleapis.com/auth/spreadsheets';
 export const TRACKER_HEADERS = ['Job ID', 'Status', 'Title', 'Company', 'Report Path'] as const;
+const REQUEST_TIMEOUT_MS = 15_000;
 export type SheetRow = Record<string, unknown> & { jobId: string };
 export type SheetAdapter = { findByJobId(jobId: string): Promise<SheetRow | null>; write(row: SheetRow): Promise<void> };
 const rowFields = [['jobId', 'Job ID'], ['status', 'Status'], ['title', 'Title'], ['company', 'Company'], ['reportPath', 'Report Path']] as const;
@@ -25,7 +26,7 @@ export class GoogleOAuthRefreshProvider {
   constructor(config: { clientId: string; clientSecret: string; refreshToken: string; scope?: string; tokenUrl?: string }) { this.config = config; }
   async getAccessToken() {
     if (!this.config.clientId || !this.config.clientSecret || !this.config.refreshToken) throw new Error('Google OAuth reauthorization is required.');
-    const response = await fetch(this.config.tokenUrl ?? 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: this.config.clientId, client_secret: this.config.clientSecret, refresh_token: this.config.refreshToken, grant_type: 'refresh_token' }) });
+    const response = await fetch(this.config.tokenUrl ?? 'https://oauth2.googleapis.com/token', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: this.config.clientId, client_secret: this.config.clientSecret, refresh_token: this.config.refreshToken, grant_type: 'refresh_token' }), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
     if (!response.ok) throw new Error('Google OAuth refresh failed.');
     const result = await response.json() as { access_token?: string; scope?: string };
     if (!result.access_token || !(result.scope ?? '').split(' ').includes(SHEETS_SCOPE)) throw new Error('Google OAuth scope is insufficient.');
@@ -39,7 +40,7 @@ function a1Column(index: number) { let value = ''; for (let current = index + 1;
 export class GoogleSheetsHttpApi implements SheetsApi {
   private readonly baseUrl: string;
   constructor(baseUrl = 'https://sheets.googleapis.com/v4') { this.baseUrl = baseUrl; }
-  private async request(pathname: string, token: string, init: RequestInit = {}) { const response = await fetch(`${this.baseUrl}${pathname}`, { ...init, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...init.headers } }); if (!response.ok) throw new Error(`Google Sheets request failed (${response.status}).`); return response.json() as Promise<Record<string, unknown>>; }
+  private async request(pathname: string, token: string, init: RequestInit = {}) { const response = await fetch(`${this.baseUrl}${pathname}`, { ...init, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json', ...init.headers }, signal: init.signal ?? AbortSignal.timeout(REQUEST_TIMEOUT_MS) }); if (!response.ok) throw new Error(`Google Sheets request failed (${response.status}).`); return response.json() as Promise<Record<string, unknown>>; }
   async verifyTarget(input: { spreadsheetId: string; tab: string; accessToken: string }) { const data = await this.request(`/spreadsheets/${encodeURIComponent(input.spreadsheetId)}?includeGridData=false&fields=spreadsheetId,sheets(properties(title))`, input.accessToken) as { spreadsheetId?: string; sheets?: Array<{ properties?: { title?: string } }> }; if (data.spreadsheetId !== input.spreadsheetId || !data.sheets?.some((sheet) => sheet.properties?.title === input.tab)) throw new Error('Google Sheets target mismatch.'); }
   async readHeaders(input: { spreadsheetId: string; tab: string; accessToken: string }) { const data = await this.request(`/spreadsheets/${encodeURIComponent(input.spreadsheetId)}/values/${encodeURIComponent(input.tab)}?majorDimension=ROWS`, input.accessToken) as { values?: unknown[][] }; return (data.values?.[0] ?? []).map(String); }
   async readRows(input: { spreadsheetId: string; tab: string; accessToken: string }) { const data = await this.request(`/spreadsheets/${encodeURIComponent(input.spreadsheetId)}/values/${encodeURIComponent(input.tab)}`, input.accessToken) as { values?: unknown[][] }; const values = data.values ?? []; const headers = (values[0] ?? []).map(String); return values.slice(1).map((row) => Object.fromEntries(headers.map((header, i) => [header, row[i] ?? '']))); }

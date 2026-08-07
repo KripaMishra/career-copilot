@@ -1,17 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CareerStore } from '../src/storage/career-store.ts';
 import { acquireJobText, normalizeResponseStatus, validateJobUrl } from '../src/tools/web-fetch-tool.ts';
 import { readProfile, writeAtomicReport } from '../src/integrations/local-files.ts';
-import { GoogleSheetsBoundary, upsertSheetRow, type SheetAdapter } from '../src/integrations/google-sheets.ts';
+import { GoogleOAuthRefreshProvider, GoogleSheetsBoundary, GoogleSheetsHttpApi, upsertSheetRow, type SheetAdapter } from '../src/integrations/google-sheets.ts';
 import { parseCommand, createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 import { assertOperationalDatabaseUrl, resolveRuntimeConfig } from '../src/config/runtime.ts';
 import { createTelegramPollingTransport } from '../src/channels/telegram-transport.ts';
 import { analyzeJob } from '../src/agents/agent.ts';
+import { AnalysisSchema } from '../src/contracts/v0.ts';
 
 test('one career_jobs table deduplicates transport events and has minimal statuses', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-v0-'));
@@ -309,4 +310,46 @@ test('local observability exporter only accepts trace events', async () => {
   assert.equal(typeof factory, 'function');
   const exporter = factory!();
   assert.equal(typeof exporter.onTracingEvent, 'function'); assert.equal('onMetricEvent' in exporter, false); assert.equal('onLogEvent' in exporter, false);
+});
+
+test('runtime rejects a Mastra database outside its protected data directory', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-db-root-'));
+  assert.throws(() => resolveRuntimeConfig({ env: {}, dataDir: path.join(dir, 'data'), databaseUrl: `file:${path.join(dir, 'outside.db')}` }), /protected data directory/);
+  assert.equal(resolveRuntimeConfig({ env: {}, dataDir: path.join(dir, 'data'), databaseUrl: `file:${path.join(dir, 'data', 'inside.db')}` }).databaseUrl, `file:${path.join(dir, 'data', 'inside.db')}`);
+  await writeFile(path.join(dir, 'outside.db'), ''); await symlink(path.join(dir, 'outside.db'), path.join(dir, 'data', 'linked.db'));
+  assert.throws(() => resolveRuntimeConfig({ env: {}, dataDir: path.join(dir, 'data'), databaseUrl: `file:${path.join(dir, 'data', 'linked.db')}` }), /protected data directory/);
+  await rm(dir, { recursive: true, force: true });
+});
+
+test('transient HTTP responses retain their status for save retries', async () => {
+  await assert.rejects(() => acquireJobText('https://linkedin.com/jobs/retry', { fetch: async () => new Response('', { status: 429 }), resolve: async () => ['93.184.216.34'] }), (error: unknown) => (error as { status?: number }).status === 429);
+  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-http-retry-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); let attempts = 0; const rows = new Map<string, Record<string, unknown>>();
+  await executeSaveJob({ input: { jobId: 'retry-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'retry-event', originalUrl: 'https://linkedin.com/jobs/retry', canonicalUrl: 'https://linkedin.com/jobs/retry' }, profileContext: 'profile', store, reportsRoot: dir, acquire: async () => { attempts++; if (attempts === 1) throw Object.assign(new Error('Job fetch failed (429).'), { status: 429 }); return { contentType: 'text/plain', text: 'job' }; }, analyze: async () => ({ schemaVersion: 1, title: 'Title', company: 'Company', location: '', summary: 'Summary', fitScore: 1, nextStep: 'Apply' }), sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } } });
+  assert.equal(attempts, 2); store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('Google HTTP requests have bounded abort signals', async () => {
+  const originalFetch = globalThis.fetch; const signals: AbortSignal[] = [];
+  globalThis.fetch = async (_input, init) => { signals.push(init?.signal as AbortSignal); return new Response(JSON.stringify(signals.length === 1 ? { access_token: 'token', scope: 'https://www.googleapis.com/auth/spreadsheets' } : {}), { headers: { 'content-type': 'application/json' } }); };
+  try { await new GoogleOAuthRefreshProvider({ clientId: 'id', clientSecret: 'secret', refreshToken: 'refresh' }).getAccessToken(); await new GoogleSheetsHttpApi('https://example.test').verifyTarget({ spreadsheetId: 'sheet', tab: 'tab', accessToken: 'token' }).catch(() => undefined); assert.equal(signals.length, 2); assert.ok(signals.every(Boolean)); } finally { globalThis.fetch = originalFetch; }
+});
+
+test('Telegram splits messages at its 4096-character limit', async () => {
+  const originalFetch = globalThis.fetch; const texts: string[] = [];
+  globalThis.fetch = async (_input, init) => { texts.push(JSON.parse(String(init?.body)).text); return new Response(JSON.stringify({ ok: true, result: true }), { headers: { 'content-type': 'application/json' } }); };
+  try { await createTelegramPollingTransport('token', async () => {}).sendMessage('chat', 'x'.repeat(4097)); assert.deepEqual(texts.map((text) => text.length), [4096, 1]); } finally { globalThis.fetch = originalFetch; }
+});
+
+test('profile reads at most 100000 bytes per file', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-profile-limit-')); await writeFile(path.join(dir, 'profile.txt'), 'x'.repeat(100_001));
+  assert.equal(readProfile(dir)['profile.txt'].length, 100_000); await rm(dir, { recursive: true, force: true });
+});
+
+test('analysis rejects blank title and company fields', () => {
+  const base = { schemaVersion: 1, title: 'Title', company: 'Company', location: '', summary: 'Summary', fitScore: 1, nextStep: 'Apply' };
+  assert.equal(AnalysisSchema.safeParse({ ...base, title: '   ' }).success, false); assert.equal(AnalysisSchema.safeParse({ ...base, company: '' }).success, false);
+});
+
+test('Mastra registrations live in the mandated entrypoint', async () => {
+  const source = await readFile(new URL('../src/mastra/index.ts', import.meta.url), 'utf8'); assert.match(source, /new Mastra\s*\(/);
 });
