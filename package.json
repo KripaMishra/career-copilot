@@ -8,9 +8,7 @@
     "dev": "mastra dev --dir src",
     "build": "mastra build --dir src",
     "start": "mastra start",
-    "test": "node --experimental-strip-types --test test/*.test.ts",
-    "oauth:google": "node --experimental-strip-types scripts/google-oauth.ts",
-    "sheets:setup": "node --experimental-strip-types scripts/google-sheets-setup.ts"
+    "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -20,15 +18,8 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
-    "@ai-sdk/google": "3.0.103",
-    "@chat-adapter/telegram": "4.35.0",
-    "@mastra/agent-browser": "0.4.1",
     "@mastra/core": "1.52.1",
-    "@mastra/duckdb": "1.5.1",
-    "@mastra/editor": "0.13.9",
     "@mastra/libsql": "1.17.0",
-    "@mastra/memory": "1.24.0",
-    "@mastra/observability": "1.16.2",
     "zod": "4.4.3"
   },
   "devDependencies": {

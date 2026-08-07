@@ -1,171 +1,28 @@
-import fs from 'node:fs';
-import path from 'node:path';
-
-export type RuntimeEnvironment = Record<string, string | undefined>;
-
-export type RuntimeConfigInput = {
-  dataDir?: string;
-  databaseUrl?: string;
-  profileDir?: string;
-  reportsDir?: string;
-  topicsDir?: string;
-  requireDeployment?: boolean;
-  env?: RuntimeEnvironment;
-};
-
-export type RuntimeConfig = {
-  dataDir: string;
-  workspacePath: string;
-  profilePath: string;
-  reportsPath: string;
-  topicsPath: string;
-  databaseUrl: string;
-  owner: {
-    resourceId: string;
-    intakeHashKey: string;
-    enabled: boolean;
-    authorizationRevision: number;
-    studioEnabled: boolean;
-    stdioEnabled: boolean;
-    apiIdentity?: string;
-  };
-  telegram: {
-    botToken: string;
-    secretToken?: string;
-    allowedUserIds: ReadonlySet<string>;
-    privateChatIds: ReadonlySet<string>;
-  };
-  sheetsTarget: {
-    spreadsheetId: string;
-    trackerTab: string;
-    auditTab: string;
-    topicsTab: string;
-  };
-  sheetsOAuth: {
-    clientId: string;
-    clientSecret: string;
-    refreshToken: string;
-    scope: string;
-  };
-};
-
-export function assertOperationalDatabaseUrl(databaseUrl: string): string {
-  let url: URL;
-  try {
-    url = new URL(databaseUrl);
-  } catch {
-    throw new Error('MASTRA_DATABASE_URL must use one absolute local file: database URL.');
-  }
-  if (
-    !databaseUrl.startsWith('file:/')
-    || url.protocol !== 'file:'
-    || (url.hostname !== '' && url.hostname !== 'localhost')
-    || !path.isAbsolute(url.pathname)
-    || url.pathname === '/:memory:'
-    || url.search !== ''
-    || url.hash !== ''
-  ) throw new Error('MASTRA_DATABASE_URL must use one absolute local file: database URL.');
-  return databaseUrl;
+import { mkdirSync } from 'node:fs';
+import { resolve, join, isAbsolute } from 'node:path';
+import { assertSafeWorkspaceRoots } from '../integrations/local-files.ts';
+import { SHEETS_SCOPE } from '../integrations/google-sheets.ts';
+export type RuntimeConfig = { dataDir: string; databaseUrl: string; profilePath: string; reportsPath: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> }; sheetsTarget: { spreadsheetId: string; trackerTab: string; auditTab: string; topicsTab: string }; sheetsOAuth: { clientId: string; clientSecret: string; refreshToken: string; scope: string } };
+type Input = { env?: Record<string, string | undefined>; dataDir?: string; databaseUrl?: string; profileDir?: string; reportsDir?: string; requireDeployment?: boolean };
+function ids(value: string | undefined, name: string, deployment: boolean) {
+  if (!value?.trim()) { if (deployment) throw new Error(`${name} is required.`); return new Set<string>(); }
+  const values = value.split(',').map((item) => item.trim());
+  if (values.some((item) => !/^\d+$/.test(item))) throw new Error(`${name} must contain numeric IDs.`);
+  const result = new Set(values); if (deployment && result.size !== 1) throw new Error(`${name} must contain exactly one ID.`); return result;
 }
-
-function numericIds(value: string | undefined, name: string, required: boolean) {
-  if (!value?.trim()) {
-    if (required) throw new Error(`${name} is required.`);
-    return new Set<string>();
-  }
-  const ids = value.split(',').map((id) => id.trim());
-  if (ids.some((id) => !/^\d+$/.test(id))) throw new Error(`${name} must contain numeric IDs.`);
-  return new Set(ids);
-}
-
-function requiredValue(env: RuntimeEnvironment, name: string) {
-  const value = env[name]?.trim();
-  if (!value) throw new Error(`${name} is required.`);
+function required(env: Record<string, string | undefined>, name: string) { const value = env[name]?.trim(); if (!value) throw new Error(`${name} is required.`); return value; }
+export function assertOperationalDatabaseUrl(value: string) {
+  let url: URL; try { url = new URL(value); } catch { throw new Error('Database URL must be an absolute local file URL.'); }
+  if (!value.startsWith('file:/') || url.protocol !== 'file:' || (url.hostname && url.hostname !== 'localhost') || !isAbsolute(url.pathname) || url.search || url.hash || url.username || url.password) throw new Error('Database URL must be an absolute local file URL.');
   return value;
 }
-
-function assertNonOverlappingRoots(profile: string, reports: string, topics: string) {
-  const roots = [profile, reports, topics].map((root) => path.resolve(root));
-  for (let i = 0; i < roots.length; i += 1) {
-    for (let j = i + 1; j < roots.length; j += 1) {
-      const relative = path.relative(roots[i], roots[j]);
-      if (!relative || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))) {
-        throw new Error('Profile, report, and topic roots must not overlap.');
-      }
-    }
-  }
-}
-
-export function resolveRuntimeConfig(input: RuntimeConfigInput = {}): RuntimeConfig {
-  const env = input.env ?? process.env;
-  const requireDeployment = input.requireDeployment === true;
-  const configuredDatabaseUrl = input.databaseUrl ?? env.MASTRA_DATABASE_URL;
-  if (requireDeployment && !configuredDatabaseUrl) throw new Error('MASTRA_DATABASE_URL is required.');
-
-  const dataDir = input.dataDir ?? env.MASTRA_DATA_DIR ?? path.join(process.cwd(), '.mastra', 'career-copilot');
-  const absoluteDataDir = path.resolve(dataDir);
-  fs.mkdirSync(absoluteDataDir, { recursive: true });
-
-  if (requireDeployment && !input.profileDir && !env.CAREER_COPILOT_PROFILE_DIR) throw new Error('CAREER_COPILOT_PROFILE_DIR is required.');
-  if (requireDeployment && !input.reportsDir && !env.CAREER_COPILOT_REPORTS_DIR) throw new Error('CAREER_COPILOT_REPORTS_DIR is required.');
-  if (requireDeployment && !input.topicsDir && !env.CAREER_COPILOT_TOPICS_DIR) throw new Error('CAREER_COPILOT_TOPICS_DIR is required.');
-  const profilePath = path.resolve(input.profileDir ?? env.CAREER_COPILOT_PROFILE_DIR ?? path.join(dataDir, 'profile'));
-  const reportsPath = path.resolve(input.reportsDir ?? env.CAREER_COPILOT_REPORTS_DIR ?? path.join(dataDir, 'reports'));
-  const topicsPath = path.resolve(input.topicsDir ?? env.CAREER_COPILOT_TOPICS_DIR ?? path.join(dataDir, 'topics'));
-  assertNonOverlappingRoots(profilePath, reportsPath, topicsPath);
-  fs.mkdirSync(reportsPath, { recursive: true });
-  fs.mkdirSync(topicsPath, { recursive: true });
-
-  const databaseUrl = assertOperationalDatabaseUrl(
-    configuredDatabaseUrl ?? `file:${path.join(absoluteDataDir, 'mastra.db')}`,
-  );
-  const spreadsheetId = requireDeployment
-    ? requiredValue(env, 'GOOGLE_SHEETS_SPREADSHEET_ID')
-    : env.GOOGLE_SHEETS_SPREADSHEET_ID ?? '';
-  const trackerTab = requireDeployment ? requiredValue(env, 'GOOGLE_SHEETS_TRACKER_TAB') : env.GOOGLE_SHEETS_TRACKER_TAB ?? 'Applications';
-  const auditTab = requireDeployment ? requiredValue(env, 'GOOGLE_SHEETS_APPLICATION_LOG_TAB') : env.GOOGLE_SHEETS_APPLICATION_LOG_TAB ?? 'Application Log';
-  const topicsTab = requireDeployment ? requiredValue(env, 'GOOGLE_SHEETS_TOPICS_TAB') : env.GOOGLE_SHEETS_TOPICS_TAB ?? 'Topics';
-  const botToken = requireDeployment ? requiredValue(env, 'TELEGRAM_BOT_TOKEN') : env.TELEGRAM_BOT_TOKEN ?? '';
-  const resourceId = requiredValue(env, 'CAREER_COPILOT_OWNER_RESOURCE_ID');
-  if (!/^[A-Za-z0-9_.:-]{1,200}$/.test(resourceId)) throw new Error('CAREER_COPILOT_OWNER_RESOURCE_ID is invalid.');
-  const intakeHashKey = requiredValue(env, 'CAREER_COPILOT_INTAKE_HASH_KEY');
-  if (Buffer.byteLength(intakeHashKey, 'utf8') < 32) throw new Error('CAREER_COPILOT_INTAKE_HASH_KEY must contain at least 32 bytes.');
-  const apiIdentity = env.CAREER_COPILOT_API_IDENTITY?.trim();
-  if (apiIdentity && !/^[A-Za-z0-9_.:@-]{1,200}$/.test(apiIdentity)) throw new Error('CAREER_COPILOT_API_IDENTITY is invalid.');
-  const authorizationRevision = Number(env.CAREER_COPILOT_AUTHORIZATION_REVISION ?? '1');
-  if (!Number.isSafeInteger(authorizationRevision) || authorizationRevision < 0) throw new Error('CAREER_COPILOT_AUTHORIZATION_REVISION must be a non-negative integer.');
-  const owner = {
-    resourceId,
-    intakeHashKey,
-    enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false',
-    authorizationRevision,
-    studioEnabled: env.CAREER_COPILOT_STUDIO_ENABLED !== 'false',
-    stdioEnabled: env.CAREER_COPILOT_STDIO_ENABLED !== 'false',
-    ...(apiIdentity ? { apiIdentity } : {}),
-  };
-  const allowedUserIds = numericIds(env.TELEGRAM_ALLOWED_USER_IDS, 'TELEGRAM_ALLOWED_USER_IDS', requireDeployment);
-  const privateChatIds = numericIds(env.CAREER_COPILOT_PRIVATE_CHAT_IDS, 'CAREER_COPILOT_PRIVATE_CHAT_IDS', requireDeployment);
-  const sheetsOAuth = {
-    clientId: requireDeployment ? requiredValue(env, 'GOOGLE_OAUTH_CLIENT_ID') : env.GOOGLE_OAUTH_CLIENT_ID ?? '',
-    clientSecret: requireDeployment ? requiredValue(env, 'GOOGLE_OAUTH_CLIENT_SECRET') : env.GOOGLE_OAUTH_CLIENT_SECRET ?? '',
-    refreshToken: requireDeployment ? requiredValue(env, 'GOOGLE_OAUTH_REFRESH_TOKEN') : env.GOOGLE_OAUTH_REFRESH_TOKEN ?? '',
-    scope: env.GOOGLE_OAUTH_SCOPE ?? 'https://www.googleapis.com/auth/spreadsheets',
-  };
-
-  if (requireDeployment && !trackerTab) throw new Error('GOOGLE_SHEETS_TRACKER_TAB is required.');
-  if (requireDeployment && !auditTab) throw new Error('GOOGLE_SHEETS_APPLICATION_LOG_TAB is required.');
-  if (requireDeployment && !topicsTab) throw new Error('GOOGLE_SHEETS_TOPICS_TAB is required.');
-
-  return {
-    dataDir: absoluteDataDir,
-    workspacePath: path.join(absoluteDataDir, 'workspace'),
-    profilePath,
-    reportsPath,
-    topicsPath,
-    databaseUrl,
-    owner,
-    telegram: { botToken, secretToken: env.TELEGRAM_WEBHOOK_SECRET_TOKEN, allowedUserIds, privateChatIds },
-    sheetsTarget: { spreadsheetId, trackerTab, auditTab, topicsTab },
-    sheetsOAuth,
-  };
+export function resolveRuntimeConfig(input: Input = {}): RuntimeConfig {
+  const env = input.env ?? process.env; const requiredDeployment = input.requireDeployment === true; const dataDir = resolve(input.dataDir ?? env.MASTRA_DATA_DIR ?? join(process.cwd(), '.mastra', 'career-copilot')); mkdirSync(dataDir, { recursive: true });
+  const databaseUrl = assertOperationalDatabaseUrl(input.databaseUrl ?? env.MASTRA_DATABASE_URL ?? `file:${join(dataDir, 'mastra.db')}`); const ownerId = requiredDeployment ? required(env, 'CAREER_COPILOT_OWNER_RESOURCE_ID') : (env.CAREER_COPILOT_OWNER_RESOURCE_ID ?? 'career-owner-v0');
+  const profilePath = resolve(input.profileDir ?? env.CAREER_COPILOT_PROFILE_DIR ?? join(dataDir, 'profile')); const reportsPath = resolve(input.reportsDir ?? env.CAREER_COPILOT_REPORTS_DIR ?? join(dataDir, 'reports')); const topicsPath = resolve(join(dataDir, 'topics')); mkdirSync(reportsPath, { recursive: true }); assertSafeWorkspaceRoots(profilePath, reportsPath, topicsPath);
+  const allowedUserIds = ids(env.TELEGRAM_ALLOWED_USER_IDS, 'TELEGRAM_ALLOWED_USER_IDS', requiredDeployment);
+  const privateChatIds = ids(env.CAREER_COPILOT_PRIVATE_CHAT_IDS, 'CAREER_COPILOT_PRIVATE_CHAT_IDS', requiredDeployment);
+  const sheetsTarget = { spreadsheetId: requiredDeployment ? required(env, 'GOOGLE_SHEETS_SPREADSHEET_ID') : (env.GOOGLE_SHEETS_SPREADSHEET_ID ?? ''), trackerTab: env.GOOGLE_SHEETS_TRACKER_TAB ?? 'Applications', auditTab: env.GOOGLE_SHEETS_APPLICATION_LOG_TAB ?? 'Application Log', topicsTab: env.GOOGLE_SHEETS_TOPICS_TAB ?? 'Topics' };
+  const sheetsOAuth = { clientId: requiredDeployment ? required(env, 'GOOGLE_OAUTH_CLIENT_ID') : (env.GOOGLE_OAUTH_CLIENT_ID ?? ''), clientSecret: requiredDeployment ? required(env, 'GOOGLE_OAUTH_CLIENT_SECRET') : (env.GOOGLE_OAUTH_CLIENT_SECRET ?? ''), refreshToken: requiredDeployment ? required(env, 'GOOGLE_OAUTH_REFRESH_TOKEN') : (env.GOOGLE_OAUTH_REFRESH_TOKEN ?? ''), scope: SHEETS_SCOPE };
+  return { dataDir, databaseUrl, profilePath, reportsPath, owner: { resourceId: ownerId, enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false' }, telegram: { botToken: requiredDeployment ? required(env, 'TELEGRAM_BOT_TOKEN') : (env.TELEGRAM_BOT_TOKEN ?? ''), allowedUserIds, privateChatIds }, sheetsTarget, sheetsOAuth };
 }

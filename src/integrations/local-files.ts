@@ -1,119 +1,27 @@
-import crypto from 'node:crypto';
-import fs from 'node:fs';
-import path from 'node:path';
-import type { CareerJob } from '../services/career-copilot.ts';
+import { createHash, randomBytes } from 'node:crypto';
+import { mkdirSync, lstatSync, realpathSync, renameSync, writeFileSync, readdirSync, readFileSync, chmodSync } from 'node:fs';
+import { dirname, extname, join, relative, resolve } from 'node:path';
 
-function realRoot(root: string): string {
-  const absolute = path.resolve(root);
-  if (fs.lstatSync(absolute).isSymbolicLink()) throw new Error('Symlinked workspace roots are rejected.');
-  return fs.realpathSync.native(absolute);
+function contained(root: string, candidate: string) { const rel = relative(root, candidate); if (rel === '..' || rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) || rel.startsWith('/')) throw new Error('Filesystem path resolves outside its guarded root.'); }
+function safeRoot(root: string) { const abs = resolve(root); mkdirSync(abs, { recursive: true, mode: 0o700 }); if (lstatSync(abs).isSymbolicLink()) throw new Error('Symlinked report roots are rejected.'); chmodSync(abs, 0o700); return realpathSync.native(abs); }
+export function writeAtomicReport(root: string, jobId: string, content: string) {
+  const base = safeRoot(root); const filename = `${jobId.replace(/[^A-Za-z0-9_.-]/g, '_')}.md`; const path = join(base, filename); contained(base, path);
+  const temp = join(base, `.${filename}.${process.pid}.${randomBytes(5).toString('hex')}.tmp`); writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 }); renameSync(temp, path);
+  return { path, hash: `sha256:${createHash('sha256').update(content).digest('hex')}` };
 }
-
-function assertContained(root: string, candidate: string) {
-  const relative = path.relative(root, candidate);
-  if (relative.startsWith(`..${path.sep}`) || relative === '..' || path.isAbsolute(relative)) {
-    throw new Error('Filesystem path resolves outside its guarded root.');
-  }
-}
-
-export function assertSafeWorkspaceRoots(profile: string, reports: string, topics: string): void {
-  const roots = [profile, reports, topics].map((root) => {
-    const absolute = path.resolve(root);
-    return fs.existsSync(absolute) ? fs.realpathSync.native(absolute) : absolute;
-  });
-  for (let i = 0; i < roots.length; i += 1) {
-    for (let j = i + 1; j < roots.length; j += 1) {
-      const a = path.relative(roots[i], roots[j]);
-      const b = path.relative(roots[j], roots[i]);
-      if (!a || !b || (!a.startsWith(`..${path.sep}`) && a !== '..') || (!b.startsWith(`..${path.sep}`) && b !== '..')) {
-        throw new Error('Filesystem roots must not overlap.');
-      }
+export function assertSafeWorkspaceRoots(profile: string, reports: string, topics: string) { const roots = [profile, reports, topics].map((root) => resolve(root)); for (let i = 0; i < roots.length; i++) for (let j = i + 1; j < roots.length; j++) { if (roots[i] === roots[j] || roots[i].startsWith(`${roots[j]}/`) || roots[j].startsWith(`${roots[i]}/`)) throw new Error('Filesystem roots must not overlap.'); } }
+export function readProfile(root: string) {
+  const base = safeRoot(root); const output: Record<string, string> = {};
+  const visit = (dir: string) => {
+    chmodSync(dir, 0o700);
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const path = join(dir, entry.name); if (entry.name.startsWith('.')) throw new Error('Hidden profile files are rejected.');
+      if (entry.isSymbolicLink()) throw new Error('symlinked profile files are rejected.');
+      if (entry.isDirectory()) { contained(base, realpathSync.native(path)); visit(path); continue; }
+      if (!entry.isFile() || !['.md', '.txt'].includes(extname(entry.name)) || /credential|secret|private|token|password|passwd|api[_-]?key|id[_-]?rsa/i.test(entry.name)) throw new Error(`unsupported profile file: ${entry.name}.`);
+      contained(base, realpathSync.native(path)); chmodSync(path, 0o600); const text = readFileSync(path, 'utf8').slice(0, 100_000);
+      if (/-----BEGIN [^-]+-----|(?:api[_ -]?key|password|secret|token)\s*[:=]/i.test(text)) throw new Error('unsafe profile content is rejected.');
+      output[relative(base, path)] = text;
     }
-  }
-}
-
-function assertRegularFileInside(root: string, file: string) {
-  const stat = fs.lstatSync(file);
-  if (stat.isSymbolicLink()) throw new Error('Symlinked profile files are rejected.');
-  const resolved = fs.realpathSync.native(file);
-  assertContained(root, resolved);
-  if (!stat.isFile()) throw new Error('Profile path must contain regular files only.');
-}
-
-function atomicWrite(file: string, content: string) {
-  const temp = `${file}.${process.pid}.${crypto.randomBytes(6).toString('hex')}.tmp`;
-  fs.writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 });
-  fs.renameSync(temp, file);
-}
-
-class ApprovedProfileBoundary {
-  private readonly root: string;
-  constructor(root: string) {
-    this.root = realRoot(root);
-  }
-
-  async readApproved(): Promise<Record<string, string>> {
-    const output: Record<string, string> = {};
-    const visit = (directory: string) => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const candidate = path.join(directory, entry.name);
-        if (entry.isDirectory()) {
-          if (entry.isSymbolicLink()) throw new Error('Symlinked profile directories are rejected.');
-          assertContained(this.root, fs.realpathSync.native(candidate));
-          visit(candidate);
-        } else {
-          assertRegularFileInside(this.root, candidate);
-          output[path.relative(this.root, candidate)] = fs.readFileSync(candidate, 'utf8');
-        }
-      }
-    };
-    visit(this.root);
-    return output;
-  }
-}
-
-class PrivateReportBoundary {
-  private readonly root: string;
-  constructor(root: string) { this.root = realRoot(root); }
-
-  async write(input: { job: CareerJob; profile: Record<string, unknown> }): Promise<{ hash: string; path: string }> {
-    const content = [
-      `URL: ${input.job.url}`,
-      `Company: ${input.job.company ?? ''}`,
-      `Title: ${input.job.title ?? ''}`,
-      `Location: ${input.job.location ?? ''}`,
-      `Description: ${input.job.description ?? ''}`,
-      `Approved profile sources: ${Object.keys(input.profile).sort().join(', ')}`,
-    ].join('\n');
-    const hash = crypto.createHash('sha256').update(content).digest('hex');
-    const file = path.join(this.root, `${hash}.md`);
-    assertContained(this.root, file);
-    atomicWrite(file, content);
-    return { hash, path: file };
-  }
-}
-
-class SharedTopicBoundary {
-  private readonly root: string;
-  constructor(root: string) { this.root = realRoot(root); }
-
-  async write(input: { job: CareerJob }): Promise<void> {
-    const file = path.join(this.root, 'topics.jsonl');
-    assertContained(this.root, file);
-    const records = fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean) : [];
-    records.push(JSON.stringify({ url: input.job.url, company: input.job.company ?? '', title: input.job.title ?? '', location: input.job.location ?? '' }));
-    atomicWrite(file, `${records.join('\n')}\n`);
-  }
-}
-
-export function createCareerFilesystemBoundaries(roots: { profile: string; reports: string; topics: string }) {
-  assertSafeWorkspaceRoots(roots.profile, roots.reports, roots.topics);
-  if (!fs.existsSync(roots.profile)) throw new Error('Approved profile root does not exist.');
-  fs.mkdirSync(roots.reports, { recursive: true });
-  fs.mkdirSync(roots.topics, { recursive: true });
-  return {
-    profile: new ApprovedProfileBoundary(roots.profile),
-    report: new PrivateReportBoundary(roots.reports),
-    topic: new SharedTopicBoundary(roots.topics),
-  };
+  }; visit(base); return output;
 }
