@@ -13,6 +13,7 @@ src/mastra/public/
 .vercel
 *.duckdb
 *.duckdb.wal
+.local-data/
 
 # Local agent configuration
 .agents/
