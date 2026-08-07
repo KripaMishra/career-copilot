@@ -20,6 +20,8 @@
   "dependencies": {
     "@mastra/core": "1.52.1",
     "@mastra/libsql": "1.17.0",
+    "@mastra/memory": "1.26.0",
+    "@mastra/observability": "1.16.5",
     "zod": "4.4.3"
   },
   "devDependencies": {
