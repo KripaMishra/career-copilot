@@ -1,5 +1,6 @@
 output.txt
 node_modules
+pnpm-lock.yaml
 dist
 .mastra
 src/mastra/public/
@@ -12,3 +13,8 @@ src/mastra/public/
 .vercel
 *.duckdb
 *.duckdb.wal
+.local-data/
+
+# Local agent configuration
+.agents/
+.claude/

@@ -1,62 +1,67 @@
-# career-copilot
+# Career Copilot V0
 
-A personal career assistant built with [Mastra](https://mastra.ai) for finding relevant jobs, personalizing resumes and application materials, and completing browser-assisted applications.
+A local, single-owner conversational Career Copilot built around one Mastra agent with persistent memory and tools:
 
-## Features
+```text
+conversation or /save → profile context → bounded fetch → structured analysis → atomic report → verified Sheets row
+```
 
-- A project-level `workspace/` for files and command execution
-- Approval gates for file changes, deletions, and shell commands
-- Conversation memory, generated thread titles, and task tracking
-- Job discovery and role matching
-- Resume and application personalization without inventing qualifications
-- Approval before application submission or other irreversible actions
-- OpenCode Go inference
-- Google Gemini web search and direct web page fetching
-- Recurring schedules that persist across restarts
-- Local libSQL storage and DuckDB observability, with optional Turso storage
-- A bundled Mastra skill that helps coding agents use current Mastra APIs
+## Run
 
-## Get started
-
-Set `OPENCODE_API_KEY` and `GOOGLE_GENERATIVE_AI_API_KEY` in `.env` or in your environment. Agent inference uses OpenCode Go.
-
-Then run:
-
-```shell
+```bash
+npm install
+cp .env.example .env
 npm run dev
 ```
 
-Open [http://localhost:4111](http://localhost:4111) in your browser to access [Mastra Studio](https://mastra.ai/docs/studio/overview).
+Configure `MASTRA_DATABASE_URL` as an absolute local `file:` URL, owner identity, Telegram allowlists, profile/report paths, model credentials, and Google Sheets OAuth/target values. The tracker header row must contain unique `Job ID`, `Status`, `Title`, `Company`, and `Report Path` columns; extra columns are preserved. Never commit `.env` or profile data. Direct fetch is the only V0 acquisition path; browser acquisition is intentionally deferred.
 
-Select **Career Copilot** in Mastra Studio and try one of these prompts:
+Every authorized private-chat message goes to the same agent and memory thread. `/save <url>` is a prompt shortcut, not a separate execution path; requests such as “save this job” can invoke the same tool. `/job [job-id]` and `/queue` are conversational shortcuts for the agent's status tools.
 
-- `Find software engineering roles that match my experience.`
-- `Tailor my resume for this job description without inventing qualifications.`
-- `Help me complete this application and ask before submitting it.`
+When the agent asks for personal context, reply normally in Telegram—do not use another slash command. It remembers profile facts and continues the pending save. You may also place owner-only `.md` or `.txt` profile files in `CAREER_COPILOT_PROFILE_DIR`; those are loaded at startup as baseline context. Never send credentials or secrets as profile data.
 
-The agent asks for approval before it changes files or runs commands. When it creates a schedule, it returns an ID that you can use to pause the schedule.
+## Storage and recovery
 
-## Workspace safety
+Application state is one `career_jobs` table in the local career database. Mastra stores conversation history and resource-scoped working memory in the configured local Mastra database; the data directory is forced to owner-only permissions because it contains personal context. Reports are owner-readable files under the configured report root; filenames are job-derived and writes use temp-file/atomic-rename. Sheets rows are keyed by immutable job ID and read back after writes. Automatic processing retries are bounded; ambiguous Sheet writes are read back and never blindly retried. Retry a terminal failed job with a new save request; transport-event deduplication prevents replay of one update, not a new owner request. Completion is stored before Telegram notification, with `notifiedAt`; restart retries one unsent completed result. `/job` remains authoritative.
 
-The local filesystem tools stay inside the project-level `workspace/` directory. Shell commands start in that directory, but `LocalSandbox` does not provide operating-system isolation by default. Review command approvals carefully, and do not expose this template through an unauthenticated public server.
+Existing databases are never deleted or reset automatically. Back up/export the local database and report root manually before an intentional owner reset. Telegram messages and Sheets rows require their provider's own deletion procedures.
 
-## Storage
+## Security bounds
 
-The default `file:./mastra.db` database stores agent memory, tasks, and schedules locally. To use Turso, set `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in `.env`.
+Only HTTPS URLs on the explicit supported-host allowlist are accepted. Every redirect is revalidated; credentials, non-default ports, localhost, private/link-local/reserved addresses, DNS failures, unsupported content types, timeouts, oversized decoded bodies, and overlong model input are rejected. Logs and user-visible errors contain safe summaries only.
 
-Recurring schedules continue to use model tokens until you pause them. Ask the agent to pause a schedule with the ID returned by `start_schedule`.
+## Observability
 
-## Making it yours
+The dev terminal emits safe lifecycle events without message text, URLs, profile data, credentials, or fetched pages:
 
-- Edit `src/mastra/agents/agent.ts` to change the model, instructions, memory, workspace, or approval policy.
-- Edit `src/mastra/tools/` to customize web fetching and scheduling.
-- Edit `src/mastra/index.ts` to change storage and observability.
-- Add files or reusable skills under `workspace/` for the agent to use.
+- `telegram.poll.*` and `telegram.update.*` show whether Telegram polling received, rejected, or failed an update.
+- `job.queued`, `job.started`, `job.succeeded`, and `job.failed` follow work by job ID.
+- `recovery.*` and `startup.*` show whether polling was allowed to start.
 
-## Learn more
+Open Mastra Studio at `http://localhost:4111`, then use **Observability → Traces** to inspect agent and tool spans, model calls, status, and duration. Trace inputs, outputs, and error payloads are redacted before local persistence. Metrics are intentionally not configured. For user-visible state, `/job <job-id>` is authoritative and `/queue` lists current jobs.
 
-To learn more about Mastra, visit our [documentation](https://mastra.ai/docs/). If you're new to AI agents, check out our [course](https://mastra.ai/learn) and [YouTube videos](https://youtube.com/@mastra-ai). You can also join our [Discord](https://discord.gg/BTYqqHKUrf) community to get help and share your projects.
+If the agent does not answer, inspect `telegram.update.handled` or `telegram.poll.failed`. A save is durable once `job.queued` appears; correlate later terminal and Studio events using that job ID.
 
-## Deploy to the Mastra platform
+## Development checks
 
-The [Mastra platform](https://projects.mastra.ai) provides two products for deploying and managing AI applications built with the Mastra framework. Learn more in the [Mastra platform documentation](https://mastra.ai/docs/mastra-platform/overview).
+```bash
+npm test
+npm exec tsc -- --noEmit
+npm run build
+```
+
+`npm run build` creates disposable `.mastra/` output; it is not source data and should not be committed.
+
+## Layout
+
+```text
+src/agents/          one conversational memory-enabled Career Copilot agent
+src/channels/        Telegram identity and authorization checks
+src/config/          local runtime configuration
+src/contracts/       minimal Job/Analysis/Result schemas
+src/integrations/    atomic reports and Sheets boundary
+src/services/        Telegram prompt shortcuts and serialized agent turns
+src/storage/         one career_jobs table
+src/tools/           deterministic save tool, URL validation, and bounded direct fetch
+test/                compact V0 acceptance checks
+```
