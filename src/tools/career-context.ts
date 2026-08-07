@@ -4,9 +4,9 @@ import { z } from 'zod';
 export const careerToolCapability = Object.freeze({ careerToolCapability: true });
 export const careerToolContextSchema = z.object({
   ownerId: z.string().min(1),
-  userId: z.string().min(1),
-  chatId: z.string().min(1),
-  transportEventId: z.string().min(1),
+  actorId: z.string().min(1),
+  conversationId: z.string().min(1),
+  requestId: z.string().min(1),
   resumeJobId: z.string().min(1).optional(),
   capability: z.custom<object>((value) => value === careerToolCapability, 'Career tool authorization is required.'),
 });

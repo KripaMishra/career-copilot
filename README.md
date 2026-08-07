@@ -16,7 +16,7 @@ npm run dev
 
 Configure `MASTRA_DATABASE_URL` as an absolute local `file:` URL, owner identity, Telegram allowlists, profile/report paths, model credentials, and Google Sheets OAuth/target values. The tracker header row must contain unique `Job ID`, `Status`, `Title`, `Company`, and `Report Path` columns; extra columns are preserved. Never commit `.env` or profile data. Direct fetch is the only V0 acquisition path; browser acquisition is intentionally deferred.
 
-Every authorized private-chat message goes to the same agent and memory thread. `/save <url>` is a prompt shortcut, not a separate execution path; requests such as “save this job” can invoke the same tool. `/job [job-id]` and `/queue` are conversational shortcuts for the agent's status tools.
+Every authorized private-chat message goes to the same agent and memory thread. `/save <url>` is a prompt shortcut, not a separate execution path; requests such as “save this job” can invoke the same tool. `/job [job-id]` and `/queue` are conversational shortcuts for the agent's status tools. Telegram is one ingress adapter, not a tool dependency.
 
 When the agent asks for personal context, reply normally in Telegram—do not use another slash command. It remembers profile facts and continues the pending save. You may also place owner-only `.md` or `.txt` profile files in `CAREER_COPILOT_PROFILE_DIR`; those are loaded at startup as baseline context. Never send credentials or secrets as profile data.
 
@@ -29,6 +29,8 @@ Existing databases are never deleted or reset automatically. Back up/export the 
 ## Security bounds
 
 Only HTTPS URLs on the explicit supported-host allowlist are accepted. Every redirect is revalidated; credentials, non-default ports, localhost, private/link-local/reserved addresses, DNS failures, unsupported content types, timeouts, oversized decoded bodies, and overlong model input are rejected. Logs and user-visible errors contain safe summaries only.
+
+Career tools require a trusted, server-created context containing an authenticated actor, conversation, and request ID. Telegram maps its authenticated update to that context. Future stdio or API adapters must authenticate their caller and create the same context at the ingress boundary; clients must never supply it themselves. Mastra Studio has no authenticated Career Copilot ingress, so its direct tool calls are intentionally denied.
 
 ## Observability
 
