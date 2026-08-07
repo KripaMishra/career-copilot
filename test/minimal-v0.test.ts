@@ -90,14 +90,16 @@ test('commands are deterministic and owner-only', async () => {
   assert.equal(replies.length, 0);
 });
 
-test('agent responder binds Telegram turns to persistent owner memory and trusted context', async () => {
+test('agent responder namespaces transport identities before memory and tools', async () => {
   const module = await import('../src/services/career-runtime.ts');
   const create = (module as { createAgentResponder?: (agent: unknown, ownerId: string) => (turn: Record<string, string>) => Promise<string> }).createAgentResponder;
-  assert.equal(typeof create, 'function'); let received: Record<string, unknown> | undefined;
-  const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received = options; return { text: 'remembered' }; } }, 'owner');
-  assert.equal(await respond({ text: 'My profile details', actorId: 'stdio-owner', conversationId: 'terminal-1', requestId: '70' }), 'remembered');
-  assert.deepEqual(received?.memory, { resource: 'owner', thread: 'conversation:terminal-1' });
-  const context = received?.requestContext as { get: (key: string) => unknown }; assert.equal(context.get('ownerId'), 'owner'); assert.equal(context.get('actorId'), 'stdio-owner'); assert.equal(context.get('conversationId'), 'terminal-1'); assert.equal(context.get('requestId'), '70');
+  assert.equal(typeof create, 'function'); const received: Record<string, unknown>[] = [];
+  const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received.push(options); return { text: 'remembered' }; } }, 'owner');
+  await respond({ text: 'Telegram profile', channel: 'telegram', actorId: '1', conversationId: '2', requestId: '70' });
+  await respond({ text: 'API profile', channel: 'api', actorId: '1', conversationId: '2', requestId: '70' });
+  assert.deepEqual(received.map(({ memory }) => memory), [{ resource: 'owner', thread: 'telegram:2' }, { resource: 'owner', thread: 'api:2' }]);
+  const contexts = received.map(({ requestContext }) => requestContext as { get: (key: string) => unknown });
+  assert.deepEqual(contexts.map((context) => [context.get('actorId'), context.get('conversationId'), context.get('requestId')]), [['telegram:1', 'telegram:2', 'telegram:70'], ['api:1', 'api:2', 'api:70']]);
 });
 
 test('career tools reject caller-forged request context', async () => {
