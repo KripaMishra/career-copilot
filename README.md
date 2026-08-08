@@ -581,9 +581,14 @@ For recovery-sensitive problems, inspect `career.db` only from a backup or while
 
 These are planned changes, not current behavior. Each item requires a written contract and regression coverage before implementation.
 
+### P-1 — Turso Cloud persistence
+
+- [ ] **Move the authoritative databases to a managed Turso Cloud instance.** Replace the local-only LibSQL and `node:sqlite` assumptions with one explicitly owned remote persistence design for Mastra memory/traces and Career Copilot job state. Specify schema migration, encrypted credentials, least-privilege tokens, environment separation, connection and retry limits, transactional guarantees, idempotency, backup/restore, regional placement, retention, observability, local-development behavior, and a tested cutover/rollback procedure that preserves existing `mastra.db` and `career.db` data without duplicate jobs or lost notifications.
+
 ### P0 — Resume privacy boundary
 
 - [ ] **Redact resume data during ingestion.** Define which direct identifiers and sensitive fields are removed, tokenized, or retained before resume text reaches model prompts, memory, traces, logs, or persisted artifacts. Preserve only the career evidence needed for analysis, keep any reversible identity mapping outside model-visible storage, and add canary tests proving raw sensitive values cannot cross those boundaries.
+- [ ] **Fine-tune and self-host a small PII redaction SLM ([#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Use Mastra's `PIIDetector` contract for contextual inference while retaining deterministic secret/regex checks. Train only on synthetic or explicitly licensed data, serve locally through a Mastra-supported provider path, enforce schema-valid output and fail-closed resume ingestion, and release only after per-category privacy, utility, latency, and resource gates pass.
 
 ### P1 — Conversation and memory
 

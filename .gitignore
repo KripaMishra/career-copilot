@@ -18,3 +18,4 @@ src/mastra/public/
 # Local agent configuration
 .agents/
 .claude/
+.pi-subagents/
