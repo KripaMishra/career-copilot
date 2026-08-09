@@ -624,8 +624,8 @@ These are planned changes, not current behavior. Each item requires a written co
 
 ### P0 — Resume privacy boundary
 
-- [ ] **Add fail-closed resume redaction to `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Authorize first, extract pasted text or bounded text-based PDFs in memory, run deterministic and local NER redaction before the ordinary agent/memory path, persist only sanitized drafts, and activate career context only after owner review and explicit confirmation.
-- [ ] **Consume the separately published layered Mastra PII processor ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** The dedicated package repository owns OpenRedaction deterministic checks, local Transformers.js NER, and Mastra `PIIDetector` integration. This repository only consumes a reviewed prerelease; production onboarding remains disabled until both local layers pass privacy, utility, latency, and resource gates.
+- [ ] **Add guided `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Collect structured career context one question at a time, keep active onboarding outside normal Mastra memory, require owner review and explicit confirmation, then activate the versioned profile. Resume paste/upload is intentionally unavailable in this first phase.
+- [ ] **Integrate the separately published layered Mastra PII processor for resume ingestion ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** After OpenRedaction deterministic checks and local Transformers.js NER are benchmarked, consume a reviewed prerelease and enable bounded text/PDF resume ingestion before the ordinary agent path; Mastra `PIIDetector` remains defense-in-depth.
 
 ### P1 — Conversation and memory
 
