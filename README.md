@@ -624,8 +624,8 @@ These are planned changes, not current behavior. Each item requires a written co
 
 ### P0 — Resume privacy boundary
 
-- [ ] **Redact resume data during ingestion.** Define which direct identifiers and sensitive fields are removed, tokenized, or retained before resume text reaches model prompts, memory, traces, logs, or persisted artifacts. Preserve only the career evidence needed for analysis, keep any reversible identity mapping outside model-visible storage, and add canary tests proving raw sensitive values cannot cross those boundaries.
-- [ ] **Fine-tune and self-host a small PII redaction SLM ([#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Use Mastra's `PIIDetector` contract for contextual inference while retaining deterministic secret/regex checks. Train only on synthetic or explicitly licensed data, serve locally through a Mastra-supported provider path, enforce schema-valid output and fail-closed resume ingestion, and release only after per-category privacy, utility, latency, and resource gates pass.
+- [ ] **Add fail-closed resume redaction to `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Authorize first, extract pasted text or bounded text-based PDFs in memory, run deterministic and local NER redaction before the ordinary agent/memory path, persist only sanitized drafts, and activate career context only after owner review and explicit confirmation.
+- [ ] **Consume the separately published layered Mastra PII processor ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** The dedicated package repository owns OpenRedaction deterministic checks, local Transformers.js NER, and Mastra `PIIDetector` integration. This repository only consumes a reviewed prerelease; production onboarding remains disabled until both local layers pass privacy, utility, latency, and resource gates.
 
 ### P1 — Conversation and memory
 
