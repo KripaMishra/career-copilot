@@ -22,7 +22,8 @@ export type TelegramResult = { outcome: 'rejected'; reason: string } | { outcome
 type RecoveryReply = (text: string, chatId?: string) => Promise<void>;
 
 export function createCareerCopilotRuntime(options: RuntimeOptions) {
-  const store = options.store ?? new CareerStore(options.databaseUrl ?? `file:/tmp/career-copilot-${process.pid}.db`);
+  if (!options.store && !options.databaseUrl) throw new Error('Career runtime requires an explicit store or databaseUrl.');
+  const store = options.store ?? new CareerStore(options.databaseUrl!);
   const seenUpdates = new Set<number>(); let recoveryPromise: Promise<void> | null = null; let turnQueue = Promise.resolve(); let active = false;
   const authorized = (userId: string, chatId: string, privateChat: boolean) => (options.ownerEnabled ?? true) && privateChat && options.allowedUserIds.has(userId) && options.privateChatIds.has(chatId);
   const telegramId = (id: string) => id.startsWith('telegram:') ? id.slice(9) : id;
@@ -31,6 +32,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
   const respond = (turn: AgentTurn) => { const result = turnQueue.then(async () => { active = true; try { return await options.respond(turn); } finally { active = false; } }); turnQueue = result.then(() => undefined, () => undefined); return result; };
 
   const handleTelegramUpdate = async (raw: unknown, reply: (text: string) => Promise<void> = async () => {}): Promise<TelegramResult> => {
+    await store.ready();
     try { assertRawTelegramUpdate(raw); } catch { return { outcome: 'rejected', reason: 'invalid_update' }; }
     const message = raw.message ?? raw.edited_message ?? raw.channel_post ?? raw.edited_channel_post; const request = deriveTelegramRequest(raw); const command = parseCommand(message?.text);
     if (!authorized(request.userId, request.chatId, request.isPrivateChat) || request.isBot || request.isEdited || request.isForwarded) return { outcome: 'rejected', reason: 'unauthorized' };
@@ -38,7 +40,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
     if (!message?.text?.trim()) return { outcome: 'rejected', reason: 'invalid_message' };
     const transportEventId = String(raw.update_id); const response = await respond({ text: injectCommand(message.text), channel: 'telegram', actorId: request.userId, conversationId: request.chatId, requestId: transportEventId });
     const scoped = (id: string) => `telegram:${id}`;
-    await reply(response); const completed = store.getByTransportEventId(scoped(transportEventId)) ?? store.getByTransportEventId(transportEventId); if (completed?.status === 'succeeded' && completed.ownerId === options.ownerId && completed.userId !== null && telegramId(completed.userId) === request.userId && telegramId(completed.chatId) === request.chatId) store.markNotified(completed.jobId); seenUpdates.add(raw.update_id);
+    await reply(response); const completed = await store.getByTransportEventId(scoped(transportEventId)) ?? await store.getByTransportEventId(transportEventId); if (completed?.status === 'succeeded' && completed.ownerId === options.ownerId && completed.userId !== null && telegramId(completed.userId) === request.userId && telegramId(completed.chatId) === request.chatId) await store.markNotified(completed.jobId); seenUpdates.add(raw.update_id);
     return { outcome: 'accepted', command: command?.kind ?? 'chat' };
   };
 
@@ -46,20 +48,21 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
     if (recoveryPromise) return recoveryPromise;
     const notify = settings.notify ?? true;
     recoveryPromise = (async () => {
-      const unfinished = store.unfinished(); observe('info', 'recovery.started', { unfinishedJobs: unfinished.length });
+      await store.ready();
+      const unfinished = await store.unfinished(); observe('info', 'recovery.started', { unfinishedJobs: unfinished.length });
       for (const job of unfinished) if (reauthorized(job)) {
         try {
           const response = await respond({ text: `Resume saving the previously persisted job ${job.originalUrl}. Use the save-job tool with the profile context already in memory.`, channel: 'telegram', actorId: telegramId(job.userId!), conversationId: telegramId(job.chatId), requestId: telegramId(job.transportEventId), resumeJobId: job.jobId });
-          if (notify) { const current = store.get(job.jobId); await reply(current?.safeResult?.summary ?? response, telegramId(job.chatId)); if (current?.status === 'succeeded') store.markNotified(job.jobId); }
-        } catch (error) { if (store.get(job.jobId)?.status !== 'succeeded') store.fail(job.jobId, error); observe('error', 'job.failed', { jobId: job.jobId, errorName: error instanceof Error ? error.name : 'UnknownError' }); }
+          if (notify) { const current = await store.get(job.jobId); await reply(current?.safeResult?.summary ?? response, telegramId(job.chatId)); if (current?.status === 'succeeded') await store.markNotified(job.jobId); }
+        } catch (error) { if ((await store.get(job.jobId))?.status !== 'succeeded') await store.fail(job.jobId, error); observe('error', 'job.failed', { jobId: job.jobId, errorName: error instanceof Error ? error.name : 'UnknownError' }); }
       }
       observe('info', 'recovery.completed', { unfinishedJobs: unfinished.length });
       if (!notify) return;
-      for (const job of store.list('succeeded')) if (!job.notifiedAt && reauthorized(job)) {
-        try { await reply(job.safeResult?.summary ?? 'Job completed.', telegramId(job.chatId)); store.markNotified(job.jobId); } catch { observe('warn', 'job.notification.failed', { jobId: job.jobId, recovery: true }); }
+      for (const job of await store.list('succeeded')) if (!job.notifiedAt && reauthorized(job)) {
+        try { await reply(job.safeResult?.summary ?? 'Job completed.', telegramId(job.chatId)); await store.markNotified(job.jobId); } catch { observe('warn', 'job.notification.failed', { jobId: job.jobId, recovery: true }); }
       }
     })().finally(() => { recoveryPromise = null; });
     return recoveryPromise;
   };
-  return { store, handleTelegramUpdate, recoverUnfinished, health: () => ({ configurationValid: Boolean(options.ownerId) && (options.ownerEnabled ?? true), databaseOpen: true, processorRunning: active }), close: () => { if (!options.store) store.close(); } };
+  return { store, handleTelegramUpdate, recoverUnfinished, health: () => ({ configurationValid: Boolean(options.ownerId) && (options.ownerEnabled ?? true), databaseOpen: true, processorRunning: active }), close: async () => { if (!options.store) await store.close(); } };
 }

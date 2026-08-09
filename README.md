@@ -7,7 +7,7 @@ conversation or /save
   → trusted ingress context
   → bounded job fetch
   → structured fit analysis
-  → private Markdown report
+  → private Markdown report row
   → verified Google Sheets row
   → durable completion notification
 ```
@@ -21,15 +21,16 @@ Implemented:
 - one owner and one registered Mastra agent;
 - Telegram private-chat ingress with explicit user and chat allowlists;
 - natural-language career conversation plus `/save`, `/job`, and `/queue` shortcuts;
-- resource-scoped working memory and the last 20 conversation messages;
+- resource-scoped working memory, the last 20 conversation messages, and thread-scoped Observational Memory;
+- one libSQL backend: Turso in production, file-backed locally;
 - synchronous save execution with durable job state;
 - HTTPS-only acquisition from an explicit job-site allowlist;
 - SSRF, redirect, content-type, timeout, and response-size controls;
 - structured model analysis;
-- owner-only atomic Markdown reports;
+- owner-scoped Markdown report rows with stable report IDs;
 - idempotent, read-after-write-verified Google Sheets updates;
 - startup recovery and retry of unsent successful notifications;
-- redacted local Mastra traces and safe lifecycle events.
+- redacted Mastra traces and safe lifecycle events.
 
 Not implemented:
 
@@ -52,33 +53,43 @@ flowchart TD
     MAP --> CTX[Trusted RequestContext]
     CTX --> AGENT[Mastra Career Copilot agent]
 
-    AGENT <--> MEM[(Mastra memory\nmastra.db)]
+    AGENT <--> MEM[(Mastra memory
+messages + working memory + OM)]
     AGENT --> SAVE[save-job tool]
     AGENT --> STATUS[job-status tool]
     AGENT --> QUEUE[job-queue tool]
 
-    SAVE --> JOBS[(career_jobs\ncareer.db)]
+    SAVE --> JOBS[(career_jobs)]
     SAVE --> URL[URL and DNS policy]
     URL --> FETCH[Bounded HTTPS fetch]
     FETCH --> ANALYZE[Structured model analysis]
-    ANALYZE --> REPORT[Atomic private Markdown report]
+    ANALYZE --> REPORT[(career_reports
+Markdown TEXT)]
     REPORT --> SHEETS[Verified Google Sheets upsert]
     SHEETS --> JOBS
 
+    PROFILE[(career_profile_documents
+TEXT)] --> AGENT
+    OBS[Redaction processor] --> TRACES[(Mastra traces)]
+    MEM --> DB[(One libSQL database
+Turso in production / file URL locally)]
+    JOBS --> DB
+    REPORT --> DB
+    PROFILE --> DB
+    TRACES --> DB
     AGENT --> TP
-    OBS[Redaction processor] --> TRACES[(Local Mastra traces\nmastra.db)]
 ```
 
 ### Composition root and startup
 
 `src/mastra/index.ts` is the composition root. Importing it performs the following work:
 
-1. `resolveRuntimeConfig()` validates configuration and creates protected local directories.
-2. `CareerStore` opens `${MASTRA_DATA_DIR}/career.db` and creates or minimally migrates `career_jobs`.
-3. The Google OAuth and Sheets boundaries are constructed.
-4. Profile `.md` and `.txt` files are loaded, joined, and capped at 100,000 characters.
-5. `createCareerAgentKit()` creates the agent and its three tools.
-6. Mastra is created with the agent, LibSQL storage, and local observability.
+1. `resolveRuntimeConfig()` validates one libSQL database URL: local `file:` for development/tests, or Turso `libsql:`/`https:` with `TURSO_AUTH_TOKEN` for production.
+2. `CareerStore` opens the same libSQL database and initializes/migrates `career_jobs`, `career_reports`, and `career_profile_documents`.
+3. Active owner-scoped profile documents are loaded from `career_profile_documents`, joined, and capped at 100,000 characters.
+4. The Google OAuth and Sheets boundaries are constructed.
+5. `createCareerAgentKit()` creates the agent and its three tools with the configured memory model.
+6. Mastra is created with the agent, the same LibSQL/Turso storage, and redacted observability.
 7. The Career Copilot runtime and Telegram long-polling transport are created.
 8. Unfinished jobs are recovered before Telegram polling begins.
 
@@ -95,6 +106,7 @@ The agent uses:
 - model: `CAREER_COPILOT_MODEL`, defaulting to `opencode-go/deepseek-v4-flash`;
 - message history: the last 20 messages;
 - working memory: resource-scoped Career Profile fields;
+- Observational Memory: thread-scoped, using `CAREER_COPILOT_MEMORY_MODEL` or the main model fallback;
 - generation limit: eight steps for a conversation turn;
 - structured analysis: one model step, no tool calls, validated by `AnalysisSchema`.
 
@@ -175,21 +187,21 @@ Natural-language requests such as “save this job” use the same agent and too
 `src/tools/save-job-tool.ts` executes the current save pipeline in order:
 
 1. Validate the trusted `JobInput`.
-2. Combine startup profile files and conversational profile context; reject an empty profile.
+2. Combine active Turso profile documents and conversational profile context; reject an empty profile.
 3. Insert or recover a job by unique `requestId`/`transport_event_id`.
 4. Verify that the persisted owner, actor, conversation, and URLs still match the request.
 5. Return the existing result if the same request already succeeded.
 6. Mark the job `running` and increment its attempt count.
 7. Fetch the canonical job URL.
 8. Ask the agent for schema-constrained analysis with tools disabled.
-9. Write the Markdown report atomically.
-10. Upsert the tracker row and read it back.
-11. Persist the safe result as `succeeded`.
+9. Store the Markdown report as a `career_reports` text row.
+10. Upsert the tracker row using the report ID and read it back.
+11. Persist the safe result as `succeeded` with the report ID.
 12. Reply to Telegram, then set `notified_at`.
 
 Fetch and model-analysis operations retry transient network, timeout, HTTP 408, HTTP 429, and HTTP 5xx failures up to three immediate attempts. A caught pipeline failure becomes terminal `failed` immediately; it is not automatically retried. A second durable processing attempt occurs only when interruption leaves a job `queued` or `running` for startup recovery. After two processing entries, the owner must send a new save request.
 
-Recovery may rewrite the same atomic report path if interruption occurred after report publication but before completion was persisted. Sheet writes are safer: upsert plus read-back reconciliation prevents blind duplicate rows.
+A job is never marked successful before the report row exists and the Sheet write is verified. Sheet writes use upsert plus read-back reconciliation to prevent blind duplicate rows.
 
 A failure is reduced to a safe user-facing category before persistence. Raw fetched pages, profile text, credentials, and internal exception details are not stored in `career_jobs`.
 
@@ -219,29 +231,31 @@ Subdomains are accepted. URLs must use HTTPS and may not contain credentials, a 
 
 Fetched content is untrusted data. The agent instructions explicitly prohibit following instructions found inside it.
 
-### Local files
+### Profile and report text storage
 
-`src/integrations/local-files.ts` owns profile and report filesystem access.
+Production profile and report persistence lives in the configured libSQL/Turso database, not the local filesystem.
 
-Profile rules:
+Tables:
 
-- the profile, reports, and reserved topics roots must not overlap;
-- profile and report roots are created with mode `0700` when first used and may not be symlinks;
-- profile directories and files may not be symlinks;
-- hidden files are rejected;
-- only `.md` and `.txt` files are accepted;
-- secret-looking filenames and secret-looking content are rejected;
-- each profile file is read up to 100,000 bytes;
-- accepted files are forced to mode `0600`.
+| Table | Purpose |
+|---|---|
+| `career_profile_documents` | Owner-scoped active profile documents, stored as text with name, version, SHA-256, byte size, and timestamps |
+| `career_reports` | Markdown reports, stored as text with owner ID, job ID, version, SHA-256, byte size, and timestamp |
+
+Profile document rules:
+
+- owner-scoped reads use active documents only;
+- secret-looking document names are rejected;
+- secret-looking content is rejected before it can reach prompts;
+- joined profile text is capped at 100,000 characters.
 
 Report rules:
 
-- filenames derive from sanitized job IDs;
-- reports are written to a private temporary file with mode `0600`;
-- rename provides atomic publication;
-- the returned metadata includes a SHA-256 content hash.
+- jobs reference stable report IDs;
+- report content is stored before a job can be marked `succeeded`;
+- report rows retain a SHA-256 hash and byte size for integrity checks.
 
-Do not place credentials, tokens, private keys, or passwords in profile files.
+`src/integrations/local-files.ts` remains only for legacy tests and safe one-time import helpers. Do not add a second production report/profile write path.
 
 ### Google Sheets boundary
 
@@ -265,21 +279,21 @@ The configured spreadsheet and tracker tab are verified before use. The applicat
 
 ### Persistence and recovery
 
-The protected data directory contains two SQLite databases with separate responsibilities:
+One libSQL database owns durable backend state.
 
-| File | Owner | Contents |
+| Environment | Database URL | Contents |
 |---|---|---|
-| `mastra.db` | Mastra LibSQL storage | message history, working memory, and local traces |
-| `career.db` | Application `CareerStore` | authoritative job state and delivery marker |
+| Development/test | absolute local `file:` URL inside `MASTRA_DATA_DIR` | Mastra memory/traces, jobs, reports, profile documents |
+| Production | Turso `libsql:`/`https:` URL plus `TURSO_AUTH_TOKEN` | Mastra memory/traces, jobs, reports, profile documents |
 
-`MASTRA_DATABASE_URL` configures `mastra.db`. The application job database is fixed at `${MASTRA_DATA_DIR}/career.db`. Both remain inside the protected data directory; the directory is mode `0700`, and `career.db` is mode `0600`.
+`MASTRA_DATABASE_URL` configures the shared store. Local file URLs must stay inside the protected data directory and cannot use `TURSO_AUTH_TOKEN`. Remote URLs require `TURSO_AUTH_TOKEN`, must be Turso `*.turso.io` hosts, and may not embed credentials, query strings, or fragments.
 
 `career_jobs` stores:
 
 - immutable job, owner, actor, conversation, request, and URL identity;
 - status: `queued`, `running`, `needs_input`, `succeeded`, or `failed`;
 - run correlation and attempt count;
-- report and Sheet references;
+- report ID and Sheet references;
 - safe result or safe error;
 - notification timestamp;
 - creation and update timestamps.
@@ -294,7 +308,30 @@ At startup, recovery is serialized and runs before Telegram polling:
 - notification is marked only after Telegram send succeeds;
 - failed notification never rolls back completed work.
 
-Existing databases are not deleted or reset automatically. There is no built-in backup. Back up `MASTRA_DATA_DIR` and the report root together while the process is stopped.
+Existing local databases and files are never deleted automatically. For cutover, stop the runtime, import the actual legacy formats this repo has used, switch `MASTRA_DATABASE_URL`/`TURSO_AUTH_TOKEN`, start a single writer, and verify owner/thread/job continuity before resuming Telegram polling.
+
+Supported one-time import inputs:
+
+- legacy local `career_jobs` SQLite/libSQL database (`career.db` or `career-copilot.db`), including legacy `report_path` rows;
+- generated Markdown reports under an explicit trusted `--report-dir`; legacy `career_jobs.report_path` values are resolved only inside that root, with safe fallback to `<report-dir>/<jobId>.md` using the same sanitized names as `writeAtomicReport()`;
+- safe `.md`/`.txt` profile files from `--profile-dir`, using the existing `readProfile()` safety checks.
+
+Run the importer after provisioning Turso:
+
+```bash
+TURSO_AUTH_TOKEN="$TURSO_AUTH_TOKEN" npm run import:career -- \
+  --source-db /absolute/path/to/career.db \
+  --target-db "$MASTRA_DATABASE_URL" \
+  --owner-id "$CAREER_COPILOT_OWNER_RESOURCE_ID" \
+  --profile-dir /absolute/path/to/profile \
+  --report-dir /absolute/path/to/reports
+```
+
+The importer reads `TURSO_AUTH_TOKEN` from the environment only so tokens never appear in process argv. It is idempotent: repeated runs skip already-imported jobs, report rows, and profile documents by stable IDs/hashes, but collisions with different owner/transport/report identity or content fail closed. It preserves source files and databases, never deletes local data, and rejects secret-looking profile/report text instead of importing it. Omit `--profile-dir` or `--report-dir` when those local files do not exist.
+
+Roll back before cutover by stopping the runtime and restoring the previous local configuration. Do not run local and Turso writers concurrently.
+
+Turso Free point-in-time recovery is short. If longer recovery matters, schedule periodic Turso exports.
 
 ### Observability and privacy
 
@@ -309,7 +346,7 @@ Synchronous configuration, database, profile, or composition errors occur before
 
 Observability callbacks are isolated so an exporter failure cannot stop job work or Telegram polling.
 
-Mastra traces are stored locally in `mastra.db`. Before export, `redactTracePayloads` removes every span input and output and replaces error details with the error name plus `Operation failed.` Logging inside the observability configuration is disabled.
+Mastra traces are stored in the configured libSQL database. Before export, `redactTracePayloads` removes every span input and output and replaces error details with the error name plus `Operation failed.` Logging inside the observability configuration is disabled.
 
 Open Studio at `http://localhost:4111` during `npm run dev`, then use **Observability → Traces**. Use job IDs to correlate safe lifecycle events. For user-visible operational state, `/job` and `/queue` are authoritative.
 
@@ -337,42 +374,33 @@ cp .env.example .env
 
 Use the scripts in `package.json`; do not invoke `mastra dev` or `mastra build` directly.
 
-### 2. Create private local directories
+### 2. Choose the backend database
 
-Choose absolute, non-overlapping paths:
-
-```bash
-mkdir -p "$HOME/.local/share/career-copilot/profile"
-mkdir -p "$HOME/.local/share/career-copilot/reports"
-chmod 700 "$HOME/.local/share/career-copilot" \
-  "$HOME/.local/share/career-copilot/profile" \
-  "$HOME/.local/share/career-copilot/reports"
-```
-
-Example profile:
+For local development, use one protected local libSQL file:
 
 ```bash
-cat > "$HOME/.local/share/career-copilot/profile/profile.md" <<'PROFILE'
-# Career profile
-
-- Current role: ...
-- Experience: ...
-- Skills: ...
-- Target roles: ...
-- Location/work authorization: ...
-PROFILE
-chmod 600 "$HOME/.local/share/career-copilot/profile/profile.md"
+mkdir -p "$HOME/.local/share/career-copilot"
+chmod 700 "$HOME/.local/share/career-copilot"
 ```
 
-Profile files are optional if the owner supplies enough context conversationally.
+For production, create a Turso database and token instead:
+
+```bash
+turso db create career-copilot
+turso db show --url career-copilot
+turso db tokens create career-copilot
+```
+
+Store Turso credentials only in deployment configuration, never in source. This architecture does not require R2, Supabase, or another payment-method-backed object store.
 
 ### 3. Configure `.env`
 
-Use absolute paths and a matching absolute `file:` URL:
+Local development:
 
 ```dotenv
 MASTRA_DATA_DIR=/home/you/.local/share/career-copilot
-MASTRA_DATABASE_URL=file:/home/you/.local/share/career-copilot/mastra.db
+MASTRA_DATABASE_URL=file:/home/you/.local/share/career-copilot/career-copilot.db
+# TURSO_AUTH_TOKEN must be empty for local file URLs
 
 CAREER_COPILOT_OWNER_RESOURCE_ID=career-owner-v0
 CAREER_COPILOT_OWNER_ENABLED=true
@@ -382,11 +410,9 @@ TELEGRAM_ALLOWED_USER_IDS=123456789
 CAREER_COPILOT_PRIVATE_CHAT_IDS=123456789
 
 CAREER_COPILOT_MODEL=opencode-go/deepseek-v4-flash
+CAREER_COPILOT_MEMORY_MODEL=opencode-go/deepseek-v4-flash
 OPENCODE_API_KEY=replace-me
 # GOOGLE_GENERATIVE_AI_API_KEY=replace-me
-
-CAREER_COPILOT_PROFILE_DIR=/home/you/.local/share/career-copilot/profile
-CAREER_COPILOT_REPORTS_DIR=/home/you/.local/share/career-copilot/reports
 
 GOOGLE_SHEETS_SPREADSHEET_ID=replace-me
 GOOGLE_SHEETS_TRACKER_TAB=Applications
@@ -398,15 +424,25 @@ GOOGLE_OAUTH_REFRESH_TOKEN=replace-me
 GOOGLE_OAUTH_SCOPE=https://www.googleapis.com/auth/spreadsheets
 ```
 
+Production Turso replaces only the database settings:
+
+```dotenv
+MASTRA_DATABASE_URL=libsql://your-db-your-org.turso.io
+TURSO_AUTH_TOKEN=replace-me
+```
+
 Configuration notes:
 
-- `MASTRA_DATABASE_URL` must be an absolute local `file:` URL inside `MASTRA_DATA_DIR`. Remote, relative, in-memory, credential-bearing, query-bearing, and fragment-bearing URLs are rejected.
+- `MASTRA_DATABASE_URL` accepts an absolute local `file:` URL inside `MASTRA_DATA_DIR`, or a remote Turso `libsql:`/`https:` URL.
+- Remote URLs require `TURSO_AUTH_TOKEN`; local file URLs reject it.
+- Database URLs may not contain credentials, query strings, or fragments.
 - `CAREER_COPILOT_OWNER_RESOURCE_ID` is the stable Mastra memory resource ID. Changing it creates a different memory owner.
+- `CAREER_COPILOT_MEMORY_MODEL` controls Observational Memory's Observer/Reflector model and falls back to `CAREER_COPILOT_MODEL`.
 - `CAREER_COPILOT_OWNER_ENABLED=false` disables Telegram authorization and recovery delivery.
 - Telegram ID lists accept comma-separated numeric IDs in development. Production currently requires exactly one user ID and one private chat ID.
 - `GOOGLE_OAUTH_SCOPE` is documented in `.env.example`, but runtime code ignores an environment override and requires the returned OAuth grant to include the Sheets scope. Additional granted scopes do not cause rejection.
 - Set the credential variable required by the selected Mastra model provider.
-- `.env`, `.local-data/`, `.mastra/`, and generated reports must remain untracked.
+- `.env`, `.local-data/`, `.mastra/`, and generated outputs must remain untracked.
 
 ### 4. Prepare Google Sheets
 
@@ -447,8 +483,8 @@ NODE_ENV=production npm start
 2. Send `/save https://www.linkedin.com/jobs/view/...` or a supported-site URL.
 3. Answer one follow-up question if the agent needs more profile context.
 4. Confirm the Telegram reply includes the analysis summary.
-5. Confirm `${CAREER_COPILOT_REPORTS_DIR}/<job-id>.md` exists.
-6. Confirm the Sheet row has the same job ID and report filename.
+5. Confirm the Sheet `Report Path` column contains the report ID for the saved job.
+6. Confirm the report row exists in `career_reports` for that report ID.
 7. Run `/job <job-id>` and `/queue`.
 8. Inspect redacted traces in Studio.
 
@@ -484,6 +520,7 @@ Tests use Node's built-in test runner and TypeScript type stripping. They must n
 | Profile/report filesystem policy | `src/integrations/local-files.ts` |
 | OAuth and Sheets verification | `src/integrations/google-sheets.ts` |
 | Runtime environment validation | `src/config/runtime.ts` |
+| Shared libSQL job/report/profile storage | `src/storage/career-store.ts` |
 | Trace redaction/export | `src/observability.ts` |
 | Shared persisted schemas and safe errors | `src/contracts/v0.ts` |
 | Acceptance and regression coverage | `test/minimal-v0.test.ts` |
@@ -548,12 +585,12 @@ src/channels/telegram-transport.ts Telegram long polling and message delivery
 src/config/runtime.ts           environment, path, and deployment validation
 src/contracts/v0.ts             persisted job, analysis, and safe-result schemas
 src/integrations/google-sheets.ts OAuth, target validation, upsert, and read-back
-src/integrations/local-files.ts profile policy and atomic private reports
+src/integrations/local-files.ts legacy safe-file import/test helpers only
 src/services/career-runtime.ts  command mapping, turn serialization, and recovery
-src/storage/career-store.ts     authoritative career_jobs SQLite store
+src/storage/career-store.ts     shared libSQL jobs, reports, and profile documents
 src/tools/career-context.ts     trusted channel-independent tool capability
 src/tools/job-url.ts            supported-site and URL policy
-src/tools/save-job-tool.ts      synchronous durable save pipeline
+src/tools/save-job-tool.ts      durable save pipeline
 src/tools/web-fetch-tool.ts     bounded DNS-pinned HTTPS acquisition
 src/observability.ts            local trace export and payload redaction
 test/minimal-v0.test.ts         compact acceptance and regression suite
@@ -565,7 +602,7 @@ test/minimal-v0.test.ts         compact acceptance and regression suite
 |---|---|
 | Bot does not respond | `telegram.poll.started`, `telegram.poll.failed`, token, user allowlist, and private-chat allowlist |
 | Update is rejected | `telegram.update.handled` reason; edited, forwarded, bot, channel, malformed, replayed, and non-private messages are rejected |
-| Agent asks for context | Add career facts conversationally or place safe `.md`/`.txt` files in the profile directory |
+| Agent asks for context | Add career facts conversationally or import safe text into `career_profile_documents`; production no longer reads a profile directory |
 | Studio tool call fails authorization | Expected: Studio is not an authenticated Career Copilot ingress |
 | URL is rejected | HTTPS, supported host family, no credentials/port/fragment, public DNS, and same-site redirects |
 | Fetch fails | Content type, 15-second timeout, 1 MB limit, redirects, DNS policy, or remote HTTP status |
@@ -573,9 +610,9 @@ test/minimal-v0.test.ts         compact acceptance and regression suite
 | Sheet may have written before an error | Search by Job ID; the code already performs read-back reconciliation |
 | Telegram notification fails after success | `/job` remains authoritative; restart retries successful rows without `notified_at` |
 | Startup fails in production | All production-required owner, Telegram, Sheets, and OAuth values must be present |
-| Database path is rejected | Use an absolute `file:` URL inside `MASTRA_DATA_DIR` |
+| Database path is rejected | Development/test: use an absolute `file:` URL inside `MASTRA_DATA_DIR`; production: use a Turso `libsql:`/`https:` host plus `TURSO_AUTH_TOKEN` |
 
-For recovery-sensitive problems, inspect `career.db` only from a backup or while the process is stopped. Do not edit rows manually; persisted identity and state checks intentionally fail closed.
+For recovery-sensitive problems, inspect the libSQL database only from a backup or while the process is stopped. Do not edit rows manually; persisted identity and state checks intentionally fail closed.
 
 ## Roadmap
 
@@ -583,7 +620,7 @@ These are planned changes, not current behavior. Each item requires a written co
 
 ### P-1 — Turso Cloud persistence
 
-- [ ] **Move the authoritative databases to a managed Turso Cloud instance.** Replace the local-only LibSQL and `node:sqlite` assumptions with one explicitly owned remote persistence design for Mastra memory/traces and Career Copilot job state. Specify schema migration, encrypted credentials, least-privilege tokens, environment separation, connection and retry limits, transactional guarantees, idempotency, backup/restore, regional placement, retention, observability, local-development behavior, and a tested cutover/rollback procedure that preserves existing `mastra.db` and `career.db` data without duplicate jobs or lost notifications.
+- [x] **Move backend persistence to a single Turso/libSQL database.** Production stores Mastra memory/traces, `career_jobs`, Markdown reports, and profile documents in Turso with local file-backed libSQL retained for development/tests. Remaining operational work is live cutover, scheduled exports, and any future binary artifact store if text rows stop being enough.
 
 ### P0 — Resume privacy boundary
 
@@ -599,4 +636,4 @@ These are planned changes, not current behavior. Each item requires a written co
 ### P1 — Acquisition and artifacts
 
 - [ ] **Add resilient, policy-compliant acquisition fallbacks.** Evaluate self-hosted SearXNG and Firecrawl when direct fetch is blocked or incomplete. Do not implement bot-detection evasion. The design must preserve the supported-site policy, authorization, SSRF and redirect controls, content limits, source attribution, provider terms, privacy guarantees, deterministic fallback order, and auditable failure reasons.
-- [ ] **Make report storage portable and recallable.** Introduce one narrow artifact boundary with the current private local filesystem as the default and an optional cloud-backed implementation. Persist stable artifact IDs rather than provider paths; require owner-scoped authorization, encryption, integrity metadata, versioning, deletion behavior, signed/short-lived retrieval, and an agent tool that can recall a report for owner review without exposing arbitrary storage objects.
+- [ ] **Make report recall user-facing.** Reports now have stable database IDs; add an owner-authorized tool to retrieve a report summary or full Markdown without exposing arbitrary database rows.

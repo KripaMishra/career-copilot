@@ -8,6 +8,7 @@
     "dev": "mastra dev --dir src/mastra",
     "build": "mastra build --dir src/mastra",
     "start": "mastra start",
+    "import:career": "node --experimental-strip-types scripts/import-career-data.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts"
   },
   "keywords": [],
@@ -18,6 +19,7 @@
     "node": ">=22.13.0"
   },
   "dependencies": {
+    "@libsql/client": "^0.17.4",
     "@mastra/core": "1.52.1",
     "@mastra/libsql": "1.17.0",
     "@mastra/memory": "1.26.0",
