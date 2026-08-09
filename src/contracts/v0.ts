@@ -27,6 +27,7 @@ export type Analysis = z.infer<typeof AnalysisSchema>;
 
 export const SafeResultSchema = z.object({
   summary: z.string().trim().min(1).max(4000),
+  reportId: z.string().max(500).nullable(),
   reportPath: z.string().max(2048).nullable(),
   sheetReference: z.string().max(500).nullable(),
 });
@@ -44,6 +45,7 @@ export type Job = Omit<JobInput, 'userId'> & { userId: string | null } & {
   status: JobStatus;
   mastraRunId: string | null;
   attempts: number;
+  reportId: string | null;
   reportPath: string | null;
   sheetReference: string | null;
   safeResult: SafeResult | null;
