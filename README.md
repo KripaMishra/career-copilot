@@ -126,11 +126,8 @@ Registered tools:
 | `save-job` | Fetch, analyze, report, and track one job | Trusted owner, actor, conversation, and request context |
 | `job-status` | Return safe state for one job or the latest job | Owner plus current conversation |
 | `job-queue` | Return up to 100 job IDs and statuses | Owner plus current conversation |
-| `onboarding-status` | Return safe onboarding state and missing fields | Trusted owner, actor, conversation, and request context |
-| `onboarding-save-draft` | Validate and persist a structured onboarding draft with optimistic versioning | Trusted owner, actor, conversation, and request context |
-| `onboarding-complete` | Model-facing compatibility tool that refuses activation; runtime-only confirmation performs completion | Trusted owner, actor, conversation, and request context |
 
-Active guided onboarding is conversational but runtime-authoritative. The runtime blocks unsupported inputs and obvious direct identifiers first, then calls a dedicated no-memory onboarding responder once with tools disabled, validates only its structured `draftPatch`, and stores only `career_onboarding`. The responder may answer clarifications, extract multiple clearly stated fields, or apply corrections, but cannot confirm or activate. Review starts when required fields are complete and the responder marks the draft ready, even if no new patch is needed. In review, exact `confirm`, `cancel`, and `edit <field>: <value>` stay runtime-owned; other review text still goes through the same no-memory responder for conversational clarifications or safe natural-language corrections. Exact runtime-observed `confirm` is the only activation path. The normal memory-enabled agent is not called during active onboarding.
+Active onboarding uses a dedicated no-memory, tool-free responder. The runtime validates draft patches and owns review, edits, cancellation, and confirmation; only exact runtime-observed `confirm` activates the profile.
 
 Outside onboarding, the agent is instructed to ask one concise question when profile context is insufficient, store the pending URL in working memory, and continue after the owner replies; another `/save` should not be required.
 
@@ -357,16 +354,7 @@ Run `npm run dev` and watch the terminal for one-line JSON app events. The app c
 
 Safe fields are allowlisted: event name, phase/status/version/attempt/duration, update/request ID, generated job/report IDs, command/tool name, field keys, and error class. Logs exclude owner/user/chat IDs, message text, URLs, draft/profile values, fetched content, analysis/report content, spreadsheet identifiers, credentials/tokens, and raw error messages/stacks.
 
-Event catalog:
-
-| Area | Events |
-|---|---|
-| Startup/runtime | `runtime.ready`, `startup.recovery.completed`, `startup.failed` |
-| Telegram | `telegram.poll.started`, `telegram.update.received`, `telegram.update.handled`, `telegram.update.accepted`, `telegram.update.rejected`, `telegram.reply.started`, `telegram.reply.sent`, `telegram.reply.failed`, `telegram.poll.failed`, `telegram.poll.stopped` |
-| Commands/agent/tools | `command.received`, `agent.turn.started`, `agent.turn.succeeded`, `agent.turn.failed`, `tool.invoked` |
-| Jobs | `job.queued`, `job.duplicate`, `job.started`, `job.resumed`, `job.phase.started`, `job.phase.succeeded`, `job.phase.failed`, `job.succeeded`, `job.failed` with phases `fetch`, `analysis`, `report`, `sheets`, `complete` |
-| Recovery/notification | `recovery.started`, `recovery.completed`, `job.notification.sent`, `job.notification.failed` |
-| Onboarding | `onboarding.started`, `onboarding.input.blocked`, `onboarding.model.started`, `onboarding.model.succeeded`, `onboarding.model.failed`, `onboarding.draft.saved`, `onboarding.review.ready`, `onboarding.completed`, `onboarding.cancelled` |
+Events cover startup, Telegram, commands, agent/tools, jobs, recovery, notifications, and onboarding. See the [onboarding and logging specification](docs/specs/onboarding-pii-redaction.md#terminal-app-logs) for the required catalog.
 
 Troubleshooting tips:
 

@@ -448,17 +448,11 @@ Requirements:
 
 Add narrow `CareerStore` methods rather than a generic repository abstraction.
 
-### Agent tools and dedicated responder
+### Dedicated responder
 
-Register guarded tools in `src/agents/agent.ts` and `src/mastra/index.ts` for normal trusted agent ingress:
+The composition root injects a dedicated responder around the existing agent/model. The runtime supplies only current structured draft JSON, allowed field definitions, missing fields, state, and the current text. The responder schema contains exactly `reply`, `draftPatch`, and `readyForReview`; it has no tools or confirmation, authorization, activation, owner, chat, user, or memory fields.
 
-1. `onboarding-status` — return safe state and missing fields;
-2. `onboarding-save-draft` — validate and persist sanitized structured profile data;
-3. `onboarding-complete` — retained as a model-facing compatibility tool, but refuses activation because completion is runtime-only.
-
-Active onboarding does not rely on those tools. The composition root injects a dedicated responder around the existing agent/model. The runtime supplies only current structured draft JSON, allowed field definitions, missing fields, state, and the current text. The responder schema contains exactly `reply`, `draftPatch`, and `readyForReview`; it has no confirmation, authorization, activation, owner, chat, user, memory, or tool fields.
-
-All guarded tools use the existing trusted `careerToolContextSchema`; the model never decides authorization or activation. Initial guided onboarding persists only strictly validated structured career fields and does not accept resume text/files. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun deterministic + NER `redactText()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
+The runtime owns authorization and activation. Initial guided onboarding persists only strictly validated structured career fields and does not accept resume text/files. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun deterministic + NER `redactText()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
 
 After completion, profile context must be available immediately. Do not depend on the unused startup `profileText` snapshot. The save path reads current owner-scoped profile text at request time.
 
@@ -499,20 +493,9 @@ Document that Telegram retains uploaded files outside this application's control
 
 ## Career Copilot file map
 
-Expected files to change:
+Expected files for later resume/PII integration:
 
 ```text
-Initial guided onboarding:
-src/contracts/onboarding.ts         onboarding schemas, fields, review text, and input rejection helpers
-src/services/career-runtime.ts      /onboarding command and state routing
-src/storage/career-store.ts         career_onboarding migration and narrow methods
-src/agents/agent.ts                 onboarding instructions and guarded tools
-src/tools/save-job-tool.ts          request-time profile refresh for immediate activation
-test/onboarding.test.ts             focused onboarding regression cases
-test/minimal-v0.test.ts             tool registration expectation
-README.md                           setup, commands, phase boundary, roadmap status
-
-Later resume/PII integration:
 package.json                         consume package prerelease; add PDF parser
 .env.example                        local NER model path/revision and limits
 src/config/runtime.ts               validate PII readiness and ingestion limits
@@ -527,22 +510,14 @@ Create additional focused files only where they remove real coupling, for exampl
 
 ## Implementation sequence
 
-### Track A — Guided Career Copilot onboarding now
-
-- Use the existing `feat/onboarding-v0` checkout.
-- Add onboarding contracts, owner/conversation-scoped state, command routing, guarded tools, dedicated conversational structured responder, review/edit/cancel, explicit confirmation, and atomic profile activation.
-- Keep resume paste/upload and all file ingestion unavailable.
-- Omit normal Mastra memory during active onboarding and prove unconfirmed facts do not influence normal flows.
-- Ship independently of the PII package benchmark.
-
-### Track B — Package deterministic + local NER benchmark
+### Track A — Package deterministic + local NER benchmark
 
 - Implement config validation, safe result types, OpenRedaction lite adapter, local NER, span normalization, merge/redaction, and Mastra processor transformation in `KripaMishra/mastra-pii`.
 - Build the frozen synthetic resume corpus and benchmark at least two Transformers.js-compatible ONNX PII models.
 - Select and pin one model only after per-entity release gates pass.
 - Publish a reviewed prerelease with deterministic + NER local layers.
 
-### Track C — Resume ingestion integration
+### Track B — Resume ingestion integration
 
 - Consume the reviewed package prerelease in Career Copilot.
 - Add bounded resume text/PDF ingestion and ephemeral metadata handling.
@@ -550,7 +525,7 @@ Create additional focused files only where they remove real coupling, for exampl
 - Revalidate every resume-derived draft/profile candidate before Turso writes.
 - Prove raw canaries never enter agent calls, Mastra memory, Turso, traces, logs, or replies.
 
-### Track D — Mastra model layer
+### Track C — Mastra model layer
 
 - Wrap the installed `PIIDetector` without copying internals.
 - Verify independent deterministic-only, NER-only, model-only, and layered configurations.
@@ -571,30 +546,6 @@ Base:   main
 ```
 
 Create a package feature branch/worktree from `main` when package implementation begins. Keep all redaction-engine, model benchmark, and npm release commits in that repository.
-
-### Career Copilot
-
-The onboarding branch/worktree is ready from the current Turso-capable baseline:
-
-```text
-Branch:   feat/onboarding-v0
-Worktree: /home/kripa/Personal/projects/mastra-demo
-Base:     f07929e
-Baseline: 52 tests passed; guided onboarding regression suite now 66 tests
-```
-
-Guided onboarding V1 is implemented without the package. Do not copy or vendor the redaction engine into this worktree; consume a reviewed prerelease only when adding the later resume-ingestion phase.
-
-Before editing:
-
-1. read `AGENTS.md` and load the project Mastra skill;
-2. read this spec, career-copilot issue #10, and mastra-pii issue #1;
-3. use the code-review graph before broad source search;
-4. confirm a clean worktree;
-5. verify exact installed Mastra APIs for guided onboarding; verify OpenRedaction/Transformers.js only during the later package integration;
-6. preserve all trust and persistence invariants in README.
-
-Use one writer per worktree. Package and app changes should be separate PRs; do not publish from an unreviewed app branch.
 
 ## Required tests
 

@@ -227,30 +227,6 @@ test('onboarding completion atomically activates one profile version and rejects
   assert.deepEqual(rows.map((row) => Number(row.active)), [1]);
 }));
 
-test('guarded onboarding tools use trusted capability and conversation scope', async () => withStore(async (store) => {
-  const { createCareerAgentKit } = await import('../src/agents/agent.ts');
-  const { createCareerToolContext } = await import('../src/tools/career-context.ts');
-  const kit = createCareerAgentKit({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} } });
-  assert.deepEqual(Object.keys(kit.tools).sort(), ['job-queue', 'job-status', 'onboarding-complete', 'onboarding-save-draft', 'onboarding-status', 'save-job']);
-  const forged = { get: (key: string) => ({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:1' })[key] };
-  const rejected = await kit.tools['onboarding-status'].execute({}, { requestContext: forged } as never) as { error?: boolean; message?: string };
-  assert.equal(rejected.error, true); assert.match(rejected.message ?? '', /authorization|required|validation/i);
-  const trusted = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:1' });
-  assert.equal((await kit.tools['onboarding-status'].execute({}, { requestContext: trusted } as never)).status, 'not_started');
-}));
-
-test('model-facing completion tool cannot activate onboarding by fabricating confirmation arguments', async () => withStore(async (store) => {
-  const { createCareerAgentKit } = await import('../src/agents/agent.ts');
-  const { createCareerToolContext } = await import('../src/tools/career-context.ts');
-  const started = await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });
-  const review = await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: started.version, draft, status: 'review' });
-  const kit = createCareerAgentKit({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} } });
-  const trusted = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:1' });
-  await assert.rejects(() => kit.tools['onboarding-complete'].execute({ expectedVersion: review.version, confirmation: 'confirm' }, { requestContext: trusted } as never), /runtime-observed owner confirmation/i);
-  assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'review');
-  assert.equal(await store.profileText('owner'), '');
-}));
-
 test('confirmed onboarding profile context is available to save-job immediately without restart', async () => withStore(async (store) => {
   const started = await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });
   const review = await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: started.version, draft, status: 'review' });

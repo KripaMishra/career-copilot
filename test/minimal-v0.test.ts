@@ -82,7 +82,7 @@ test('Career Copilot exposes protected tools only to authenticated ingress', asy
   assert.ok(await agent.getMemory());
   assert.deepEqual(Object.keys(await agent.listTools()), []);
   const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
-  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['job-queue', 'job-status', 'onboarding-complete', 'onboarding-save-draft', 'onboarding-status', 'save-job']);
+  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['job-queue', 'job-status', 'save-job']);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
