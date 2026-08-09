@@ -8,7 +8,7 @@ export const careerToolContextSchema = z.object({
   conversationId: z.string().min(1),
   requestId: z.string().min(1),
   resumeJobId: z.string().min(1).optional(),
-  capability: z.custom<object>((value) => value === careerToolCapability, 'Career tool authorization is required.'),
+  capability: z.any().refine((value) => value === careerToolCapability, 'Career tool authorization is required.'),
 });
 export type CareerToolContext = z.infer<typeof careerToolContextSchema>;
 
