@@ -35,7 +35,7 @@ Implemented:
 
 Not implemented:
 
-- resume paste/upload, PDF, image, DOCX, URL, or arbitrary file ingestion during onboarding until `mastra-pii` is benchmarked and integrated;
+- resume file/upload, PDF, image, DOCX, URL, or arbitrary file ingestion during onboarding until `mastra-pii` is benchmarked and integrated; plain structured career text is accepted;
 - job discovery, scheduling, CSV import, or browser-assisted applications;
 - automatic applications or mutation of job sites;
 - multiple owners, multiple runtime instances, or distributed coordination;
@@ -127,7 +127,7 @@ Registered tools:
 | `job-status` | Return safe state for one job or the latest job | Owner plus current conversation |
 | `job-queue` | Return up to 100 job IDs and statuses | Owner plus current conversation |
 
-Active onboarding uses a dedicated no-memory, tool-free responder. The runtime validates draft patches and owns review, edits, cancellation, and confirmation; only exact runtime-observed `confirm` activates the profile.
+Active onboarding uses a dedicated tool-free responder with owner/conversation-scoped Mastra memory. The runtime validates draft patches and owns review, edits, cancellation, and confirmation; only exact runtime-observed `confirm` activates the profile.
 
 Outside onboarding, the agent is instructed to ask one concise question when profile context is insufficient, store the pending URL in working memory, and continue after the owner replies; another `/save` should not be required.
 
@@ -194,7 +194,7 @@ Command shortcuts are translated into explicit agent instructions; they do not b
 /onboarding cancel   cancel active onboarding and clear draft content
 ```
 
-Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or chat memory. It does not use normal Mastra message history, working memory, observational memory, trusted tool request context, or tool calls. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
+Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or tool calls. The responder uses owner/conversation-scoped Mastra message history, working memory, and observational memory, but receives no trusted tool request context. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
 
 ### Save pipeline
 
@@ -641,7 +641,7 @@ These are planned changes, not current behavior. Each item requires a written co
 
 ### P0 — Resume privacy boundary
 
-- [x] **Add guided `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Collects structured career context one question at a time, keeps active onboarding outside normal Mastra memory, requires owner review and runtime-observed explicit confirmation, then activates the versioned profile. Resume paste/upload remains intentionally unavailable in this first phase.
+- [x] **Add guided `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Collects structured career context one question at a time with owner/conversation-scoped Mastra memory, requires owner review and runtime-observed explicit confirmation, then activates the versioned profile. Resume file/upload ingestion remains intentionally unavailable in this first phase; plain structured career text is accepted.
 - [ ] **Integrate the separately published layered Mastra PII processor for resume ingestion ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** After OpenRedaction deterministic checks and local Transformers.js NER are benchmarked, consume a reviewed prerelease and enable bounded text/PDF resume ingestion before the ordinary agent path; Mastra `PIIDetector` remains defense-in-depth.
 
 ### P1 — Conversation and memory
