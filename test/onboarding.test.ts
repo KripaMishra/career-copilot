@@ -276,11 +276,14 @@ test('prohibited active onboarding inputs are blocked before the onboarding mode
   await runtime.handleTelegramUpdate(update(422, '/queue'), async (text) => { replies.push(text); });
   await runtime.handleTelegramUpdate(update(423, 'x'.repeat(4001)), async (text) => { replies.push(text); });
   await runtime.handleTelegramUpdate(update(424, 'Resume\nExperience\n- AI Engineer building healthcare agents\nProjects\n- Citation-first RAG system\nSkills\n- TypeScript, Python, SQL'), async (text) => { replies.push(text); });
-  assert.equal(onboardCalls, 1);
+  await runtime.handleTelegramUpdate(update(425, 'Built image recognition for distributed file systems as a CV engineer'), async (text) => { replies.push(text); });
+  await runtime.handleTelegramUpdate(update(426, '/help'), async (text) => { replies.push(text); });
+  assert.equal(onboardCalls, 2);
   assert.equal(normalCalls, 0);
   assert.match(replies[1], /unavailable/i);
   assert.match(replies[2], /finish or cancel/i);
   assert.match(replies[3], /4000|too long/i);
+  assert.match(replies[6], /finish or cancel/i);
   await runtime.close();
 }));
 

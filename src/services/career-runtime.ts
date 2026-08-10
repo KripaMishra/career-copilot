@@ -73,11 +73,11 @@ export async function handleOnboardingTurn(input: { store: CareerStore; ownerId:
     if (command.action === 'cancel') { const state = await input.store.loadOnboarding(input.ownerId, input.conversationId); if (!state || !['collecting', 'review'].includes(state.status)) return 'No active onboarding to cancel.'; await input.store.cancelOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.cancelled', { status: 'cancelled', version: state.version + 1 }); return 'Onboarding cancelled and draft content cleared. Send /onboarding to start again.'; }
     const state = await input.store.startOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, restart: command.action === 'restart' }); log('info', 'onboarding.started', { status: state.status, version: state.version }); return onboardingReply(state);
   }
-  const state = await input.store.loadOnboarding(input.ownerId, input.conversationId); if (!state || !['collecting', 'review'].includes(state.status)) return null;
+  const state = await input.store.loadOnboarding(input.ownerId, input.conversationId); if (!state || (state.status !== 'collecting' && state.status !== 'review')) return null;
   if (input.nonTextInput) { log('warn', 'onboarding.input.blocked', { reason: 'non_text', status: state.status }); return unavailableOnboardingReply; }
   const trimmed = input.text?.trim(); if (!trimmed) return null;
   if (/^\/?cancel$/i.test(trimmed)) { await input.store.cancelOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.cancelled', { status: 'cancelled', version: state.version + 1 }); return 'Onboarding cancelled and draft content cleared. Send /onboarding to start again.'; }
-  if (command && command.kind !== 'onboarding') { log('warn', 'onboarding.input.blocked', { reason: 'command', status: state.status }); return 'Please finish or cancel onboarding before using /save, /job, or /queue.'; }
+  if (trimmed.startsWith('/')) { log('warn', 'onboarding.input.blocked', { reason: 'command', status: state.status }); return 'Please finish or cancel onboarding before using commands.'; }
   if (trimmed.length > 4000) { log('warn', 'onboarding.input.blocked', { reason: 'overlength', status: state.status }); return longOnboardingReply; }
   if (isUnavailableOnboardingInput(trimmed)) { log('warn', 'onboarding.input.blocked', { reason: 'unavailable_input', status: state.status }); return unavailableOnboardingReply; }
   if (isDirectIdentifierOnboardingInput(trimmed)) { log('warn', 'onboarding.input.blocked', { reason: 'direct_identifier', status: state.status }); return directIdentifierOnboardingReply; }
