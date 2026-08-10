@@ -86,6 +86,16 @@ test('Career Copilot exposes protected tools only to authenticated ingress', asy
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
+test('job-status logs no caller-supplied job ID', async () => {
+  const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-log-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const logs: unknown[] = [];
+  const { tools } = createCareerAgentKit({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} }, logger: (_level, _event, data) => { logs.push(data); } });
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  await tools['job-status'].execute?.({ jobId: 'password=secret-value' }, { requestContext } as never);
+  assert.doesNotMatch(JSON.stringify(logs), /password=secret-value/);
+  await store.close(); await rm(dir, { recursive: true, force: true });
+});
+
 test('career memory keeps message history, working memory, and thread-scoped observations', () => {
   const options = careerMemoryOptions('test-memory-model');
   assert.equal(options.lastMessages, 20);
