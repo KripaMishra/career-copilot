@@ -80,7 +80,9 @@ export function onboardingFieldFromLabel(label: string): OnboardingField | null 
 }
 
 export function isUnavailableOnboardingInput(text: string) {
-  return /\b(resume|cv|upload|file|pdf|docx?|image|png|jpe?g|screenshot)\b/i.test(text) || /https?:\/\//i.test(text);
+  return /https?:\/\//i.test(text)
+    || /\.(?:pdf|docx?|png|jpe?g)\b/i.test(text)
+    || /\b(?:upload|attach)\b.{0,40}\b(?:resume|cv|file|pdf|docx?|image|screenshot)\b/i.test(text);
 }
 
 export function isDirectIdentifierOnboardingInput(text: string) {
