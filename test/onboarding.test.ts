@@ -47,7 +47,7 @@ function sequentialOnboarder(): OnboardingResponder {
   return async ({ text, missingFields }) => ({ reply: `Saved. ${missingFields[1] ? `Next: ${missingFields[1]}` : 'Ready to review.'}`, draftPatch: missingFields[0] ? { [missingFields[0]]: text } : {}, readyForReview: missingFields.length <= 1 });
 }
 
-test('onboarding command parsing and channel-neutral handler keep onboarding out of normal memory injection', async () => withStore(async (store) => {
+test('onboarding command parsing and channel-neutral handler use dedicated routing', async () => withStore(async (store) => {
   assert.deepEqual(parseCommand('/onboarding'), { kind: 'onboarding', action: 'start' });
   assert.deepEqual(parseCommand('/onboarding restart'), { kind: 'onboarding', action: 'restart' });
   assert.deepEqual(parseCommand('/onboarding cancel'), { kind: 'onboarding', action: 'cancel' });
@@ -129,7 +129,7 @@ test('stale completion does not deactivate or insert profile documents', async (
   assert.equal(tx.closed, true);
 });
 
-test('runtime starts, resumes, asks one question, isolates memory, and blocks save/file inputs while active', async () => withStore(async (store) => {
+test('runtime starts, resumes, asks one question, and blocks save/file inputs while active', async () => withStore(async (store) => {
   const agentTurns: unknown[] = []; const replies: string[] = [];
   const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, onboard: sequentialOnboarder(), respond: async (turn) => { agentTurns.push(turn); return 'agent'; } });
   await runtime.handleTelegramUpdate(update(1, '/onboarding'), async (text) => { replies.push(text); });
@@ -283,12 +283,12 @@ test('prohibited active onboarding inputs are blocked before the onboarding mode
   await runtime.close();
 }));
 
-test('dedicated onboarding responder uses structured output without memory, requestContext, or tools', async () => {
+test('dedicated onboarding responder uses owner and conversation memory without tools', async () => {
   let prompt = ''; let options: Record<string, unknown> = {};
   const responder = createOnboardingResponder({ generate: async (text, received) => { prompt = text; options = received; return { object: { reply: 'Captured both.', draftPatch: { currentStatus: draft.currentStatus, skills: draft.skills }, readyForReview: false } }; } });
-  const decision = await responder({ draft: {}, fields: [], missingFields: ['currentStatus'], status: 'collecting', text: 'I am senior and know TS' });
+  const decision = await responder({ ownerId: 'owner', conversationId: 'telegram:2', draft: {}, fields: [], missingFields: ['currentStatus'], status: 'collecting', text: 'I am senior and know TS' });
   assert.equal(decision.draftPatch.currentStatus, draft.currentStatus);
-  assert.equal('memory' in options, false);
+  assert.deepEqual(options.memory, { resource: 'owner', thread: 'telegram:2' });
   assert.equal('requestContext' in options, false);
   assert.equal(options.toolChoice, 'none');
   assert.equal(options.maxSteps, 1);

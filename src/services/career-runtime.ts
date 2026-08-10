@@ -19,7 +19,7 @@ export function injectCommand(text: string) { const command = parseCommand(text)
 
 const onboardingReply = (state: Awaited<ReturnType<CareerStore['loadOnboarding']>>) => state?.status === 'review' ? onboardingReviewText(state.draft) : `Let's build your career profile. ${nextOnboardingQuestion(state?.draft ?? {}) ?? 'Share any final preference, or say ready to review.'}`;
 
-export type OnboardingResponderInput = { draft: OnboardingDraft; fields: typeof onboardingFields; missingFields: string[]; status: Extract<OnboardingStatus, 'collecting' | 'review'>; text: string };
+export type OnboardingResponderInput = { ownerId: string; conversationId: string; draft: OnboardingDraft; fields: typeof onboardingFields; missingFields: string[]; status: Extract<OnboardingStatus, 'collecting' | 'review'>; text: string };
 export type OnboardingResponder = (input: OnboardingResponderInput) => Promise<OnboardingDecision>;
 
 function onboardingPrompt(input: OnboardingResponderInput) {
@@ -28,16 +28,16 @@ function onboardingPrompt(input: OnboardingResponderInput) {
 
 export function createOnboardingResponder(agent: { generate: (text: string, options: Record<string, unknown>) => Promise<{ object?: unknown; text?: string }> }): OnboardingResponder {
   return async (input) => {
-    const result = await agent.generate(onboardingPrompt(input), { structuredOutput: { schema: OnboardingDecisionSchema, jsonPromptInjection: 'inline' }, toolChoice: 'none', maxSteps: 1 });
+    const result = await agent.generate(onboardingPrompt(input), { memory: { resource: input.ownerId, thread: input.conversationId }, structuredOutput: { schema: OnboardingDecisionSchema, jsonPromptInjection: 'inline' }, toolChoice: 'none', maxSteps: 1 });
     return OnboardingDecisionSchema.parse((result as { object?: unknown }).object);
   };
 }
 
-async function runOnboardingResponder(input: { onboard?: OnboardingResponder; draft: OnboardingDraft; status: Extract<OnboardingStatus, 'collecting' | 'review'>; text: string; logger: AppLogger }) {
+async function runOnboardingResponder(input: { onboard?: OnboardingResponder; ownerId: string; conversationId: string; draft: OnboardingDraft; status: Extract<OnboardingStatus, 'collecting' | 'review'>; text: string; logger: AppLogger }) {
   if (!input.onboard) { input.logger('error', 'onboarding.model.failed', { errorName: 'MissingOnboardingResponder' }); return onboardingModelRetryReply; }
   try {
     input.logger('info', 'onboarding.model.started', { status: input.status, missingFields: onboardingMissingFields(input.draft) });
-    const decision = await input.onboard({ draft: input.draft, fields: onboardingFields, missingFields: onboardingMissingFields(input.draft), status: input.status, text: input.text });
+    const decision = await input.onboard({ ownerId: input.ownerId, conversationId: input.conversationId, draft: input.draft, fields: onboardingFields, missingFields: onboardingMissingFields(input.draft), status: input.status, text: input.text });
     input.logger('info', 'onboarding.model.succeeded', { status: input.status, fieldKeys: Object.keys(decision.draftPatch), readyForReview: decision.readyForReview });
     return decision;
   } catch (error) { input.logger('error', 'onboarding.model.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); return onboardingModelRetryReply; }
@@ -85,7 +85,7 @@ export async function handleOnboardingTurn(input: { store: CareerStore; ownerId:
     if (/^confirm$/i.test(trimmed)) { await input.store.completeOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.completed', { status: 'completed', version: state.version + 1 }); return 'Onboarding complete. Your confirmed profile is active now.'; }
     const edit = trimmed.match(/^edit\s+([^:]+):\s*(.+)$/i); if (edit) { const key = onboardingFieldFromLabel(edit[1]); if (!key) return `Unknown field. Edit one of: ${onboardingFields.map((field) => field.key).join(', ')}.`; const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: { [key]: edit[2].trim() }, status: 'review' }); log('info', 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys: [key] }); return onboardingReviewText(saved.draft); }
   }
-  const decision = await runOnboardingResponder({ onboard: input.onboard, draft: state.draft, status: state.status, text: trimmed, logger: (level, event, data) => log(level, event, { version: state.version, ...data }) });
+  const decision = await runOnboardingResponder({ onboard: input.onboard, ownerId: input.ownerId, conversationId: input.conversationId, draft: state.draft, status: state.status, text: trimmed, logger: (level, event, data) => log(level, event, { version: state.version, ...data }) });
   return typeof decision === 'string' ? decision : applyOnboardingDecision({ store: input.store, ownerId: input.ownerId, conversationId: input.conversationId, logger: log }, state, decision);
 }
 
