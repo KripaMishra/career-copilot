@@ -3,6 +3,7 @@ import { chmodSync, closeSync, existsSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createClient, type Client, type InStatement, type Row } from '@libsql/client';
 import { JobInputSchema, JobStatusSchema, SafeResultSchema, safeErrorMessage, type Job, type JobInput, type JobStatus, type SafeResult } from '../contracts/v0.ts';
+import { OnboardingDraftSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus } from '../contracts/onboarding.ts';
 
 export type LibsqlConnectionConfig = { url: string; authToken?: string };
 
@@ -25,6 +26,13 @@ function rowToJob(row: Row): Job {
     reportId: row.report_id ? String(row.report_id) : null, reportPath: row.report_path ? String(row.report_path) : null, sheetReference: row.sheet_reference ? String(row.sheet_reference) : null,
     safeResult: rowSafeResult(row), safeError: row.safe_error ? String(row.safe_error) : null,
     notifiedAt: row.notified_at === null ? null : Number(row.notified_at), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+  };
+}
+
+function rowToOnboarding(row: Row): OnboardingRecord {
+  return {
+    ownerId: String(row.owner_id), conversationId: String(row.conversation_id), status: OnboardingStatusSchema.parse(row.status),
+    draft: OnboardingDraftSchema.parse(JSON.parse(String(row.draft_json || '{}'))), version: Number(row.version), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
   };
 }
 
@@ -96,6 +104,16 @@ const createSchema: InStatement[] = [
   `CREATE TABLE IF NOT EXISTS career_report_counters (
     job_id TEXT PRIMARY KEY,
     next_version INTEGER NOT NULL CHECK (next_version >= 2)
+  ) STRICT`,
+  `CREATE TABLE IF NOT EXISTS career_onboarding (
+    owner_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('collecting','review','completed','cancelled')),
+    draft_json TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(owner_id, conversation_id)
   ) STRICT`,
 ];
 
@@ -194,6 +212,58 @@ export class CareerStore {
     statements.push({ sql: 'INSERT INTO career_profile_documents (document_id,owner_id,name,version,active,content,sha256,byte_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', args: [documentId, input.ownerId, name, version, input.active === false ? 0 : 1, input.content, contentHash, bytes(input.content), now, now] });
     await this.#client.batch(statements, 'write');
     return { documentId, hash: `sha256:${contentHash}`, byteSize: bytes(input.content), version };
+  }
+
+  async loadOnboarding(ownerId: string, conversationId: string): Promise<OnboardingRecord | null> {
+    await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_onboarding WHERE owner_id=? AND conversation_id=?', args: [ownerId, conversationId] })).rows[0];
+    return row ? rowToOnboarding(row) : null;
+  }
+  async startOnboarding(input: { ownerId: string; conversationId: string; restart?: boolean }) {
+    await this.#ready; const existing = await this.loadOnboarding(input.ownerId, input.conversationId);
+    if (existing && ['collecting', 'review'].includes(existing.status) && !input.restart) return existing;
+    const now = Date.now();
+    await this.#client.execute({ sql: `INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_id, conversation_id) DO UPDATE SET status='collecting', draft_json='{}', version=career_onboarding.version+1, updated_at=excluded.updated_at`, args: [input.ownerId, input.conversationId, 'collecting', '{}', 1, now, now] });
+    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
+  }
+  async saveOnboardingDraft(input: { ownerId: string; conversationId: string; expectedVersion: number; draft: OnboardingDraft; status?: Extract<OnboardingStatus, 'collecting' | 'review'> }) {
+    await this.#ready; const current = await this.loadOnboarding(input.ownerId, input.conversationId);
+    if (!current || current.version !== input.expectedVersion || !['collecting', 'review'].includes(current.status)) throw new Error('Onboarding draft version is stale.');
+    assertSafeOnboardingDraft(input.draft);
+    const draft = OnboardingDraftSchema.parse({ ...current.draft, ...input.draft });
+    assertSafeOnboardingDraft(draft);
+    const status = input.status ?? 'collecting';
+    if (status === 'review' && onboardingMissingFields(draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
+    const updated = await this.#client.execute({ sql: 'UPDATE career_onboarding SET status=?, draft_json=?, version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN (\'collecting\',\'review\')', args: [status, JSON.stringify(draft), Date.now(), input.ownerId, input.conversationId, input.expectedVersion] });
+    if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
+    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
+  }
+  async cancelOnboarding(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
+    await this.#ready;
+    const updated = await this.#client.execute({ sql: "UPDATE career_onboarding SET status='cancelled', draft_json='{}', version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN ('collecting','review')", args: [Date.now(), input.ownerId, input.conversationId, input.expectedVersion] });
+    if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
+    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
+  }
+  async completeOnboarding(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
+    await this.#ready; const name = 'onboarding.md'; const now = Date.now(); let committed = false;
+    const transaction = await this.#client.transaction('write');
+    try {
+      const row = (await transaction.execute({ sql: 'SELECT * FROM career_onboarding WHERE owner_id=? AND conversation_id=?', args: [input.ownerId, input.conversationId] })).rows[0];
+      const current = row ? rowToOnboarding(row) : null;
+      if (!current || current.version !== input.expectedVersion || current.status !== 'review') throw new Error('Onboarding draft version is stale.');
+      if (onboardingMissingFields(current.draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
+      const content = buildOnboardingProfileText(current.draft); assertSafeProfileContent(content);
+      const updated = await transaction.execute({ sql: "UPDATE career_onboarding SET status='completed', version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status='review'", args: [now, input.ownerId, input.conversationId, input.expectedVersion] });
+      if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
+      const currentVersion = (await transaction.execute({ sql: 'SELECT COALESCE(MAX(version), 0) AS version FROM career_profile_documents WHERE owner_id=? AND name=?', args: [input.ownerId, name] })).rows[0];
+      const version = Number(currentVersion?.version ?? 0) + 1; const documentId = `${hash(`${input.ownerId}:${name}`).slice(0, 16)}-v${version}`; const contentHash = hash(content);
+      await transaction.execute({ sql: 'UPDATE career_profile_documents SET active=0, updated_at=? WHERE owner_id=? AND name=?', args: [now, input.ownerId, name] });
+      await transaction.execute({ sql: 'INSERT INTO career_profile_documents (document_id,owner_id,name,version,active,content,sha256,byte_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', args: [documentId, input.ownerId, name, version, 1, content, contentHash, bytes(content), now, now] });
+      await transaction.commit(); committed = true;
+    } catch (error) {
+      if (!committed) try { await transaction.rollback(); } catch { /* rollback best effort */ }
+      throw error;
+    } finally { transaction.close(); }
+    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
   async importJob(job: Job) {
     await this.#ready; const value = normalizeJobForImport(job);

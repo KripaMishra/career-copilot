@@ -1,21 +1,23 @@
 # Onboarding PII Redaction and Layered Mastra Processor
 
-**Status:** Ready for implementation  
-**Priority:** P0  
-**Onboarding issue:** [career-copilot #10](https://github.com/KripaMishra/career-copilot/issues/10)  
-**Package issue:** [mastra-pii #1](https://github.com/KripaMishra/mastra-pii/issues/1)  
-**Target app branch:** `feat/onboarding`  
-**Target app worktree:** `/home/kripa/Personal/projects/worktrees/mastra-demo/onboarding/mastra-demo`  
-**Package repository:** [KripaMishra/mastra-pii](https://github.com/KripaMishra/mastra-pii)  
-**Local package checkout:** `/home/kripa/Personal/projects/mastra-pii`  
+**Status:** Guided onboarding V1 implemented; resume ingestion follows the package benchmark
+**Priority:** P0
+**Onboarding issue:** [career-copilot #10](https://github.com/KripaMishra/career-copilot/issues/10)
+**Package issue:** [mastra-pii #1](https://github.com/KripaMishra/mastra-pii/issues/1)
+**Target app branch:** `feat/onboarding-v0`
+**Target app worktree:** `/home/kripa/Personal/projects/mastra-demo`
+**Package repository:** [KripaMishra/mastra-pii](https://github.com/KripaMishra/mastra-pii)
+**Local package checkout:** `/home/kripa/Personal/projects/mastra-pii`
 **Provisional npm package:** `@kripamishra/mastra-pii` (confirm npm scope before publishing)
 
 ## Objective
 
-Deliver two connected features:
+Deliver two independently schedulable features:
 
-1. a reusable TypeScript package that extends Mastra PII processing with three independently configurable layers;
-2. a Career Copilot `/onboarding` flow that applies the local layers before resume text reaches the ordinary agent, memory, traces, or Turso profile storage.
+1. a guided Career Copilot `/onboarding` flow that collects structured career context without resume ingestion and can ship now;
+2. a reusable TypeScript package that extends Mastra PII processing with three independently configurable layers, then enables a later resume text/PDF ingestion phase.
+
+The package benchmark is not a blocker for guided onboarding. Plain structured career text, including text headed “Resume,” is accepted after direct-identifier checks. Resume file/upload ingestion remains disabled until the reviewed local deterministic + NER layers can run before document content reaches the ordinary agent, memory, traces, or Turso profile storage.
 
 The three package layers are:
 
@@ -352,41 +354,60 @@ These dependency versions reflect the researched releases and must be re-verifie
 
 ## Career Copilot onboarding architecture
 
-```text
-/onboarding or active onboarding turn
-  → authenticate and authorize ingress
-  → identify/create owner + conversation onboarding state
-  → if PDF: bounded Telegram download → in-memory text extraction
-  → deterministic + NER redactText() [fail closed]
-  → discard raw bytes/text
-  → send only sanitized text to Career Copilot agent
-  → agent asks one missing-field question or renders review summary
-  → persist sanitized draft only
-  → owner confirms
-  → atomically activate versioned profile document and complete onboarding
+```mermaid
+flowchart LR
+    User[Telegram user] --> Auth[Authenticated ingress]
+    Auth --> Runtime[Career runtime command/state router]
+    Runtime --> Route[Hybrid onboarding router\nowner/conversation memory]
+    Route --> Agent[Dedicated onboarding responder\nstructured output, no tools]
+    Agent --> Route
+    Route <--> Draft[(career_onboarding\nstructured draft + version)]
+    Draft --> Review[Owner review]
+    Review --> Confirm[Explicit confirmation]
+    Confirm --> Profile[(career_profile_documents\nnew active version)]
+
+    Resume[Future resume text/PDF] -. disabled until benchmarked .-> Extract[Bounded in-memory extraction]
+    Extract -. future integration .-> PII[mastra-pii redactText\ndeterministic + local NER]
+    PII -. sanitized text only .-> Runtime
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> Collecting: /onboarding
+    Collecting --> Collecting: responder reply / optional patch saved
+    Collecting --> Review: required fields complete + responder ready
+    Review --> Review: deterministic edit or responder correction
+    Review --> Completed: exact confirmation
+    Collecting --> Cancelled: cancel
+    Review --> Cancelled: cancel
+    Cancelled --> Collecting: /onboarding starts cleanly
+    Completed --> NormalCareerFlow: active profile available
 ```
 
 ### Command behavior
 
-Add `/onboarding` to `Command`, `parseCommand()`, and `injectCommand()` in `src/services/career-runtime.ts`.
+`/onboarding`, `/onboarding restart`, and `/onboarding cancel` are parsed in `src/services/career-runtime.ts`.
 
-`/onboarding` must:
+`/onboarding` now:
 
-1. create or resume onboarding state for the trusted owner/conversation;
-2. tell the agent to inspect state using onboarding tools;
-3. ask one concise missing-field question at a time;
-4. request pasted resume text or a PDF;
-5. show a redacted review summary when required data exists;
-6. complete only after an explicit confirmation such as `confirm onboarding`;
-7. allow `cancel onboarding` without activating the draft.
+1. creates or resumes onboarding state for the trusted owner/conversation;
+2. blocks URLs, file/upload requests, non-text/overlength input, obvious direct identifiers, and unrelated commands before any model call while accepting plain structured career text;
+3. sends active collection turns to a dedicated onboarding responder using one structured-output generation with owner/conversation-scoped memory, no trusted request context, `toolChoice: 'none'`, and `maxSteps: 1`;
+4. validates and persists only the responder's schema-valid `draftPatch`, allowing clarification replies with no draft mutation and one answer to populate multiple clearly stated fields;
+5. accepts plain structured career text but never requests or accepts URLs, PDFs, images, DOCX, or arbitrary files in the initial guided-onboarding phase;
+6. shows a structured review summary when required fields are complete and the responder marks the draft ready, including ready-with-empty-patch turns;
+7. keeps review conversational for non-command text by calling the same memory-enabled, tool-free responder, while exact `confirm`, `cancel`, and deterministic `edit <field>: <value>` remain runtime-owned;
+8. completes only after runtime-observed exact `confirm` owner confirmation;
+9. allows cancellation without activating the draft and clears draft content.
 
-Normal `/save`, `/job`, and `/queue` behavior must remain unchanged.
+Normal `/save`, `/job`, and `/queue` behavior remains unchanged outside active onboarding; during active onboarding those commands are held until the owner finishes or cancels onboarding.
 
 ### Required onboarding information
 
 Collect only information needed for career assistance:
 
-- resume-derived experience, education, skills, projects, and achievements;
+- experience, education, skills, projects, and achievements gathered through guided questions;
 - current role/status and years of experience;
 - target roles and seniority;
 - preferred industries and company characteristics;
@@ -397,7 +418,7 @@ Collect only information needed for career assistance:
 - strengths, growth areas, likes, dislikes, deal-breakers, and career goals;
 - one optional example job or description of the desired job.
 
-Do not require legal name, exact birth date, street address, phone, email, government ID, or financial data.
+Do not require legal name, exact birth date, street address, phone, email, government ID, or financial data. A narrow deterministic onboarding guard rejects obvious direct identifier canaries such as email addresses, phone numbers, legal-name phrases, exact birth-date phrases, government/financial ID labels, and credential assignments before model calls and before draft persistence. This is not a general redactor and must not block allowed career facts such as city, school, employer, work authorization country, compensation, or years of experience.
 
 ### Durable state
 
@@ -407,10 +428,8 @@ Add an owner/conversation-scoped `career_onboarding` table:
 owner_id             TEXT
 conversation_id      TEXT
 status               collecting | review | completed | cancelled
-step                  TEXT
+draft_json            TEXT
 version               INTEGER
-sanitized_draft_json  TEXT
-profile_document_id   TEXT nullable
 created_at            INTEGER
 updated_at            INTEGER
 PRIMARY KEY (owner_id, conversation_id)
@@ -420,35 +439,42 @@ Requirements:
 
 - optimistic version checks on updates;
 - strict schema validation of draft JSON;
+- deterministic rejection of obvious direct identifiers in draft values before persistence;
 - no raw resume column;
 - owner + conversation scoping on every read/write;
-- idempotent start/resume/confirm;
+- idempotent start/resume and explicit versioned confirmation;
 - confirmation transaction writes a new active `career_profile_documents` version and marks onboarding complete;
-- cancellation sets status to `cancelled` and atomically replaces `sanitized_draft_json` with `{}`; retain only non-content timestamps/version so a later `/onboarding` starts cleanly.
+- cancellation sets status to `cancelled` and atomically replaces `draft_json` with `{}`; retain only non-content timestamps/version so a later `/onboarding` starts cleanly.
 
 Add narrow `CareerStore` methods rather than a generic repository abstraction.
 
-### Agent tools
+### Dedicated responder
 
-Register three guarded tools in `src/agents/agent.ts` and `src/mastra/index.ts`:
+The composition root injects a dedicated responder around the existing agent/model. The runtime supplies only current structured draft JSON, allowed field definitions, missing fields, state, and the current text. The responder schema contains exactly `reply`, `draftPatch`, and `readyForReview`; it has no tools or confirmation, authorization, activation, owner, chat, user, or memory fields.
 
-1. `onboarding-status` — return safe state and missing fields;
-2. `onboarding-save-draft` — validate and persist sanitized structured profile data;
-3. `onboarding-complete` — require expected version and explicit confirmation context, then activate the profile atomically.
+The runtime owns authorization and activation. Initial guided onboarding persists only strictly validated structured career fields from plain text and does not accept resume files/uploads. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun deterministic + NER `redactText()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
 
-All tools use the existing trusted `careerToolContextSchema`. The model never decides authorization and cannot submit raw resume content because it receives only sanitized text. Before every onboarding draft write and final profile activation, rerun deterministic + NER `redactText()` over the serialized candidate and require byte-for-byte equality with the candidate. Any new detection blocks persistence with a generic error; `CareerStore.assertSafeTextContent()` remains a second secret check, not the PII gate.
-
-After completion, profile context must be available immediately. Do not depend on the unused startup `profileText` snapshot. Read current owner-scoped profile text through a guarded tool or refreshable request-time dependency.
+After completion, profile context must be available immediately. Do not depend on the unused startup `profileText` snapshot. The save path reads current owner-scoped profile text at request time.
 
 ### Text turns
 
-While onboarding state is `collecting` or `review`, redact every non-command inbound text turn locally before calling the agent. Onboarding turns must omit the normal `{ memory: { resource, thread } }` execution option and must not update resource working memory or thread history. The durable sanitized onboarding row and guarded onboarding tools provide continuity until confirmation. Integration tests must prove sanitized-but-unconfirmed facts never appear in Mastra memory or influence normal job flows.
+While onboarding state is `collecting`, route text through the hybrid onboarding state machine and dedicated structured responder instead of normal agent generation. Pass the trusted owner ID as the Mastra memory resource and the scoped conversation ID as the thread so message history, working memory, and Observational Memory remain enabled. While state is `review`, runtime-only exact confirm/cancel/deterministic edit handling applies first; all other review text goes through the same memory-enabled responder for conversational clarification or natural-language corrections while remaining in review. The durable structured onboarding row remains authoritative until confirmation.
 
-After confirmation, write the active profile document and explicitly refresh approved profile context for subsequent normal turns. Do not redact the command token itself. Reject or safely route unrelated commands according to explicit tests.
+After confirmation, write the active profile document and explicitly refresh approved profile context for subsequent normal turns. Accept plain structured career text, but reject resume file/upload and unrelated file input until the PII integration phase. Reject or safely route unrelated commands according to explicit tests.
 
-### PDF ingestion
+### Reply-failure idempotency
 
-V1 supports text-based PDF only.
+For accepted Telegram updates, cache the completed outbound response/result in memory after model/state/tool effects complete but before sending the Telegram reply. If Telegram delivery fails and the same update is retried in the same process, resend the cached response without rerunning onboarding model/state changes or normal agent/tool effects. After a successful cached normal reply, still mark any completed job notification. This cache is deliberately process-local; after a process restart, persisted job deduplication still protects save requests, but onboarding reply retries resume from durable onboarding state rather than from a durable response cache.
+
+### Terminal app logs
+
+`npm run dev` must show useful app-wide events directly in the terminal through one shared structured terminal logger created in `src/mastra/index.ts`, not Mastra's default logger. Inject that logger through Telegram transport, runtime, agent/tools, and the save pipeline. Emit one JSON line per event with an allowlisted payload only. Safe fields include event name, phase, status, version, attempt, duration, field keys, update/request ID, generated job/report ID, command/tool name, and error class/name. Never log owner/user/chat IDs, message text, draft/profile values, fetched content, URLs, analysis/report content, spreadsheet identifiers, credentials, tokens, or raw errors.
+
+Required useful events include runtime/startup, Telegram polling/update/reply, normal agent turns, commands, protected tool invocation, job fetch/analysis/report/Sheets/completion/failure, recovery/notification, and onboarding model/draft/review/completion. Cap allowed string and array-item values before writing terminal JSON. Do not log empty Telegram polls or intentional stop aborts as failures.
+
+### Deferred resume/PDF ingestion
+
+Resume file/upload and PDF extraction are intentionally unavailable in the initial guided-onboarding release; plain structured career text is accepted. After the package benchmark and reviewed prerelease, the integration phase supports text-based PDFs only:
 
 1. authorize the Telegram update before calling `getFile` or downloading bytes;
 2. accept only Telegram documents with PDF MIME type, `.pdf` name, and `%PDF-` signature;
@@ -467,53 +493,39 @@ Document that Telegram retains uploaded files outside this application's control
 
 ## Career Copilot file map
 
-Expected files to change:
+Expected files for later resume/PII integration:
 
 ```text
-package.json                         consume published/prerelease package; add PDF parser
+package.json                         consume package prerelease; add PDF parser
 .env.example                        local NER model path/revision and limits
-src/config/runtime.ts               validate PII/onboarding configuration
-src/contracts/v0.ts                 onboarding schemas and statuses
+src/config/runtime.ts               validate PII readiness and ingestion limits
 src/channels/telegram-auth.ts       authorize bounded PDF document envelopes
 src/channels/telegram-transport.ts  injectable authenticated file download
-src/services/career-runtime.ts      /onboarding command, state routing, pre-agent redaction
-src/storage/career-store.ts         career_onboarding migration and narrow methods
-src/agents/agent.ts                 onboarding instructions and guarded tools
-src/mastra/index.ts                 register/configure package processor and tools
+src/services/career-runtime.ts      pre-agent resume redaction
+src/mastra/index.ts                 register/configure package processor
 src/observability.ts                preserve no-input/no-output trace policy
-test/minimal-v0.test.ts             focused end-to-end regression cases
-README.md                           setup, commands, privacy boundary, roadmap status
 ```
 
 Create additional focused files only where they remove real coupling, for example `src/services/onboarding.ts` and `src/integrations/pdf-text.ts`. Do not turn the change into a general workflow framework.
 
 ## Implementation sequence
 
-### Slice 1 — Publishable deterministic package
+### Track A — Package deterministic + local NER benchmark
 
-- Create the dedicated repository and worktree.
-- Implement config validation, safe result types, OpenRedaction lite adapter, span normalization, merge/redaction, and Mastra processor transformation.
-- Add privacy canaries proving raw values/maps never escape.
-- Publish `0.1.0-alpha.1` with deterministic layer only; disabled NER/model config must reject clearly if selected before implementation.
-
-### Slice 2 — Local NER layer
-
-- Build the frozen synthetic resume corpus.
-- Benchmark at least two Transformers.js-compatible ONNX PII models.
+- Implement config validation, safe result types, OpenRedaction lite adapter, local NER, span normalization, merge/redaction, and Mastra processor transformation in `KripaMishra/mastra-pii`.
+- Build the frozen synthetic resume corpus and benchmark at least two Transformers.js-compatible ONNX PII models.
 - Select and pin one model only after per-entity release gates pass.
-- Implement chunking, label mapping, offsets, warmup/readiness, and deterministic overlap behavior.
-- Publish `0.1.0-alpha.2` with deterministic + NER local layers.
+- Publish a reviewed prerelease with deterministic + NER local layers.
 
-### Slice 3 — Career Copilot onboarding with fail-closed local redaction
+### Track B — Resume ingestion integration
 
-- Create the app worktree and consume `0.1.0-alpha.2` or later.
-- Add onboarding state, command, guarded tools, memory-isolated pasted-text flow, explicit review, and atomic completion.
-- Add bounded PDF download/extraction and ephemeral metadata handling.
-- Keep `/onboarding` disabled unless both local layers warm successfully and pass configuration/readiness checks.
-- Revalidate every draft/profile candidate before Turso writes.
+- Consume the reviewed package prerelease in Career Copilot.
+- Add bounded resume text/PDF ingestion and ephemeral metadata handling.
+- Keep resume ingestion disabled unless both local layers warm successfully and pass readiness checks.
+- Revalidate every resume-derived draft/profile candidate before Turso writes.
 - Prove raw canaries never enter agent calls, Mastra memory, Turso, traces, logs, or replies.
 
-### Slice 4 — Mastra model layer
+### Track C — Mastra model layer
 
 - Wrap the installed `PIIDetector` without copying internals.
 - Verify independent deterministic-only, NER-only, model-only, and layered configurations.
@@ -535,30 +547,6 @@ Base:   main
 
 Create a package feature branch/worktree from `main` when package implementation begins. Keep all redaction-engine, model benchmark, and npm release commits in that repository.
 
-### Career Copilot
-
-The onboarding branch/worktree is ready from the current Turso-capable baseline:
-
-```text
-Branch:   feat/onboarding
-Worktree: /home/kripa/Personal/projects/worktrees/mastra-demo/onboarding/mastra-demo
-Base:     f07929e
-Baseline: 52 tests passed
-```
-
-Do not copy or vendor the redaction engine into this worktree. Consume the reviewed package prerelease after package issue #1 reaches the local-layer release gate.
-
-Before editing:
-
-1. read `AGENTS.md` and load the project Mastra skill;
-2. read this spec, career-copilot issue #10, and mastra-pii issue #1;
-3. use the code-review graph before broad source search;
-4. confirm a clean worktree;
-5. verify exact installed Mastra/OpenRedaction/Transformers.js APIs;
-6. preserve all trust and persistence invariants in README.
-
-Use one writer per worktree. Package and app changes should be separate PRs; do not publish from an unreviewed app branch.
-
 ## Required tests
 
 ### Package
@@ -579,27 +567,37 @@ Use one writer per worktree. Package and app changes should be separate PRs; do 
 - model-layer delegation and documented model failure behavior;
 - assertions that logs/errors/results contain none of the synthetic raw canaries.
 
-### Career Copilot
+### Career Copilot guided onboarding
 
-- `/onboarding` parse/injection and resume behavior;
-- unauthorized text/PDF rejected before download or parsing;
+- `/onboarding` parse/routing and start/resume behavior;
 - onboarding resumes after restart;
-- every active-onboarding text turn is redacted before the responder spy receives it;
-- active onboarding omits normal Mastra memory and unconfirmed facts cannot affect `/save` or later chat;
-- bounded valid PDF extraction;
-- MIME/extension/signature mismatch, oversized, encrypted, malformed, image-only, timeout, and overlong extraction rejection;
-- filename, caption, `file_id`, and `file_unique_id` canaries are rejected/redacted and never persisted or injected;
-- raw canaries absent from agent calls, memory tables, onboarding rows, profile documents, traces, lifecycle logs, replies, and snapshots;
-- draft and completion writes rerun local detection and reject any candidate that changes after redaction;
-- one-question-at-a-time progression;
-- review summary contains useful career evidence but no direct identifiers;
+- active onboarding uses the trusted owner resource and scoped conversation thread for Mastra memory;
+- plain structured career text is accepted while URLs and document/file inputs are rejected;
+- strict structured draft validation and optimistic versions;
+- conversational clarification without draft mutation;
+- one answer may populate multiple fields;
+- corrections update only returned fields;
+- prohibited inputs blocked before the onboarding model;
+- dedicated responder uses structured output with owner/conversation memory, no request context or tools, and one step;
+- review begins only when required fields are complete and the responder marks ready;
+- review summary contains useful career evidence and does not request identity fields;
 - explicit confirmation required;
 - stale version confirmation rejected;
 - confirmation atomically activates one profile version and completes state;
 - confirmation refreshes approved profile context without restart;
-- cancel clears draft content, leaves normal memory unchanged, and restart begins cleanly;
+- cancel clears draft content and restart begins cleanly;
 - start/resume/confirm idempotency;
 - existing `/save`, `/job`, `/queue`, recovery, authorization, and Sheets tests unchanged.
+
+### Career Copilot resume integration follow-up
+
+- unauthorized text/PDF rejected before download or parsing;
+- every resume input is redacted before the responder spy receives it;
+- bounded valid PDF extraction;
+- MIME/extension/signature mismatch, oversized, encrypted, malformed, image-only, timeout, and overlong extraction rejection;
+- filename, caption, `file_id`, and `file_unique_id` canaries are rejected/redacted and never persisted or injected;
+- raw canaries absent from agent calls, memory tables, onboarding rows, profile documents, traces, lifecycle logs, replies, and snapshots;
+- resume-derived draft and completion writes rerun local detection and reject any candidate that changes after redaction.
 
 ## Quality gates
 
@@ -621,11 +619,12 @@ Any high-risk canary leak blocks release.
 - [ ] Deterministic, NER, and Mastra model layers can each be disabled, enabled alone, or layered.
 - [ ] OpenRedaction is used only for deterministic detection; its raw values and reversible map never escape the adapter.
 - [ ] Local NER makes no inference API call and makes no runtime model download in production.
-- [ ] `/onboarding` supports pasted text and bounded text-based PDFs only after deterministic + NER readiness succeeds.
-- [ ] Onboarding asks for all required career context, then requires review and explicit confirmation.
-- [ ] Active onboarding uses durable sanitized state instead of normal Mastra memory.
-- [ ] Every draft/profile write is revalidated by both local layers.
-- [ ] Only confirmed redacted context becomes an active Turso profile document.
+- [x] Guided `/onboarding` ships independently with plain structured career text enabled and resume file ingestion disabled.
+- [x] Onboarding asks for all required career context, then requires review and runtime-observed explicit confirmation.
+- [x] Active onboarding uses durable structured state plus owner/conversation-scoped Mastra memory.
+- [x] Only confirmed structured context becomes an active Turso profile document.
+- [ ] A later integration enables bounded resume file/PDF ingestion only after deterministic + NER readiness succeeds.
+- [ ] Every resume-derived draft/profile write is revalidated by both local layers.
 - [ ] Synthetic canary tests prove raw PII never reaches the main agent, memory, traces, logs, Turso, reports, Sheets, or user replies.
 - [ ] Existing Career Copilot behavior and tests remain green.
 - [ ] Package prerelease and application integration are reviewed independently before stable release.

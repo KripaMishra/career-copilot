@@ -20,8 +20,9 @@ Implemented:
 
 - one owner and one registered Mastra agent;
 - Telegram private-chat ingress with explicit user and chat allowlists;
-- natural-language career conversation plus `/save`, `/job`, and `/queue` shortcuts;
-- resource-scoped working memory, the last 20 conversation messages, and thread-scoped Observational Memory;
+- natural-language career conversation plus `/save`, `/job`, `/queue`, and guided `/onboarding` shortcuts;
+- resource-scoped working memory, the last 20 conversation messages, and thread-scoped Observational Memory outside active onboarding;
+- owner/conversation-scoped guided onboarding state with structured review, edit, cancel, and confirmed profile activation;
 - one libSQL backend: Turso in production, file-backed locally;
 - synchronous save execution with durable job state;
 - HTTPS-only acquisition from an explicit job-site allowlist;
@@ -34,6 +35,7 @@ Implemented:
 
 Not implemented:
 
+- resume file/upload, PDF, image, DOCX, URL, or arbitrary file ingestion during onboarding until `mastra-pii` is benchmarked and integrated; plain structured career text is accepted;
 - job discovery, scheduling, CSV import, or browser-assisted applications;
 - automatic applications or mutation of job sites;
 - multiple owners, multiple runtime instances, or distributed coordination;
@@ -58,7 +60,14 @@ messages + working memory + OM)]
     AGENT --> SAVE[save-job tool]
     AGENT --> STATUS[job-status tool]
     AGENT --> QUEUE[job-queue tool]
+    AGENT --> ONBOARD[onboarding tools]
+    MAP --> ONBOARDING[Hybrid onboarding router]
+    ONBOARDING --> ORESP[Dedicated onboarding responder\nno memory/tools]
 
+    ONBOARD --> DRAFT[(career_onboarding)]
+    ORESP --> ONBOARDING
+    ONBOARDING --> DRAFT
+    ONBOARDING --> PROFILE
     SAVE --> JOBS[(career_jobs)]
     SAVE --> URL[URL and DNS policy]
     URL --> FETCH[Bounded HTTPS fetch]
@@ -85,10 +94,10 @@ Turso in production / file URL locally)]
 `src/mastra/index.ts` is the composition root. Importing it performs the following work:
 
 1. `resolveRuntimeConfig()` validates one libSQL database URL: local `file:` for development/tests, or Turso `libsql:`/`https:` with `TURSO_AUTH_TOKEN` for production.
-2. `CareerStore` opens the same libSQL database and initializes/migrates `career_jobs`, `career_reports`, and `career_profile_documents`.
-3. Active owner-scoped profile documents are loaded from `career_profile_documents`, joined, and capped at 100,000 characters.
+2. `CareerStore` opens the same libSQL database and initializes/migrates `career_jobs`, `career_reports`, `career_profile_documents`, and `career_onboarding`.
+3. Active owner-scoped profile documents are available from `career_profile_documents`, joined, and capped at 100,000 characters.
 4. The Google OAuth and Sheets boundaries are constructed.
-5. `createCareerAgentKit()` creates the agent and its three tools with the configured memory model.
+5. `createCareerAgentKit()` creates the agent and its career/onboarding tools with the configured memory model.
 6. Mastra is created with the agent, the same LibSQL/Turso storage, and redacted observability.
 7. The Career Copilot runtime and Telegram long-polling transport are created.
 8. Unfinished jobs are recovered before Telegram polling begins.
@@ -97,7 +106,7 @@ Turso in production / file URL locally)]
 
 When `TELEGRAM_BOT_TOKEN` is empty, recovery still runs without notification and polling does not start. When `NODE_ENV=production`, deployment configuration is required and validated eagerly.
 
-### One agent, three tools
+### One agent and guarded tools
 
 `src/agents/agent.ts` creates the `careerCopilot` agent.
 
@@ -118,7 +127,9 @@ Registered tools:
 | `job-status` | Return safe state for one job or the latest job | Owner plus current conversation |
 | `job-queue` | Return up to 100 job IDs and statuses | Owner plus current conversation |
 
-The agent is instructed to ask one concise question when profile context is insufficient, store the pending URL in working memory, and continue after the owner replies; another `/save` should not be required. This is model-directed conversational behavior, not a deterministic state machine.
+Active onboarding uses a dedicated tool-free responder with owner/conversation-scoped Mastra memory. The runtime validates draft patches and owns review, edits, cancellation, and confirmation; only exact runtime-observed `confirm` activates the profile.
+
+Outside onboarding, the agent is instructed to ask one concise question when profile context is insufficient, store the pending URL in working memory, and continue after the owner replies; another `/save` should not be required.
 
 The same agent performs the final structured job analysis through `analyzeJob()`. The analysis call disables tools, accepts at most 100,000 characters each of job text and profile context, and must produce schema-valid title, company, location, summary, fit score, and next step.
 
@@ -159,7 +170,7 @@ Transport behavior:
 - replies are split at Telegram's 4,096-character limit;
 - the offset advances only after an update is handled;
 - polling failures emit a safe event and retry after one second;
-- `stop()` aborts an active long poll.
+- `stop()` aborts an active long poll without logging an intentional abort as a poll failure.
 
 `src/channels/telegram-auth.ts` validates complete raw envelopes before the runtime reads them. `src/services/career-runtime.ts` then rejects:
 
@@ -169,7 +180,7 @@ Transport behavior:
 - bot, edited, forwarded, channel, and non-text messages;
 - duplicate `update_id` values seen by the current process.
 
-Accepted turns execute serially through one promise queue. This prevents concurrent turns from racing the single owner's conversation state.
+Accepted turns execute serially through one promise queue. This prevents concurrent turns from racing the single owner's conversation state. Once an update's state/tool effects have completed, the runtime caches the outbound response before calling Telegram; if that reply fails and Telegram retries the same update in the same process, the cached response is resent without rerunning model/state/tool effects. This in-memory cache is intentionally not durable across process restarts; persisted job deduplication still protects save requests, but onboarding reply retries after a restart may need normal state recovery/resume.
 
 Command shortcuts are translated into explicit agent instructions; they do not bypass the agent:
 
@@ -178,9 +189,12 @@ Command shortcuts are translated into explicit agent instructions; they do not b
 /job             show the latest job in this conversation
 /job <job-id>    show one job in this conversation
 /queue           list jobs in this conversation
+/onboarding      start or resume guided structured onboarding
+/onboarding restart  clear any prior draft and start over
+/onboarding cancel   cancel active onboarding and clear draft content
 ```
 
-Natural-language requests such as “save this job” use the same agent and tools.
+Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or tool calls. The responder uses owner/conversation-scoped Mastra message history, working memory, and observational memory, but receives no trusted tool request context. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
 
 ### Save pipeline
 
@@ -240,6 +254,7 @@ Tables:
 | Table | Purpose |
 |---|---|
 | `career_profile_documents` | Owner-scoped active profile documents, stored as text with name, version, SHA-256, byte size, and timestamps |
+| `career_onboarding` | Owner/conversation-scoped structured onboarding draft, status, and optimistic version; no raw resume/file columns |
 | `career_reports` | Markdown reports, stored as text with owner ID, job ID, version, SHA-256, byte size, and timestamp |
 
 Profile document rules:
@@ -333,22 +348,24 @@ Roll back before cutover by stopping the runtime and restoring the previous loca
 
 Turso Free point-in-time recovery is short. If longer recovery matters, schedule periodic Turso exports.
 
-### Observability and privacy
+### Observability, terminal logs, and privacy
 
-The runtime emits safe lifecycle events through Mastra's logger:
+Run `npm run dev` and watch the terminal for one-line JSON app events. The app creates one shared privacy-safe terminal logger in `src/mastra/index.ts` and injects it through Telegram transport, runtime, agent/tools, and the save pipeline. It does not depend on Mastra's default logger and does not log empty Telegram polls.
 
-- `telegram.poll.*` and `telegram.update.*`;
-- `job.queued`, `job.duplicate`, `job.started`, `job.resumed`, `job.succeeded`, and `job.failed`;
-- `recovery.started`, `recovery.completed`, and notification failures;
-- asynchronous startup recovery completion or failure.
+Safe fields are allowlisted: event name, phase/status/version/attempt/duration, update/request ID, generated job/report IDs, command/tool name, field keys, and error class. Logs exclude owner/user/chat IDs, message text, URLs, draft/profile values, fetched content, analysis/report content, spreadsheet identifiers, credentials/tokens, and raw error messages/stacks.
 
-Synchronous configuration, database, profile, or composition errors occur before lifecycle logging is available and fail module initialization directly.
+Events cover startup, Telegram, commands, agent/tools, jobs, recovery, notifications, and onboarding. See the [onboarding and logging specification](docs/specs/onboarding-pii-redaction.md#terminal-app-logs) for the required catalog.
 
-Observability callbacks are isolated so an exporter failure cannot stop job work or Telegram polling.
+Troubleshooting tips:
 
-Mastra traces are stored in the configured libSQL database. Before export, `redactTracePayloads` removes every span input and output and replaces error details with the error name plus `Operation failed.` Logging inside the observability configuration is disabled.
+- No terminal events: confirm `npm run dev` reaches `runtime.ready`; synchronous config/database/profile failures can stop module initialization before app logging starts.
+- Telegram is silent: look for `telegram.poll.started` and then non-empty `telegram.update.received`; empty polls are intentionally not logged.
+- A job stalls: follow one `jobId` through `job.phase.*`; a failed phase logs only `errorName`, never raw provider or fetch details.
+- User-visible operational state remains `/job` and `/queue`; terminal events are diagnostics, not an audit log.
 
-Open Studio at `http://localhost:4111` during `npm run dev`, then use **Observability → Traces**. Use job IDs to correlate safe lifecycle events. For user-visible operational state, `/job` and `/queue` are authoritative.
+Mastra traces are still stored in the configured libSQL database. Before export, `redactTracePayloads` removes every span input and output and replaces error details with the error name plus `Operation failed.` Logging inside the observability configuration is disabled.
+
+Open Studio at `http://localhost:4111` during `npm run dev`, then use **Observability → Traces**. Use generated job IDs to correlate safe terminal events.
 
 ## Setup
 
@@ -624,8 +641,8 @@ These are planned changes, not current behavior. Each item requires a written co
 
 ### P0 — Resume privacy boundary
 
-- [ ] **Add fail-closed resume redaction to `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Authorize first, extract pasted text or bounded text-based PDFs in memory, run deterministic and local NER redaction before the ordinary agent/memory path, persist only sanitized drafts, and activate career context only after owner review and explicit confirmation.
-- [ ] **Consume the separately published layered Mastra PII processor ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** The dedicated package repository owns OpenRedaction deterministic checks, local Transformers.js NER, and Mastra `PIIDetector` integration. This repository only consumes a reviewed prerelease; production onboarding remains disabled until both local layers pass privacy, utility, latency, and resource gates.
+- [x] **Add guided `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Collects structured career context one question at a time with owner/conversation-scoped Mastra memory, requires owner review and runtime-observed explicit confirmation, then activates the versioned profile. Resume file/upload ingestion remains intentionally unavailable in this first phase; plain structured career text is accepted.
+- [ ] **Integrate the separately published layered Mastra PII processor for resume ingestion ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** After OpenRedaction deterministic checks and local Transformers.js NER are benchmarked, consume a reviewed prerelease and enable bounded text/PDF resume ingestion before the ordinary agent path; Mastra `PIIDetector` remains defense-in-depth.
 
 ### P1 — Conversation and memory
 

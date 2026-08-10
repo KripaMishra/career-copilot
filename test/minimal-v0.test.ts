@@ -75,13 +75,24 @@ test('report version allocation is conflict-safe across concurrent writers', asy
   await first.close(); await second.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('one Career Copilot agent owns memory and all career tools', async () => {
-  const module = await import('../src/agents/agent.ts');
-  const create = (module as { createCareerAgent?: (options: Record<string, unknown>) => { getMemory: () => Promise<unknown>; listTools: () => Promise<Record<string, unknown>> | Record<string, unknown> } }).createCareerAgent;
-  assert.equal(typeof create, 'function');
+test('Career Copilot exposes protected tools only to authenticated ingress', async () => {
+  const [{ createCareerAgent }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const agent = create!({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} } });
-  assert.ok(await agent.getMemory()); assert.deepEqual(Object.keys(await agent.listTools()).sort(), ['job-queue', 'job-status', 'save-job']);
+  const agent = createCareerAgent({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} } });
+  assert.ok(await agent.getMemory());
+  assert.deepEqual(Object.keys(await agent.listTools()), []);
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['job-queue', 'job-status', 'save-job']);
+  await store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('job-status logs no caller-supplied job ID', async () => {
+  const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-log-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const logs: unknown[] = [];
+  const { tools } = createCareerAgentKit({ store, profileText: '', sheet: { findByJobId: async () => null, write: async () => {} }, logger: (_level, _event, data) => { logs.push(data); } });
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  await tools['job-status'].execute?.({ jobId: 'password=secret-value' }, { requestContext } as never);
+  assert.doesNotMatch(JSON.stringify(logs), /password=secret-value/);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -152,14 +163,16 @@ test('commands are deterministic and owner-only', async () => {
 
 test('agent responder namespaces transport identities before memory and tools', async () => {
   const module = await import('../src/services/career-runtime.ts');
-  const create = (module as { createAgentResponder?: (agent: unknown, ownerId: string) => (turn: Record<string, string>) => Promise<string> }).createAgentResponder;
-  assert.equal(typeof create, 'function'); const received: Record<string, unknown>[] = [];
-  const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received.push(options); return { text: 'remembered' }; } }, 'owner');
+  const create = (module as { createAgentResponder?: (agent: unknown, ownerId: string, logger?: (level: string, event: string, data?: Record<string, unknown>) => void) => (turn: Record<string, string>) => Promise<string> }).createAgentResponder;
+  assert.equal(typeof create, 'function'); const received: Record<string, unknown>[] = []; const events: Array<{ event: string; data?: Record<string, unknown> }> = [];
+  const respond = create!({ generate: async (_text: string, options: Record<string, unknown>) => { received.push(options); return { text: 'remembered' }; } }, 'owner', (_level, event, data) => { events.push({ event, data }); });
   await respond({ text: 'Telegram profile', channel: 'telegram', actorId: '1', conversationId: '2', requestId: '70' });
   await respond({ text: 'API profile', channel: 'api', actorId: '1', conversationId: '2', requestId: '70' });
   assert.deepEqual(received.map(({ memory }) => memory), [{ resource: 'owner', thread: 'telegram:2' }, { resource: 'owner', thread: 'api:2' }]);
   const contexts = received.map(({ requestContext }) => requestContext as { get: (key: string) => unknown });
   assert.deepEqual(contexts.map((context) => [context.get('actorId'), context.get('conversationId'), context.get('requestId')]), [['telegram:1', 'telegram:2', 'telegram:70'], ['api:1', 'api:2', 'api:70']]);
+  assert.deepEqual(events.map(({ event }) => event), ['agent.turn.started', 'agent.turn.succeeded', 'agent.turn.started', 'agent.turn.succeeded']);
+  assert.deepEqual(events.map(({ data }) => data?.requestId), ['70', '70', '70', '70']);
 });
 
 test('career tools reject caller-forged request context', async () => {
@@ -228,8 +241,9 @@ test('single-agent save operation persists before completing the full pipeline',
   assert.equal(typeof execute, 'function');
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-save-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>(); const events: string[] = []; let persistedBeforeAcquire = false;
   const input = { jobId: 'agent-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'agent-event', originalUrl: 'https://linkedin.com/jobs/agent', canonicalUrl: 'https://linkedin.com/jobs/agent' };
-  const result = await execute!({ input, profileContext: 'GenAI engineer with five years of experience.', store, acquire: async () => { persistedBeforeAcquire = (await store.get(input.jobId))?.status === 'running'; return { contentType: 'text/plain', text: 'GenAI role' }; }, analyze: async () => ({ schemaVersion: 1, title: 'GenAI Engineer', company: 'Example', location: 'Remote', summary: 'Good fit.', fitScore: 90, nextStep: 'Apply.' }), sheet: { async findByJobId(id: string) { return rows.get(id) ?? null; }, async write(row: Record<string, unknown>) { rows.set(String(row.jobId), row); } }, observe: (_level: string, event: string) => { events.push(event); } });
-  assert.equal(persistedBeforeAcquire, true); assert.equal(result.jobId, input.jobId); assert.match(result.summary, /GenAI Engineer/); assert.equal((await store.get(input.jobId))?.status, 'succeeded'); assert.equal((await store.get(input.jobId))?.reportId, result.reportId); assert.equal(rows.get(input.jobId)?.status, 'succeeded'); assert.deepEqual(events, ['job.queued', 'job.started', 'job.succeeded']);
+  const result = await execute!({ input, profileContext: 'GenAI engineer with five years of experience.', store, acquire: async () => { persistedBeforeAcquire = (await store.get(input.jobId))?.status === 'running'; return { contentType: 'text/plain', text: 'GenAI role' }; }, analyze: async () => ({ schemaVersion: 1, title: 'GenAI Engineer', company: 'Example', location: 'Remote', summary: 'Good fit.', fitScore: 90, nextStep: 'Apply.' }), sheet: { async findByJobId(id: string) { return rows.get(id) ?? null; }, async write(row: Record<string, unknown>) { rows.set(String(row.jobId), row); } }, logger: (_level: string, event: string) => { events.push(event); } });
+  assert.equal(persistedBeforeAcquire, true); assert.equal(result.jobId, input.jobId); assert.match(result.summary, /GenAI Engineer/); assert.equal((await store.get(input.jobId))?.status, 'succeeded'); assert.equal((await store.get(input.jobId))?.reportId, result.reportId); assert.equal(rows.get(input.jobId)?.status, 'succeeded');
+  assert.deepEqual(events, ['job.queued', 'job.started', 'job.phase.started', 'job.phase.succeeded', 'job.phase.started', 'job.phase.succeeded', 'job.phase.started', 'job.phase.succeeded', 'job.phase.started', 'job.phase.succeeded', 'job.phase.started', 'job.phase.succeeded', 'job.succeeded']);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -247,9 +261,9 @@ test('single-agent save persists only a redacted failure', async () => {
   assert.equal((await store.get(input.jobId))?.status, 'failed'); assert.doesNotMatch((await store.get(input.jobId))?.safeError ?? '', /secret|do-not-store/); assert.equal(sheeted, false); await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('single-agent save is not broken by observability failures', async () => {
-  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-observe-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>(); const input = { jobId: 'observed-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'observed-event', originalUrl: 'https://linkedin.com/jobs/observe', canonicalUrl: 'https://linkedin.com/jobs/observe' };
-  const result = await executeSaveJob({ input, profileContext: 'profile', store, acquire: async () => ({ contentType: 'text/plain', text: 'job' }), analyze: async () => ({ schemaVersion: 1, title: 'Title', company: 'Company', location: 'Remote', summary: 'Summary', fitScore: 1, nextStep: 'Apply' }), sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } }, observe: () => { throw new Error('logger unavailable'); } });
+test('single-agent save is not broken by logger failures', async () => {
+  const { executeSaveJob } = await import('../src/tools/save-job-tool.ts'); const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-log-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const rows = new Map<string, Record<string, unknown>>(); const input = { jobId: 'logged-job', userId: '1', ownerId: 'owner', chatId: '2', transportEventId: 'logged-event', originalUrl: 'https://linkedin.com/jobs/logged', canonicalUrl: 'https://linkedin.com/jobs/logged' };
+  const result = await executeSaveJob({ input, profileContext: 'profile', store, acquire: async () => ({ contentType: 'text/plain', text: 'job' }), analyze: async () => ({ schemaVersion: 1, title: 'Title', company: 'Company', location: 'Remote', summary: 'Summary', fitScore: 1, nextStep: 'Apply' }), sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } }, logger: () => { throw new Error('logger unavailable'); } });
   assert.equal(result.jobId, input.jobId); assert.equal((await store.get(input.jobId))?.status, 'succeeded'); await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -435,16 +449,16 @@ test('Telegram polling reports transport failures', async () => {
   } finally { globalThis.fetch = originalFetch; }
 });
 
-test('Telegram stop aborts an in-flight long poll', async () => {
-  const originalFetch = globalThis.fetch; let signal: AbortSignal | undefined;
+test('Telegram stop aborts an in-flight long poll without false failure log', async () => {
+  const originalFetch = globalThis.fetch; let signal: AbortSignal | undefined; const events: string[] = [];
   globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => { signal = init?.signal ?? undefined; signal?.addEventListener('abort', () => reject(signal?.reason), { once: true }); setTimeout(() => reject(new Error('late timeout')), 30); });
-  try { const transport = createTelegramPollingTransport('bot-token', async () => {}); const started = transport.start(); await new Promise((resolve) => setImmediate(resolve)); transport.stop(); await started; assert.equal(signal?.aborted, true); } finally { globalThis.fetch = originalFetch; }
+  try { const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level, event) => { events.push(event); }); const started = transport.start(); await new Promise((resolve) => setImmediate(resolve)); transport.stop(); await started; assert.equal(signal?.aborted, true); assert.deepEqual(events, ['telegram.poll.started', 'telegram.poll.stopped']); } finally { globalThis.fetch = originalFetch; }
 });
 
 test('Telegram transport can deliver a recovery message before polling', async () => {
-  const originalFetch = globalThis.fetch; const calls: unknown[] = [];
+  const originalFetch = globalThis.fetch; const calls: unknown[] = []; const events: string[] = [];
   globalThis.fetch = async (_input, init) => { calls.push(JSON.parse(String(init?.body))); return new Response(JSON.stringify({ ok: true, result: true }), { headers: { 'content-type': 'application/json' } }); };
-  try { const transport = createTelegramPollingTransport('bot-token', async () => {}); await transport.sendMessage('chat-1', 'recovered'); assert.deepEqual(calls, [{ chat_id: 'chat-1', text: 'recovered' }]); transport.stop(); } finally { globalThis.fetch = originalFetch; }
+  try { const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level, event) => { events.push(event); }); await transport.sendMessage('chat-1', 'recovered'); assert.deepEqual(calls, [{ chat_id: 'chat-1', text: 'recovered' }]); assert.deepEqual(events, ['telegram.reply.started', 'telegram.reply.sent']); transport.stop(); } finally { globalThis.fetch = originalFetch; }
 });
 
 test('local observability exporter only accepts trace events', async () => {
@@ -453,6 +467,20 @@ test('local observability exporter only accepts trace events', async () => {
   assert.equal(typeof factory, 'function');
   const exporter = factory!();
   assert.equal(typeof exporter.onTracingEvent, 'function'); assert.equal('onMetricEvent' in exporter, false); assert.equal('onLogEvent' in exporter, false);
+});
+
+test('terminal app logger emits safe events without raw answer leakage', async () => {
+  const module = await import('../src/observability.ts');
+  const lines: string[] = [];
+  const logger = module.createTerminalAppLogger(() => 'now', { log: (line: string) => { lines.push(line); }, warn: (line: string) => { lines.push(line); }, error: (line: string) => { lines.push(line); } });
+  logger('info', 'onboarding.model.succeeded', { status: 'collecting', version: 2, fieldKeys: ['skills', `x${'y'.repeat(200)}\nnext`], updateId: 10, requestId: `req-${'z'.repeat(200)}`, rawAnswer: 'secret synthetic answer', url: 'https://example.test', ownerId: 'owner' });
+  assert.equal(lines.length, 1);
+  const parsed = JSON.parse(lines[0]);
+  assert.equal(parsed.requestId.length, 120);
+  assert.equal(parsed.fieldKeys[1].length, 120);
+  assert.doesNotMatch(parsed.fieldKeys[1], /\n/);
+  assert.deepEqual({ ts: parsed.ts, level: parsed.level, event: parsed.event, status: parsed.status, version: parsed.version, firstField: parsed.fieldKeys[0], updateId: parsed.updateId }, { ts: 'now', level: 'info', event: 'onboarding.model.succeeded', status: 'collecting', version: 2, firstField: 'skills', updateId: 10 });
+  assert.doesNotMatch(lines[0], /secret synthetic answer|example\.test|rawAnswer|url|owner/);
 });
 
 test('runtime rejects a Mastra database outside its protected data directory', async () => {
