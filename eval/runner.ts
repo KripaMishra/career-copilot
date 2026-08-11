@@ -187,7 +187,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);
     const acquire = (url: string) => acquireJobText(url, { fetch: fetchFake.fetch, resolve: fetchFake.resolve, timeoutMs: 5000 });
-    const memoryStorage = new LibSQLStore({ id: 'eval-memory', url: `file:${path.join(dir, 'memory.db')}` });
+    memoryStorage = new LibSQLStore({ id: 'eval-memory', url: `file:${path.join(dir, 'memory.db')}` });
     await memoryStorage.init();
     const baselineFiles = new Set(await listFiles(dir));
 
