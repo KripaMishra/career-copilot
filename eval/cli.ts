@@ -113,7 +113,7 @@ async function main() {
   const aggregateFile = path.join(RESULTS_DIR, `run-${Date.now()}.json`);
   await writeFile(aggregateFile, JSON.stringify({ aggregate, runs: results.map((result) => ({ runId: result.runId, scenarioId: result.scenarioId, status: result.status, corpusHash: result.corpusHash, manifest: result.manifest, metrics: result.metrics, assertions: result.assertions, redaction: result.redaction })), corpusHash: selected.hash }, null, 2));
   console.log(`artifact: ${aggregateFile} (redacted aggregate; raw transcripts stay local)`);
-  process.exit(exitCodeFor(aggregate, contractScenarios.length));
+  process.exit(exitCodeFor(aggregate));
 }
 
 main().catch((error) => {

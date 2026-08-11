@@ -36,10 +36,9 @@ export function aggregateOutcomes(outcomes: ScenarioOutcome[]): RunAggregate {
   return { status, passed, failed, incomplete, skipped, executed };
 }
 
-export function exitCodeFor(aggregate: RunAggregate, scenarioCount: number): number {
-  // Exit 0 only for documented successful terminal status; empty corpus is a
-  // successful no-op (scenarios land in #13c).
-  if (scenarioCount === 0) return 0;
+export function exitCodeFor(aggregate: RunAggregate): number {
+  // Exit 0 only for documented successful terminal status: passed, or skipped
+  // (no scenarios executed — an empty selection is a successful no-op).
   if (aggregate.status === 'passed' || aggregate.status === 'skipped') return 0;
   return 1;
 }
