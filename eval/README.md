@@ -30,7 +30,7 @@ Google, no real fetch. Any provider/network call outside the fakes fails the run
 | `eval/fixtures/*.yaml` | Synthetic fixtures (strict v1 schema). |
 | `eval/schemas/` | Zod v1 schemas: scenario, fixture, assertion, rubric, run artifact. Unknown keys fail validation. |
 | `eval/corpus.ts` | Recursive POSIX-ordered discovery, duplicate/ID/filename checks, content-sensitive corpus hash (SHA-256 over canonical scenario + referenced-fixture JSON). |
-| `eval/assertions.ts` | The 30 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
+| `eval/assertions.ts` | The 27 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
 | `eval/redaction.ts` | Sink-aware canary scanner (NFC-normalized, recursive, fail-closed). |
 | `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, Sheets fake, collecting logger. |
 | `eval/runner.ts` | Hermetic per-scenario runner: temp dir 0700, fresh libSQL DB + memory store, fixed clock/IDs, scripted turns, ledgers, state projection, redaction scan, cleanup. |

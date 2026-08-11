@@ -292,11 +292,6 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
     }
     return problems.length === 0 ? pass('A-NOTIFY-MARK-AFTER-SEND', 'notified_at only where delivery succeeded') : fail('A-NOTIFY-MARK-AFTER-SEND', problems.join('; '));
   },
-  'A-REPLAY-IDEMPOTENT': (ctx) => {
-    const replays = ctx.ledgers.lifecycle.filter((event) => event.event === 'telegram.update.rejected' && String(event.data.reason ?? '') === 'replayed_update');
-    if (replays.length === 0) return pass('A-REPLAY-IDEMPOTENT', 'no replayed updates');
-    return pass('A-REPLAY-IDEMPOTENT', `${replays.length} replayed update(s) rejected without effects`);
-  },
   'A-RECOVERY-REAUTH': (ctx) => {
     const resumed = ctx.ledgers.toolCalls.filter((call) => call.resumeJobId);
     const problems: string[] = [];
@@ -349,7 +344,6 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
     }
     return violations.length === 0 ? pass('A-LOG-ALLOWLIST', `${ctx.ledgers.logs.length} log event(s) allowlist-clean`) : fail('A-LOG-ALLOWLIST', `non-allowlisted log keys: ${violations.join(', ')}`);
   },
-  'A-SCHEMA-VALID': (ctx) => pass('A-SCHEMA-VALID', 'scenario/fixture/run artifacts parsed by strict v1 schemas'),
   'A-TRANSCRIPT-COMPLETE': (ctx) => {
     if (!ctx.transcriptComplete) return fail('A-TRANSCRIPT-COMPLETE', 'transcript incomplete (missing terminal replies or tool results)');
     return pass('A-TRANSCRIPT-COMPLETE', `${ctx.transcriptEvents.length} event(s), every turn terminal`);
