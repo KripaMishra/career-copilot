@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { parseArgs } from 'node:util';
 import { loadCorpus, filterCorpus } from './corpus.ts';
 import { runScenario, type RunnerManifest } from './runner.ts';
 import { aggregateOutcomes, exitCodeFor } from './status.ts';
@@ -11,20 +12,11 @@ import type { RunResult } from './schemas/run.ts';
 const RUNNER_VERSION = '0.1.0';
 const RESULTS_DIR = 'eval/results';
 
-function parseArgs(argv: string[]): { scenarioIds: string[]; keepArtifacts: boolean } {
-  const scenarioIds: string[] = [];
-  let keepArtifacts = false;
-  for (let index = 0; index < argv.length; index++) {
-    const arg = argv[index];
-    if (arg === '--keep-artifacts') keepArtifacts = true;
-    else if (arg === '--scenario') {
-      const id = argv[++index];
-      if (!id) throw new Error('--scenario requires an ID');
-      scenarioIds.push(id);
-    } else if (arg.startsWith('--scenario=')) scenarioIds.push(arg.slice('--scenario='.length));
-    else throw new Error(`unknown argument: ${arg}`);
-  }
-  return { scenarioIds, keepArtifacts };
+const OPTIONS = { 'keep-artifacts': { type: 'boolean' as const }, scenario: { type: 'string' as const, multiple: true as const } };
+
+function parseArgsCLI(argv: string[]): { scenarioIds: string[]; keepArtifacts: boolean } {
+  const { values } = parseArgs({ args: argv, options: OPTIONS });
+  return { scenarioIds: values.scenario ?? [], keepArtifacts: Boolean(values['keep-artifacts']) };
 }
 
 function lockfileHash(): string {
@@ -63,7 +55,7 @@ function manifestFor(fixtureClock: string): RunnerManifest {
 }
 
 async function main() {
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseArgsCLI(process.argv.slice(2));
   const corpus = await loadCorpus();
   if (corpus.errors.length > 0) {
     for (const error of corpus.errors) console.error(`invalid corpus: ${error.file}: ${error.message}`);
