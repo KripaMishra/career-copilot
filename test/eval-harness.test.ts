@@ -1,0 +1,749 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, mkdir, rm, writeFile, readdir } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { loadCorpus } from '../eval/corpus.ts';
+import { runScenario } from '../eval/runner.ts';
+import { parseScenario } from '../eval/schemas/scenario.ts';
+import { parseFixture } from '../eval/schemas/fixture.ts';
+
+const MANIFEST = {
+  sourceRevision: 'test',
+  runnerVersion: 'test',
+  nodeVersion: process.version,
+  lockfileHash: 'test',
+  seed: '2026-01-01T00:00:00Z',
+  clock: '2026-01-01T00:00:00Z',
+  model: 'scripted/contract-model',
+  judge: null,
+  retry: 'none',
+};
+
+const NEW_OWNER_FIXTURE = `schemaVersion: 1
+id: new-owner
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+model:
+  responses:
+    - purpose: memory
+      text: "{}"
+    - purpose: onboarding
+      match: "Senior backend engineer"
+      object:
+        reply: "Saved. Next: experience."
+        draftPatch:
+          currentStatus: "Senior backend engineer."
+        readyForReview: false
+    - purpose: onboarding
+      match: "Eight years"
+      object:
+        reply: "Saved. Next: education."
+        draftPatch:
+          experience: "Eight years of backend work."
+        readyForReview: false
+`;
+
+const ONBOARDING_SCENARIO = `schemaVersion: 1
+id: onboarding-minimal
+kind: contract
+persona: P01
+fixture: new-owner
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+  - id: t2
+    channel: telegram
+    input: { kind: text, text: "I am a Senior backend engineer with 8 years of experience." }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+  - id: t3
+    channel: telegram
+    input: { kind: text, text: "Eight years of backend work." }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-ONBOARDING-STATE, A-NO-ACTIVATION-BEFORE-CONFIRM, A-DRAFT-PATCH-ONLY, A-TOOLS-EXACT, A-TRANSCRIPT-COMPLETE, A-BUDGET, A-CANARY-CONTAINED, A-AUTH-BEFORE-MODEL, A-LOG-ALLOWLIST]
+tools:
+  counts:
+    save-job: 0
+limits:
+  maxTurns: 5
+  maxWallClockMs: 30000
+  maxModelCalls: 20
+`;
+
+async function writeCorpus(dir: string, fixtures: Record<string, string>, scenarios: Record<string, string>) {
+  const fixtureDir = path.join(dir, 'eval', 'fixtures');
+  const scenarioDir = path.join(dir, 'eval', 'scenarios');
+  await mkdir(fixtureDir, { recursive: true });
+  await mkdir(scenarioDir, { recursive: true });
+  for (const [id, yaml] of Object.entries(fixtures)) await writeFile(path.join(fixtureDir, `${id}.yaml`), yaml);
+  for (const [id, yaml] of Object.entries(scenarios)) await writeFile(path.join(scenarioDir, `${id}.yaml`), yaml);
+}
+
+async function runOnboarding(dir: string, keepArtifacts = false) {
+  const corpus = await loadCorpus(dir);
+  assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+  const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'onboarding-minimal')!;
+  const fixture = corpus.fixtures.get('new-owner')!.fixture;
+  return runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts, corpusHash: corpus.hash, runId: `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` });
+}
+
+test('strict schemas: unknown keys, unknown assertion IDs, and malformed YAML fail validation', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-schema-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, {});
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'bad-key.yaml'), `${ONBOARDING_SCENARIO}\nunknownField: true\n`);
+    let corpus = await loadCorpus(dir);
+    assert.ok(corpus.errors.some((error) => /unknownField/.test(error.message)), 'unknown scenario key must fail');
+
+    await rm(path.join(dir, 'eval', 'scenarios', 'bad-key.yaml'));
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'bad-assertion.yaml'), ONBOARDING_SCENARIO.replace('A-BUDGET', 'A-NO-SUCH-GATE'));
+    corpus = await loadCorpus(dir);
+    assert.ok(corpus.errors.some((error) => /unknown assertion ID/.test(error.message)), 'unknown assertion ID must fail');
+
+    await rm(path.join(dir, 'eval', 'scenarios', 'bad-assertion.yaml'));
+    await writeFile(path.join(dir, 'eval', 'fixtures', 'bad-key.yaml'), `${NEW_OWNER_FIXTURE}\nmystery: 1\n`);
+    corpus = await loadCorpus(dir);
+    assert.ok(corpus.errors.some((error) => /mystery/.test(error.message)), 'unknown fixture key must fail');
+
+    await rm(path.join(dir, 'eval', 'fixtures', 'bad-key.yaml'));
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'bad-yaml.yaml'), 'schemaVersion: 1\n  broken: [unclosed\n');
+    corpus = await loadCorpus(dir);
+    assert.ok(corpus.errors.some((error) => /bad-yaml/.test(error.message) || error.message.length > 0), 'malformed YAML must fail');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: duplicate IDs and filename/ID mismatch fail', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-discover-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    // duplicate ID requires the same filename in a different directory
+    await mkdir(path.join(dir, 'eval', 'scenarios', 'nested'), { recursive: true });
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'nested', 'onboarding-minimal.yaml'), ONBOARDING_SCENARIO);
+    const corpus = await loadCorpus(dir);
+    assert.ok(corpus.errors.some((error) => /duplicate scenario id/.test(error.message)), 'duplicate scenario id must fail');
+
+    await rm(path.join(dir, 'eval', 'scenarios', 'nested'), { recursive: true, force: true });
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'mismatch.yaml'), ONBOARDING_SCENARIO);
+    const corpus2 = await loadCorpus(dir);
+    assert.ok(corpus2.errors.some((error) => /does not match filename/.test(error.message)), 'filename/ID mismatch must fail');
+
+    await rm(path.join(dir, 'eval', 'scenarios', 'mismatch.yaml'));
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml.staged'), ONBOARDING_SCENARIO);
+    const corpus3 = await loadCorpus(dir);
+    assert.equal(corpus3.errors.length, 0);
+    assert.equal(corpus3.scenarios.length, 1, 'staged files are excluded from the live corpus');
+    assert.equal(corpus3.staged.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('corpus hash is content-sensitive and stable across reloads', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-hash-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const first = await loadCorpus(dir);
+    const second = await loadCorpus(dir);
+    assert.equal(first.hash, second.hash, 'hash must be stable across reloads');
+    assert.match(first.hash, /^[0-9a-f]{64}$/);
+    const changed = ONBOARDING_SCENARIO.replace('Eight years of backend work.', 'Eight years of backend work in fintech.');
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml'), changed);
+    const third = await loadCorpus(dir);
+    assert.notEqual(first.hash, third.hash, 'changing turn content must change the hash');
+
+    // fixture content is part of run semantics (scripted responses, DB rows,
+    // fetch plans, notification plans) — it must invalidate the hash too
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml'), ONBOARDING_SCENARIO);
+    const fixtureChanged = NEW_OWNER_FIXTURE.replace('Senior backend engineer.', 'Senior staff backend engineer.');
+    await writeFile(path.join(dir, 'eval', 'fixtures', 'new-owner.yaml'), fixtureChanged);
+    const fourth = await loadCorpus(dir);
+    assert.notEqual(third.hash, fourth.hash, 'changing fixture content must change the hash');
+
+    // fixtures NOT referenced by any scenario stay out of the hash
+    await writeFile(path.join(dir, 'eval', 'fixtures', 'unreferenced.yaml'), NEW_OWNER_FIXTURE.replace('id: new-owner', 'id: unreferenced'));
+    const fifth = await loadCorpus(dir);
+    assert.equal(fourth.hash, fifth.hash, 'unreferenced fixture content must not change the hash');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('hermetic runner: onboarding contract passes end to end with a scripted model', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-run-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const result = await runOnboarding(dir);
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    assert.equal(result.transcript.complete, true);
+    assert.equal(result.state.onboarding?.[0]?.status, 'collecting');
+    assert.equal(result.state.onboarding?.[0]?.version, 3);
+    assert.ok((result.state.onboarding?.[0]?.draft as Record<string, unknown>).currentStatus);
+    assert.ok((result.state.onboarding?.[0]?.draft as Record<string, unknown>).experience);
+    assert.equal(result.metrics.modelCalls, 2, 'one onboarding model call per answered turn; commands and memory extraction do not consume calls');
+    assert.equal(result.redaction.canariesFound.length, 0);
+    assert.equal(result.quality.status, 'not-run');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('runner isolation: repeated runs share no state and temp dirs are cleaned up', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-isolate-'));
+  const before = await readdir(tmpdir());
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const first = await runOnboarding(dir);
+    const second = await runOnboarding(dir);
+    assert.equal(first.status, 'passed');
+    assert.equal(second.status, 'passed');
+    assert.notEqual(first.runId, second.runId);
+    assert.deepEqual(first.state.jobs, [], 'fresh DB per run');
+    assert.deepEqual(second.state.jobs, []);
+    assert.equal(first.state.onboarding?.[0]?.version, second.state.onboarding?.[0]?.version, 'independent stores reach identical state');
+    const after = await readdir(tmpdir());
+    const leaked = after.filter((entry) => entry.startsWith('career-eval-') && !before.includes(entry));
+    assert.deepEqual(leaked, [], 'temp dirs must be removed after runs');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('keep-artifacts retains the temp directory and raw artifact path is reported', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-keep-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const result = await runOnboarding(dir, true);
+    assert.equal(result.status, 'passed');
+    assert.ok(result.redaction.rawArtifactPath, 'raw artifact path must be reported');
+    const entries = await readdir(result.redaction.rawArtifactPath!);
+    assert.ok(entries.some((entry) => entry.endsWith('.db')), 'database artifact retained');
+    await rm(result.redaction.rawArtifactPath!, { recursive: true, force: true });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('redaction fails closed: canary in a forbidden sink blocks the run', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-canary-'));
+  try {
+    const leakyFixture = NEW_OWNER_FIXTURE.replace(
+      'model:\n  responses:\n    - purpose: memory',
+      'canaries:\n  - { value: "CANARY_SECRET", sinks: [model] }\nmodel:\n  responses:\n    - purpose: memory',
+    ).replace(
+      'reply: "Saved. Next: experience."',
+      'reply: "Saved with CANARY_SECRET. Next: experience."',
+    );
+    await writeCorpus(dir, { 'new-owner': leakyFixture }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0);
+    const { scenario } = corpus.scenarios[0];
+    const fixture = corpus.fixtures.get('new-owner')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete');
+    assert.ok(result.redaction.canariesFound.includes('CANARY_SECRET'), 'canary must be reported');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('incomplete: uncaught model throw and budget breach are incomplete, never failed', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-incomplete-'));
+  try {
+    // production catches onboarding model errors (safe retry reply); an uncaught
+    // chat-path throw must make the run incomplete
+    const chatThrowFixture = `schemaVersion: 1
+id: chat-throw
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+model:
+  responses:
+    - purpose: chat
+      throws: "provider exploded"
+`;
+    const chatScenario = `schemaVersion: 1
+id: chat-throw-scenario
+kind: contract
+persona: P05
+fixture: chat-throw
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "hello" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-TRANSCRIPT-COMPLETE, A-BUDGET]
+limits:
+  maxModelCalls: 10
+`;
+    await writeCorpus(dir, { 'chat-throw': chatThrowFixture }, { 'chat-throw-scenario': chatScenario });
+    const corpus = await loadCorpus(dir);
+    const { scenario } = corpus.scenarios[0];
+    const fixture = corpus.fixtures.get('chat-throw')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'uncaught model throw must be incomplete');
+
+    const budgeted = ONBOARDING_SCENARIO.replace('maxModelCalls: 20', 'maxModelCalls: 1');
+    await writeFile(path.join(dir, 'eval', 'fixtures', 'new-owner.yaml'), NEW_OWNER_FIXTURE);
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml'), budgeted);
+    const corpus2 = await loadCorpus(dir);
+    const result2 = await runScenario({ scenario: corpus2.scenarios[0].scenario, fixture: corpus2.fixtures.get('new-owner')!.fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus2.hash, runId: `test-${Date.now()}` });
+    assert.equal(result2.status, 'incomplete', 'budget breach must be incomplete');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('value assertions: path operators evaluate against the run context', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-value-'));
+  try {
+    const passing = ONBOARDING_SCENARIO.replace(
+      'assertions: [A-ONBOARDING-STATE, A-NO-ACTIVATION-BEFORE-CONFIRM, A-DRAFT-PATCH-ONLY, A-TOOLS-EXACT, A-TRANSCRIPT-COMPLETE, A-BUDGET, A-CANARY-CONTAINED, A-AUTH-BEFORE-MODEL, A-LOG-ALLOWLIST]',
+      'assertions:\n  - A-ONBOARDING-STATE\n  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 0 }\n  - { id: A-JOB-STATE, path: "state.onboarding[0].status", op: eq, value: collecting }\n  - { id: A-JOB-STATE, path: "state.onboarding[0].version", op: eq, value: 3 }\n  - { id: A-JOB-STATE, path: "state.profiles", op: count, value: 0 }\n  - { id: A-JOB-STATE, path: "state.nonexistent", op: absent }\n  - { id: A-JOB-STATE, path: "state.onboarding[0].draft.currentStatus", op: eq, value: "Senior backend engineer." }',
+    );
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': passing });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios[0];
+    const fixture = corpus.fixtures.get('new-owner')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+
+    // a member assertion against an empty array must fail the run
+    const failing = passing.replace('{ id: A-JOB-STATE, path: "state.nonexistent", op: absent }', '{ id: A-JOB-STATE, path: "state.jobs", op: member, value: {} }');
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml'), failing);
+    const corpus2 = await loadCorpus(dir);
+    const result2 = await runScenario({ scenario: corpus2.scenarios[0].scenario, fixture: corpus2.fixtures.get('new-owner')!.fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus2.hash, runId: `test-${Date.now()}` });
+    assert.equal(result2.status, 'failed');
+    const member = result2.assertions.find((a) => a.id === 'A-JOB-STATE' && /member/.test(a.evidence));
+    assert.equal(member?.status, 'failed', 'member operator on an empty array must fail');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('turn outcomes: unauthorized turns fail closed on expected outcomes', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-auth-'));
+  try {
+    const unauthorized = `schemaVersion: 1
+id: onboarding-minimal
+kind: contract
+persona: P11
+fixture: new-owner
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:9999"
+    expected: rejected
+  - id: t2
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+  - id: t3
+    channel: telegram
+    input: { kind: text, text: "I am a Senior backend engineer with 8 years." }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-ONBOARDING-STATE, A-AUTH-BEFORE-MODEL]
+tools:
+  counts:
+    save-job: 0
+limits:
+  maxTurns: 5
+  maxWallClockMs: 30000
+  maxModelCalls: 20
+`;
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': unauthorized });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios[0];
+    const fixture = corpus.fixtures.get('new-owner')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    const turnCheck = result.assertions.find((a) => a.id === 'turn.t1.outcome');
+    assert.equal(turnCheck?.status, 'passed');
+    assert.equal(result.state.onboarding?.[0]?.status, 'collecting', 'the authorized /onboarding still started the flow');
+
+    const wronglyExpected = unauthorized.replace('conversationId: "telegram:9999"\n    expected: rejected', 'conversationId: "telegram:9999"\n    expected: accepted');
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml'), wronglyExpected);
+    const corpus2 = await loadCorpus(dir);
+    const result2 = await runScenario({ scenario: corpus2.scenarios[0].scenario, fixture: corpus2.fixtures.get('new-owner')!.fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus2.hash, runId: `test-${Date.now()}` });
+    assert.equal(result2.status, 'failed', 'expected-accepted on an unauthorized turn must fail');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('scenario and fixture schemas parse with strict unknown-key rejection', () => {
+  assert.throws(() => parseScenario({ schemaVersion: 1, id: 'x', kind: 'contract', persona: 'P01', fixture: 'f', turns: [], assertions: ['A-BUDGET'], extra: true }));
+  assert.throws(() => parseFixture({ schemaVersion: 1, id: 'f', ownerId: 'o', extra: 1 }));
+  assert.throws(() => parseScenario({ ...parseScenario({ schemaVersion: 1, id: 'x', kind: 'contract', persona: 'P01', fixture: 'f', turns: [{ id: 't1', channel: 'telegram', input: { kind: 'text', text: 'hi' }, actorId: '1', conversationId: 'telegram:1', expected: 'accepted' }], assertions: ['A-BUDGET'] }), persona: 'P99' }));
+});
+
+const SAVE_FLOW_FIXTURE = `schemaVersion: 1
+id: save-flow
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada\\nExperience: 8 years backend\\nSkills: TypeScript"
+      active: true
+      version: 2
+fetch:
+  - url: "https://linkedin.com/jobs/view/42"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+notifications:
+  - jobId: "fixture-0001"
+    deliver: fail-first
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/42"
+            profileContext: ""
+    - purpose: analysis
+      object:
+        schemaVersion: 1
+        title: "Senior Platform Engineer"
+        company: "Example Corp"
+        location: "Remote"
+        summary: "Platform tooling for the core product."
+        fitScore: 82
+        nextStep: "Apply with the confirmed profile."
+    - purpose: chat
+      text: "Saved: Senior Platform Engineer at Example Corp."
+`;
+
+const SAVE_REPLAY_SCENARIO = `schemaVersion: 1
+id: save-replay
+kind: contract
+persona: P03
+fixture: save-flow
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/42" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+    updateId: 9001
+  - id: t2
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/42" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+    updateId: 9001
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-FETCH-DATA-NOT-POLICY
+  - A-SSRF-BLOCK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-SAFE-ERROR
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+tools:
+  require: [save-job]
+  forbid: [web_fetch]
+  counts:
+    save-job: 1
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 20
+`;
+
+test('full save replay: analyzeJob runs inside the harness, tool ledger is exact, fail-first delivery is real', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-save-'));
+  try {
+    await writeCorpus(dir, { 'save-flow': SAVE_FLOW_FIXTURE }, { 'save-replay': SAVE_REPLAY_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'save-replay')!;
+    const fixture = corpus.fixtures.get('save-flow')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+
+    // the save path ran end to end through the real agent + save-job tool
+    assert.equal(result.state.jobs.length, 1);
+    const job = result.state.jobs[0];
+    assert.equal(job.status, 'succeeded');
+    assert.ok(job.safeResult, 'job must carry a safe result');
+    assert.ok(job.reportId, 'job must carry a report');
+    assert.equal(result.state.sheets.length, 1, 'sheet row must be verified');
+    assert.equal(result.state.sheets[0].jobId, 'fixture-0001');
+    assert.ok(job.notifiedAt, 'notification must be marked only after the successful delivery');
+
+    // tool ledger is non-destructive and exact: 1 call, identity + url captured
+    const toolCalls = result.assertions.find((a) => a.id === 'A-TOOLS-EXACT')!;
+    assert.equal(toolCalls.status, 'passed', toolCalls.evidence);
+    const urlPolicy = result.assertions.find((a) => a.id === 'A-URL-POLICY')!;
+    assert.equal(urlPolicy.status, 'passed', urlPolicy.evidence);
+
+    // notification delivery is a real ledger: attempt 1 failed (fail-first),
+    // attempt 2 (the same-update replay) delivered
+    assert.deepEqual(result.state.notifications.map((n) => ({ delivered: n.delivered, attempt: n.attempt })), [
+      { delivered: false, attempt: 1 },
+      { delivered: true, attempt: 2 },
+    ]);
+    assert.equal(result.transcript.events.filter((e) => e.type === 'tool_call').length, 1);
+    assert.equal(result.transcript.events.filter((e) => e.type === 'notification').length, 2);
+
+    // the first turn is terminal via the delivery-failure record, not a reply
+    const t1 = result.assertions.find((a) => a.id === 'turn.t1.outcome')!;
+    assert.equal(t1.status, 'passed', t1.evidence);
+    const t2 = result.assertions.find((a) => a.id === 'turn.t2.outcome')!;
+    assert.equal(t2.status, 'passed', t2.evidence);
+    assert.equal(result.transcript.complete, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const SSRF_FIXTURE = `schemaVersion: 1
+id: ssrf-flow
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada"
+      active: true
+fetch:
+  - url: "https://linkedin.com/jobs/view/99"
+    dns: ["10.0.0.5"]
+    status: 200
+    contentType: "text/html"
+    body: "<p>internal</p>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+notifications: []
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/99"
+            profileContext: ""
+    - purpose: chat
+      text: "The job could not be saved safely."
+`;
+
+const SSRF_SCENARIO = `schemaVersion: 1
+id: ssrf-block
+kind: contract
+persona: P03
+fixture: ssrf-flow
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/99" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions:
+  - A-TOOLS-EXACT
+  - A-URL-POLICY
+  - A-SSRF-BLOCK
+  - A-SAFE-ERROR
+  - A-JOB-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-LOG-ALLOWLIST
+tools:
+  counts:
+    save-job: 1
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 20
+`;
+
+test('SSRF: private-DNS fetch plans are blocked by the real policy and recorded', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-ssrf-'));
+  try {
+    await writeCorpus(dir, { 'ssrf-flow': SSRF_FIXTURE }, { 'ssrf-block': SSRF_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'ssrf-block')!;
+    const fixture = corpus.fixtures.get('ssrf-flow')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    const job = result.state.jobs[0];
+    assert.equal(job.status, 'failed', 'private-address fetch must fail the job');
+    assert.ok(String(job.safeError).length > 0, 'failed job carries a safe error');
+    assert.equal(result.transcript.events.filter((e) => e.type === 'tool_call').length, 1);
+    assert.equal(result.transcript.events.filter((e) => e.type === 'tool_result').length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('per-turn timeoutMs: a hung turn makes the run incomplete, never stalls', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-timeout-'));
+  try {
+    // the fetch plan hangs until the policy abort signal fires; the turn's
+    // timeoutMs must expire first and mark the run incomplete
+    const hangFixture = `schemaVersion: 1
+id: hang-flow
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada"
+      active: true
+fetch:
+  - url: "https://linkedin.com/jobs/view/77"
+    dns: ["93.184.216.34"]
+    timeout: true
+sheets:
+  headers: []
+  rows: []
+notifications: []
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/77"
+            profileContext: ""
+    - purpose: chat
+      text: "Saved."
+`;
+    const hangScenario = `schemaVersion: 1
+id: hang-turn
+kind: contract
+persona: P03
+fixture: hang-flow
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/77" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+    timeoutMs: 150
+assertions: [A-TRANSCRIPT-COMPLETE, A-BUDGET]
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 20
+`;
+    await writeCorpus(dir, { 'hang-flow': hangFixture }, { 'hang-turn': hangScenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const started = Date.now();
+    const result = await runScenario({ scenario: corpus.scenarios[0].scenario, fixture: corpus.fixtures.get('hang-flow')!.fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'a hung turn past timeoutMs must be incomplete');
+    assert.ok(Date.now() - started < 5000, 'run must return at the per-turn timeout, not the global wall clock');
+    assert.ok(result.transcript.events.some((e) => e.type === 'error'), 'timeout must be recorded in the transcript');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('stub merge conflicts: sheets failure modes and notification plans fail validation', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubconflict-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE, 'stub-sheets': `schemaVersion: 1
+id: stub-sheets
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+sheets:
+  failure: auth
+model:
+  responses:
+    - purpose: chat
+      text: "stub"
+`, 'stub-notify': `schemaVersion: 1
+id: stub-notify
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+notifications:
+  - { jobId: "job-1", deliver: "ok" }
+model:
+  responses:
+    - purpose: chat
+      text: "stub"
+` }, {});
+    const baseFixture = NEW_OWNER_FIXTURE.replace('id: new-owner', 'id: new-owner-conflict').replace('clock: "2026-01-01T00:00:00Z"\n', 'clock: "2026-01-01T00:00:00Z"\nsheets:\n  failure: write\nnotifications:\n  - { jobId: "job-1", deliver: "fail-first" }\n');
+    await writeFile(path.join(dir, 'eval', 'fixtures', 'new-owner-conflict.yaml'), baseFixture);
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'conflict.yaml'), `schemaVersion: 1
+id: conflict
+kind: contract
+persona: P01
+fixture: new-owner-conflict
+stubs: [stub-sheets, stub-notify]
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-BUDGET]
+`);
+    const corpus = await loadCorpus(dir);
+    const messages = corpus.errors.map((e) => e.message).join('; ');
+    assert.ok(/sheets failure modes write, auth/.test(messages), `sheets conflict must fail validation: ${messages}`);
+    assert.ok(/conflicting delivery modes fail-first\/ok/.test(messages), `notification conflict must fail validation: ${messages}`);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
