@@ -72,7 +72,6 @@ export type ScriptedModel = {
   provider: string;
   modelId: string;
   doGenerate(options: Record<string, unknown>): Promise<Record<string, unknown>>;
-  doStream(options: Record<string, unknown>): Promise<{ stream: ReadableStream<unknown>; warnings: unknown[] }>;
 };
 
 export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger: ScriptedModelLedger, provider = 'scripted', modelId = 'career-copilot-contract-model'): ScriptedModel {
@@ -143,17 +142,6 @@ export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger
     modelId,
     async doGenerate(options: Record<string, unknown>) {
       return generate(options);
-    },
-    async doStream(options: Record<string, unknown>) {
-      const result = await generate(options);
-      const streamId = `stream-${served}`;
-      const parts: unknown[] = [{ type: 'stream-start', warnings: [] }, { type: 'response-metadata', id: result.response?.id, modelId: result.response?.modelId }];
-      for (const part of result.content as Array<{ type: string; text?: string }>) {
-        if (part.type === 'text') parts.push({ type: 'text-start', id: streamId }, { type: 'text-delta', id: streamId, delta: part.text ?? '' }, { type: 'text-end', id: streamId });
-        if (part.type === 'tool-call') parts.push(part);
-      }
-      parts.push({ type: 'finish', finishReason: (result.finishReason as { unified: string }).unified });
-      return { stream: new ReadableStream({ start(controller) { for (const part of parts) controller.enqueue(part); controller.close(); } }), warnings: [] };
     },
   };
 }
