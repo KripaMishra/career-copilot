@@ -41,7 +41,7 @@ function scenarioIdFromFile(file: string): string {
 }
 
 function canonicalScenarioJson(scenario: Scenario): string {
-  return JSON.stringify({ ...scenario, turns: scenario.turns, assertions: scenario.assertions, rubrics: scenario.rubrics ?? [], limits: scenario.limits ?? {} });
+  return JSON.stringify(scenario);
 }
 
 /** Canonical serialization of a parsed (defaults-applied) fixture. */
