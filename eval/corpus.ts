@@ -24,14 +24,11 @@ const SCENARIO_DIR = 'eval/scenarios';
 const FIXTURE_DIR = 'eval/fixtures';
 
 async function walk(dir: string): Promise<string[]> {
-  const entries = await readdir(dir, { withFileTypes: true }).catch(() => []);
-  const files: string[] = [];
-  for (const entry of entries) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) files.push(...(await walk(full)));
-    else if (entry.isFile()) files.push(full);
-  }
-  return files.sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'variant' }));
+  const all = await readdir(dir, { recursive: true }).catch(() => []);
+  return all
+    .filter((entry) => !all.some((other) => other !== entry && other.startsWith(entry + '/')))
+    .map((entry) => path.join(dir, entry))
+    .sort((a, b) => a.localeCompare(b, 'en', { sensitivity: 'variant' }));
 }
 
 function readYaml(file: string): unknown {

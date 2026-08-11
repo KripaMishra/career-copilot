@@ -42,18 +42,11 @@ export type RunOptions = {
 const FALLBACK_CLOCK_MS = Date.parse('2026-01-01T00:00:00Z');
 
 async function listFiles(dir: string): Promise<string[]> {
-  const out: string[] = [];
-  const stack = [dir];
-  while (stack.length > 0) {
-    const current = stack.pop()!;
-    const entries = await readdir(current, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      const full = path.join(current, entry.name);
-      if (entry.isDirectory()) stack.push(full);
-      else if (entry.isFile()) out.push(full);
-    }
-  }
-  return out.sort();
+  const all = await readdir(dir, { recursive: true }).catch(() => []);
+  return all
+    .filter((entry) => !all.some((other) => other !== entry && other.startsWith(entry + '/')))
+    .map((entry) => path.join(dir, entry))
+    .sort();
 }
 
 function isSimulatedDeliveryFailure(error: unknown): boolean {
