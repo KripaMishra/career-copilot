@@ -161,8 +161,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   let currentTurnId: string | null = null;
   let currentUpdateId: string | null = null;
   let modelCallsAtTurnStart = 0;
-  const toolCallLogs: { event: string; data: Record<string, unknown>; turnId: string | null }[] = [];
-  const lifecycleLogs: { event: string; data: Record<string, unknown>; turnId: string | null }[] = [];
 
   try {
     store = new CareerStore(`file:${dbFile}`, { clock });
@@ -298,7 +296,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
           };
           openToolCalls.add(toolLedger.length);
           toolLedger.push(record);
-          toolCallLogs.push({ event: log.event, data: log.data, turnId: turn.id });
           emit('tool_call', turn.id, { toolId: record.toolId });
         } else if (log.event.startsWith('job.') || log.event.startsWith('onboarding.') || log.event.startsWith('recovery.') || log.event.startsWith('telegram.update.') || log.event === 'command.received' || log.event === 'agent.turn.started' || log.event === 'agent.turn.succeeded' || log.event === 'agent.turn.failed') {
           const record: LifecycleRecord = { event: log.event, data: { ...log.data }, turnId: turn.id };
@@ -306,7 +303,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
           if (log.data.phase) record.phase = String(log.data.phase);
           if (log.data.status) record.status = String(log.data.status);
           lifecycle.push(record);
-          lifecycleLogs.push({ event: log.event, data: log.data, turnId: turn.id });
           emit('lifecycle', turn.id, { event: log.event, ...log.data });
         } else if (log.event === 'agent.turn.failed') {
           emit('error', turn.id, { event: log.event });
