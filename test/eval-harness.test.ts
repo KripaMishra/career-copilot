@@ -13,11 +13,8 @@ const MANIFEST = {
   runnerVersion: 'test',
   nodeVersion: process.version,
   lockfileHash: 'test',
-  seed: '2026-01-01T00:00:00Z',
   clock: '2026-01-01T00:00:00Z',
   model: 'scripted/contract-model',
-  judge: null,
-  retry: 'none',
 };
 
 const NEW_OWNER_FIXTURE = `schemaVersion: 1
@@ -193,7 +190,6 @@ test('hermetic runner: onboarding contract passes end to end with a scripted mod
     assert.ok((result.state.onboarding?.[0]?.draft as Record<string, unknown>).experience);
     assert.equal(result.metrics.modelCalls, 2, 'one onboarding model call per answered turn; commands and memory extraction do not consume calls');
     assert.equal(result.redaction.canariesFound.length, 0);
-    assert.equal(result.quality.status, 'not-run');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

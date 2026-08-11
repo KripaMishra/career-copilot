@@ -28,7 +28,7 @@ Google, no real fetch. Any provider/network call outside the fakes fails the run
 |---|---|
 | `eval/scenarios/*.yaml` | Live scenario corpus (strict v1 schema). `*.yaml.staged` are excluded from live discovery/hash and can only be targeted explicitly. |
 | `eval/fixtures/*.yaml` | Synthetic fixtures (strict v1 schema). |
-| `eval/schemas/` | Zod v1 schemas: scenario, fixture, assertion, rubric, run artifact. Unknown keys fail validation. |
+| `eval/schemas/` | Zod v1 schemas: scenario, fixture, assertion, run artifact. Unknown keys fail validation. |
 | `eval/corpus.ts` | Recursive POSIX-ordered discovery, duplicate/ID/filename checks, content-sensitive corpus hash (SHA-256 over canonical scenario + referenced-fixture JSON). |
 | `eval/assertions.ts` | The 27 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
 | `eval/redaction.ts` | Sink-aware canary scanner (NFC-normalized, recursive, fail-closed). |
@@ -63,7 +63,6 @@ tools:                             # optional A-TOOLS-EXACT expectations
   require: []
   forbid: []
   counts: { save-job: 0 }
-rubrics: []                        # quality lane only (validated now, unused)
 limits: { maxTurns: 2, maxWallClockMs: 30000, maxModelCalls: 4 }
 ```
 

@@ -46,11 +46,8 @@ function manifestFor(fixtureClock: string): RunnerManifest {
     runnerVersion: RUNNER_VERSION,
     nodeVersion: process.version,
     lockfileHash: lockfileHash(),
-    seed: fixtureClock,
     clock: fixtureClock,
     model: 'scripted/career-copilot-contract-model',
-    judge: null,
-    retry: 'none',
   };
 }
 

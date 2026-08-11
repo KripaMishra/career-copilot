@@ -28,26 +28,12 @@ export const assertionResultSchema = z.strictObject({
   evidence: z.string(),
 });
 
-export const qualitySchema = z.strictObject({
-  status: z.enum(['not-run', 'passed', 'failed', 'incomplete']).default('not-run'),
-  rubrics: z
-    .array(z.strictObject({
-      id: z.string(),
-      status: z.enum(['not-run', 'passed', 'failed', 'incomplete']),
-      score: z.number().int().min(1).max(5).nullable(),
-      evidence: z.string(),
-      criticalFailure: z.boolean().default(false),
-    }))
-    .default([]),
-});
-
 export const metricsSchema = z.strictObject({
   durationMs: z.number().int().nonnegative(),
   ttFirstResponseMs: z.number().int().nonnegative().nullable(),
   modelCalls: z.number().int().nonnegative(),
   inputTokens: z.number().int().nonnegative().nullable(),
   outputTokens: z.number().int().nonnegative().nullable(),
-  estimatedCostUsd: z.number().nonnegative().nullable(),
   peakRssBytes: z.number().int().nonnegative().nullable(),
   transcriptBytes: z.number().int().nonnegative(),
 });
@@ -63,11 +49,8 @@ export const manifestSchema = z.strictObject({
   runnerVersion: z.string(),
   nodeVersion: z.string(),
   lockfileHash: z.string(),
-  seed: z.string(),
   clock: z.string(),
   model: z.string().nullable(),
-  judge: z.string().nullable(),
-  retry: z.string(),
 });
 
 export const runResultSchema = z.strictObject({
@@ -88,7 +71,6 @@ export const runResultSchema = z.strictObject({
     notifications: z.array(z.record(z.string(), z.unknown())),
   }),
   assertions: z.array(assertionResultSchema),
-  quality: qualitySchema,
   metrics: metricsSchema,
   redaction: redactionSchema,
 });

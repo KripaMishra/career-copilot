@@ -1,6 +1,5 @@
 import { z } from 'zod';
 import { assertionSchema, assertionIdSchema } from './assertion.ts';
-import { rubricIdSchema } from './rubric.ts';
 
 export const SCHEMA_VERSION = 1 as const;
 
@@ -56,7 +55,6 @@ export const scenarioSchema = z.strictObject({
   turns: z.array(turnSchema).min(1).max(500),
   stubs: z.array(z.string().regex(/^[a-z0-9][a-z0-9-]{2,80}$/)).max(20).optional(),
   assertions: z.array(assertionSchema).min(1).max(100),
-  rubrics: z.array(rubricIdSchema).max(10).optional(),
   tools: toolExpectationSchema.optional(),
   limits: limitsSchema.optional(),
 });

@@ -4,7 +4,5 @@ export { fixtureSchema, parseFixture, modelPurposeSchema, canarySinkSchema, ALL_
 export type { Fixture, FetchPlan, SheetPlan, ModelResponse, ModelPlan, Canary, CanarySink, NotificationPlan, JobRow } from './fixture.ts';
 export { ASSERTION_IDS, assertionSchema, valueAssertionSchema, operatorSchema, isValueAssertion } from './assertion.ts';
 export type { AssertionId, AssertionEntry, ValueAssertion, Operator } from './assertion.ts';
-export { RUBRIC_IDS, rubricIdSchema } from './rubric.ts';
-export type { RubricId } from './rubric.ts';
 export { runResultSchema, eventSchema, transcriptSchema, manifestSchema, parseRunResult, RUN_SCHEMA_VERSION } from './run.ts';
 export type { RunResult, TranscriptEvent, AssertionResult, Manifest, Metrics, Redaction, RunStatus } from './run.ts';

@@ -22,11 +22,8 @@ export type RunnerManifest = {
   runnerVersion: string;
   nodeVersion: string;
   lockfileHash: string;
-  seed: string;
   clock: string;
   model: string | null;
-  judge: string | null;
-  retry: string;
 };
 
 export type RunOptions = {
@@ -396,7 +393,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       modelCalls: modelCalls.length,
       inputTokens: modelCalls.length > 0 && modelCalls.every((call) => call.inputTokens !== null) ? modelCalls.reduce((sum, call) => sum + (call.inputTokens ?? 0), 0) : null,
       outputTokens: modelCalls.length > 0 && modelCalls.every((call) => call.outputTokens !== null) ? modelCalls.reduce((sum, call) => sum + (call.outputTokens ?? 0), 0) : null,
-      estimatedCostUsd: null,
       peakRssBytes: Math.round(process.memoryUsage().rss / 1024) * 1024,
       transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8'),
     };
@@ -443,7 +439,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       transcript: { complete: transcriptComplete, events },
       state,
       assertions: assertionResults,
-      quality: { status: 'not-run', rubrics: [] },
       metrics,
       redaction: { canariesFound: hits.map((hit) => hit.canary), sinksScanned: [...new Set(scanned)], rawArtifactPath: keepArtifacts ? dir : null },
     });
@@ -462,8 +457,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       transcript: { complete: false, events },
       state: { onboarding: [], profiles: [], jobs: [], reports: [], sheets: [], notifications: [] },
       assertions: [],
-      quality: { status: 'not-run', rubrics: [] },
-      metrics: { durationMs: Date.now() - startedAt, ttFirstResponseMs: null, modelCalls: modelLedger.calls.length, inputTokens: null, outputTokens: null, estimatedCostUsd: null, peakRssBytes: null, transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8') },
+      metrics: { durationMs: Date.now() - startedAt, ttFirstResponseMs: null, modelCalls: modelLedger.calls.length, inputTokens: null, outputTokens: null, peakRssBytes: null, transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8') },
       redaction: { canariesFound: [], sinksScanned: [], rawArtifactPath: keepArtifacts ? dir : null },
     });
   } finally {
