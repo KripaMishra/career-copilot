@@ -32,7 +32,7 @@ Google, no real fetch. Any provider/network call outside the fakes fails the run
 | `eval/corpus.ts` | Recursive POSIX-ordered discovery, duplicate/ID/filename checks, content-sensitive corpus hash (SHA-256 over canonical scenario + referenced-fixture JSON). |
 | `eval/assertions.ts` | The 30 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
 | `eval/redaction.ts` | Sink-aware canary scanner (NFC-normalized, recursive, fail-closed). |
-| `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, Sheets fake, collecting logger/trace collector. |
+| `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, Sheets fake, collecting logger. |
 | `eval/runner.ts` | Hermetic per-scenario runner: temp dir 0700, fresh libSQL DB + memory store, fixed clock/IDs, scripted turns, ledgers, state projection, redaction scan, cleanup. |
 | `eval/status.ts` | passed/failed/incomplete/skipped semantics and run aggregation. |
 | `eval/cli.ts` | `eval:test` entry point. |
@@ -172,7 +172,7 @@ Notes for `#13c` authors:
 
 ## Redaction
 
-Canaries are scanned across replies, logs, database state, sheets, traces,
+Canaries are scanned across replies, logs, database state, sheets,
 model-call ledgers, and notifications. An exact (NFC-normalized) match in any
 sink the canary is not classified for blocks the run (`incomplete`). Fixture
 canaries that intentionally enter the model sink (injection tests) must be

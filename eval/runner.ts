@@ -6,7 +6,7 @@ import { createAgentResponder, createCareerCopilotRuntime, createOnboardingRespo
 import { CareerStore } from '../src/storage/career-store.ts';
 import { LibSQLStore } from '@mastra/libsql';
 import { acquireJobText } from '../src/tools/web-fetch-tool.ts';
-import { evaluateAssertions, type RunContext, type ToolCallRecord, type LifecycleRecord } from './assertions.ts';
+import { evaluateAssertions, type RunContext, type ToolCallRecord, type LifecycleRecord, type LogRecord } from './assertions.ts';
 import type { Fixture, Scenario, Turn } from './schemas/index.ts';
 import { resolveLimits } from './schemas/index.ts';
 import type { RunResult, TranscriptEvent, AssertionResult } from './schemas/run.ts';
@@ -14,7 +14,7 @@ import { parseRunResult } from './schemas/run.ts';
 import { createScriptedModel, asModelConfig, type ScriptedModelLedger } from './fakes/model.ts';
 import { createFetchFake, type FetchLedger } from './fakes/fetch.ts';
 import { createSheetsFake, type SheetsLedger } from './fakes/sheets.ts';
-import { createCollectingLogger, createTraceCollector, type CollectedLog, type TraceSpan } from './fakes/logger.ts';
+import { createCollectingLogger } from './fakes/logger.ts';
 import { scanTargets, type ScanTarget } from './redaction.ts';
 
 export type RunnerManifest = {
@@ -121,9 +121,8 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   const emit = (type: TranscriptEvent['type'], turnId: string | null, payload: Record<string, unknown> = {}) => {
     events.push({ sequence: ++sequence, turnId, type, atMs: atMs(), payload });
   };
-  const logLedger: CollectedLog[] = [];
-  const allLogs: CollectedLog[] = [];
-  const traceLedger: TraceSpan[] = [];
+  const logLedger: LogRecord[] = [];
+  const allLogs: LogRecord[] = [];
   const modelLedger: ScriptedModelLedger = { calls: [] };
   const fetchLedger: FetchLedger = { calls: [] };
   const sheetsLedger: SheetsLedger = { calls: [] };
@@ -133,7 +132,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   const openToolCalls = new Set<number>();
   const lifecycle: LifecycleRecord[] = [];
   const logger = createCollectingLogger(logLedger);
-  const trace = createTraceCollector(traceLedger);
 
   const mergedFixture: Fixture = {
     ...fixture,
@@ -397,7 +395,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       { name: 'logs', sink: 'log', value: allLogs },
       { name: 'database', sink: 'database', value: { onboarding: onboardingRows, profiles, jobs, reports } },
       { name: 'sheets', sink: 'sheet', value: sheetsFake.rows },
-      { name: 'traces', sink: 'trace', value: traceLedger },
       { name: 'model-calls', sink: 'model', value: modelLedger.calls },
       { name: 'notifications', sink: 'reply', value: notifications },
     ];

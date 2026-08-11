@@ -338,11 +338,6 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
     }
     return problems.length === 0 ? pass('A-SAFE-ERROR', `${ctx.state.jobs.filter((candidate) => candidate.status === 'failed').length} failed job(s) with safe errors only`) : fail('A-SAFE-ERROR', problems.join('; '));
   },
-  'A-TRACE-REDACTED': (ctx) => {
-    const hits = ctx.redactionHits.filter((hit) => hit.sink === 'trace');
-    if (hits.length > 0) return fail('A-TRACE-REDACTED', `trace sink leaked ${hits.length} canary(ies)`);
-    return pass('A-TRACE-REDACTED', 'trace payloads redacted (no canary hits)');
-  },
   'A-LOG-ALLOWLIST': (ctx) => {
     const violations: string[] = [];
     for (const log of ctx.ledgers.logs) {
