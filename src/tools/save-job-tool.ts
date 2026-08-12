@@ -13,6 +13,7 @@ export type SaveJobDeps = {
   profileText?: string;
   acquire?: typeof acquireJobText;
   analyze: (text: string, profile: string) => Promise<Analysis>;
+  uuid?: () => string;
   logger?: AppLogger;
 };
 
@@ -38,7 +39,7 @@ export async function executeSaveJob(options: SaveJobDeps & { input: JobInput; p
   if (stored.job.attempts >= 2) throw new Error('Automatic retry limit reached; send a new save request.');
   let running = stored.job;
   try {
-    running = await options.store.markRunning(persistedInput.jobId, stored.job.mastraRunId ?? randomUUID()) ?? stored.job;
+    running = await options.store.markRunning(persistedInput.jobId, stored.job.mastraRunId ?? (options.uuid ?? randomUUID)()) ?? stored.job;
     await options.store.assertRunningInput(persistedInput);
     const eventData = { jobId: persistedInput.jobId, requestId: persistedInput.transportEventId, attempt: running.attempts };
     log('info', stored.duplicate ? 'job.resumed' : 'job.started', eventData);

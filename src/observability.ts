@@ -31,6 +31,7 @@ export type AppLogger = (level: AppLogLevel, event: string, data?: Record<string
 const safeAppLogKeys = new Set([
   'attempt', 'chunkCount', 'command', 'durationMs', 'errorName', 'eventName', 'fieldKeys', 'jobId', 'missingFields', 'outcome', 'phase', 'readyForReview', 'reason', 'recovery', 'reportId', 'requestId', 'status', 'toolId', 'unfinishedJobs', 'updateId', 'version',
 ]);
+export { safeAppLogKeys };
 
 const maxLogStringLength = 120;
 const clipLogString = (value: unknown) => String(value).replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, maxLogStringLength);

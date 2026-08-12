@@ -145,9 +145,11 @@ export class CareerStore {
   readonly #client: Client;
   readonly #ownsClient: boolean;
   readonly #url: string;
+  readonly #clock: () => number;
   #ready: Promise<void>;
 
-  constructor(config: string | LibsqlConnectionConfig | Client) {
+  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number } = {}) {
+    this.#clock = options.clock ?? Date.now;
     if (typeof config === 'string') { const safe = validateDirectConnectionConfig({ url: config }); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
     else if ('execute' in config) { this.#url = ''; this.#client = config; this.#ownsClient = false; }
     else { const safe = validateDirectConnectionConfig(config); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
@@ -166,7 +168,7 @@ export class CareerStore {
   statuses(): JobStatus[] { return ['queued', 'running', 'needs_input', 'succeeded', 'failed']; }
 
   async enqueue(input: JobInput): Promise<{ job: Job; duplicate: boolean }> {
-    await this.#ready; const value = JobInputSchema.parse(input); const now = Date.now();
+    await this.#ready; const value = JobInputSchema.parse(input); const now = this.#clock();
     const inserted = await this.#client.execute({ sql: `INSERT INTO career_jobs (job_id,user_id,owner_id,chat_id,transport_event_id,original_url,canonical_url,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?, 'queued', ?,?) ON CONFLICT(transport_event_id) DO NOTHING`, args: [value.jobId, value.userId, value.ownerId, value.chatId, value.transportEventId, value.originalUrl, value.canonicalUrl, now, now] });
     const row = (await this.#client.execute({ sql: 'SELECT * FROM career_jobs WHERE transport_event_id = ?', args: [value.transportEventId] })).rows[0];
     if (!row) throw new Error('Persisted job could not be read after enqueue.');
@@ -185,14 +187,14 @@ export class CareerStore {
     await this.#ready; const rows = (status ? await this.#client.execute({ sql: 'SELECT * FROM career_jobs WHERE status = ? ORDER BY created_at', args: [status] }) : await this.#client.execute('SELECT * FROM career_jobs ORDER BY created_at')).rows;
     return rows.map(rowToJob);
   }
-  async markRunning(jobId: string, runId: string) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='running', mastra_run_id=?, attempts=attempts+1, updated_at=? WHERE job_id=? AND status IN ('queued','running')", args: [runId, Date.now(), jobId] }); return this.get(jobId); }
-  async complete(jobId: string, result: SafeResult, reportId: string | null, sheetReference: string | null) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='succeeded', safe_result=?, report_id=?, report_path=NULL, sheet_reference=?, safe_error=NULL, updated_at=? WHERE job_id=?", args: [JSON.stringify(result), reportId, sheetReference, Date.now(), jobId] }); return this.get(jobId); }
-  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_error=?, updated_at=? WHERE job_id=?", args: [safeErrorMessage(error), Date.now(), jobId] }); return this.get(jobId); }
-  async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [Date.now(), Date.now(), jobId] }); return this.get(jobId); }
+  async markRunning(jobId: string, runId: string) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='running', mastra_run_id=?, attempts=attempts+1, updated_at=? WHERE job_id=? AND status IN ('queued','running')", args: [runId, this.#clock(), jobId] }); return this.get(jobId); }
+  async complete(jobId: string, result: SafeResult, reportId: string | null, sheetReference: string | null) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='succeeded', safe_result=?, report_id=?, report_path=NULL, sheet_reference=?, safe_error=NULL, updated_at=? WHERE job_id=?", args: [JSON.stringify(result), reportId, sheetReference, this.#clock(), jobId] }); return this.get(jobId); }
+  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_error=?, updated_at=? WHERE job_id=?", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
+  async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [this.#clock(), this.#clock(), jobId] }); return this.get(jobId); }
   async unfinished() { return (await this.list()).filter((job) => job.status === 'queued' || job.status === 'running'); }
 
   async saveReport(input: { ownerId: string; jobId: string; content: string }) {
-    await this.#ready; const now = Date.now();
+    await this.#ready; const now = this.#clock();
     const job = (await this.#client.execute({ sql: 'SELECT owner_id FROM career_jobs WHERE job_id = ?', args: [input.jobId] })).rows[0];
     if (!job) throw new Error('Report job does not exist.');
     const ownerId = String(job.owner_id);
@@ -204,7 +206,7 @@ export class CareerStore {
   }
   async getReport(reportId: string, ownerId: string) { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_reports WHERE report_id = ? AND owner_id = ?', args: [reportId, ownerId] })).rows[0]; return row ? { reportId: String(row.report_id), ownerId: String(row.owner_id), jobId: String(row.job_id), version: Number(row.version), content: String(row.content), sha256: String(row.sha256), byteSize: Number(row.byte_size), createdAt: Number(row.created_at) } : null; }
   async saveProfileDocument(input: { ownerId: string; name: string; content: string; active?: boolean }) {
-    await this.#ready; const name = safeDocumentName(input.name); assertSafeProfileContent(input.content); const now = Date.now();
+    await this.#ready; const name = safeDocumentName(input.name); assertSafeProfileContent(input.content); const now = this.#clock();
     const current = (await this.#client.execute({ sql: 'SELECT COALESCE(MAX(version), 0) AS version FROM career_profile_documents WHERE owner_id=? AND name=?', args: [input.ownerId, name] })).rows[0];
     const version = Number(current?.version ?? 0) + 1; const documentId = `${hash(`${input.ownerId}:${name}`).slice(0, 16)}-v${version}`; const contentHash = hash(input.content);
     const statements: InStatement[] = [];
@@ -221,7 +223,7 @@ export class CareerStore {
   async startOnboarding(input: { ownerId: string; conversationId: string; restart?: boolean }) {
     await this.#ready; const existing = await this.loadOnboarding(input.ownerId, input.conversationId);
     if (existing && ['collecting', 'review'].includes(existing.status) && !input.restart) return existing;
-    const now = Date.now();
+    const now = this.#clock();
     await this.#client.execute({ sql: `INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_id, conversation_id) DO UPDATE SET status='collecting', draft_json='{}', version=career_onboarding.version+1, updated_at=excluded.updated_at`, args: [input.ownerId, input.conversationId, 'collecting', '{}', 1, now, now] });
     return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
@@ -233,18 +235,18 @@ export class CareerStore {
     assertSafeOnboardingDraft(draft);
     const status = input.status ?? 'collecting';
     if (status === 'review' && onboardingMissingFields(draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
-    const updated = await this.#client.execute({ sql: 'UPDATE career_onboarding SET status=?, draft_json=?, version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN (\'collecting\',\'review\')', args: [status, JSON.stringify(draft), Date.now(), input.ownerId, input.conversationId, input.expectedVersion] });
+    const updated = await this.#client.execute({ sql: 'UPDATE career_onboarding SET status=?, draft_json=?, version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN (\'collecting\',\'review\')', args: [status, JSON.stringify(draft), this.#clock(), input.ownerId, input.conversationId, input.expectedVersion] });
     if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
     return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
   async cancelOnboarding(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
     await this.#ready;
-    const updated = await this.#client.execute({ sql: "UPDATE career_onboarding SET status='cancelled', draft_json='{}', version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN ('collecting','review')", args: [Date.now(), input.ownerId, input.conversationId, input.expectedVersion] });
+    const updated = await this.#client.execute({ sql: "UPDATE career_onboarding SET status='cancelled', draft_json='{}', version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN ('collecting','review')", args: [this.#clock(), input.ownerId, input.conversationId, input.expectedVersion] });
     if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
     return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
   async completeOnboarding(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
-    await this.#ready; const name = 'onboarding.md'; const now = Date.now(); let committed = false;
+    await this.#ready; const name = 'onboarding.md'; const now = this.#clock(); let committed = false;
     const transaction = await this.#client.transaction('write');
     try {
       const row = (await transaction.execute({ sql: 'SELECT * FROM career_onboarding WHERE owner_id=? AND conversation_id=?', args: [input.ownerId, input.conversationId] })).rows[0];
@@ -283,11 +285,11 @@ export class CareerStore {
     const existing = (await this.#client.execute({ sql: 'SELECT * FROM career_reports WHERE report_id=?', args: [input.reportId] })).rows[0];
     if (existing) {
       assertImportMatch(String(existing.owner_id) === input.ownerId && String(existing.job_id) === input.jobId && String(existing.sha256) === contentHash && Number(existing.byte_size) === byteSize, 'Imported report collision does not match source content.');
-      if (!job.report_id) await this.#client.execute({ sql: 'UPDATE career_jobs SET report_id=?, updated_at=? WHERE job_id=? AND report_id IS NULL', args: [input.reportId, input.createdAt ?? Date.now(), input.jobId] });
+      if (!job.report_id) await this.#client.execute({ sql: 'UPDATE career_jobs SET report_id=?, updated_at=? WHERE job_id=? AND report_id IS NULL', args: [input.reportId, input.createdAt ?? this.#clock(), input.jobId] });
       return { reportId: String(existing.report_id), hash: `sha256:${String(existing.sha256)}`, byteSize: Number(existing.byte_size), version: Number(existing.version), imported: false };
     }
     const allocated = (await this.#client.execute({ sql: `INSERT INTO career_report_counters (job_id,next_version) VALUES (?, COALESCE((SELECT MAX(version) FROM career_reports WHERE job_id=?), 0) + 2) ON CONFLICT(job_id) DO UPDATE SET next_version=next_version+1 RETURNING next_version - 1 AS version`, args: [input.jobId, input.jobId] })).rows[0];
-    const version = Number(allocated?.version); const now = input.createdAt ?? Date.now();
+    const version = Number(allocated?.version); const now = input.createdAt ?? this.#clock();
     await this.#client.batch([
       { sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,version,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?,?)', args: [input.reportId, input.ownerId, input.jobId, version, input.content, contentHash, byteSize, now] },
       { sql: 'UPDATE career_jobs SET report_id=?, updated_at=? WHERE job_id=? AND (report_id IS NULL OR report_id=?)', args: [input.reportId, now, input.jobId, input.reportId] },
@@ -300,13 +302,22 @@ export class CareerStore {
     const existing = (await this.#client.execute({ sql: 'SELECT document_id,sha256,byte_size,version FROM career_profile_documents WHERE document_id=?', args: [documentId] })).rows[0];
     if (existing) return { documentId: String(existing.document_id), hash: `sha256:${String(existing.sha256)}`, byteSize: Number(existing.byte_size), version: Number(existing.version), imported: false };
     const current = (await this.#client.execute({ sql: 'SELECT COALESCE(MAX(version), 0) AS version FROM career_profile_documents WHERE owner_id=? AND name=?', args: [input.ownerId, name] })).rows[0];
-    const version = Number(current?.version ?? 0) + 1; const now = input.createdAt ?? Date.now();
+    const version = Number(current?.version ?? 0) + 1; const now = input.createdAt ?? this.#clock();
     await this.#client.execute({ sql: 'INSERT INTO career_profile_documents (document_id,owner_id,name,version,active,content,sha256,byte_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', args: [documentId, input.ownerId, name, version, input.active === false ? 0 : 1, input.content, contentHash, bytes(input.content), now, now] });
     return { documentId, hash: `sha256:${contentHash}`, byteSize: bytes(input.content), version, imported: true };
   }
   async profileText(ownerId: string) {
     await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT name, content FROM career_profile_documents WHERE owner_id=? AND active=1 ORDER BY name', args: [ownerId] })).rows;
     return rows.map((row) => { const name = safeDocumentName(String(row.name)); const content = String(row.content); assertSafeProfileContent(content); return `${name}:\n${content}`; }).join('\n').slice(0, 100_000);
+  }
+  async listProfileDocuments(ownerId: string) {
+    await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT * FROM career_profile_documents WHERE owner_id=? ORDER BY created_at, document_id', args: [ownerId] })).rows;
+    return rows.map((row) => ({ documentId: String(row.document_id), ownerId: String(row.owner_id), name: String(row.name), version: Number(row.version), active: Number(row.active) === 1, content: String(row.content), sha256: String(row.sha256), byteSize: Number(row.byte_size), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at) }));
+  }
+  async importOnboarding(input: { ownerId: string; conversationId: string; status: 'collecting' | 'review' | 'completed' | 'cancelled'; draft: OnboardingDraft; version: number; createdAt?: number; updatedAt?: number }) {
+    await this.#ready; const draft = OnboardingDraftSchema.parse(input.draft); assertSafeOnboardingDraft(draft);
+    const now = this.#clock();
+    await this.#client.execute({ sql: 'INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_id, conversation_id) DO NOTHING', args: [input.ownerId, input.conversationId, input.status, JSON.stringify(draft), input.version, input.createdAt ?? now, input.updatedAt ?? now] });
   }
   static newJobId() { return randomUUID(); }
 }
