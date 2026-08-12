@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, rm, writeFile, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { loadCorpus } from '../eval/corpus.ts';
+import { loadCorpus, filterCorpus } from '../eval/corpus.ts';
 import { runScenario } from '../eval/runner.ts';
 import { parseScenario } from '../eval/schemas/scenario.ts';
 import { parseFixture } from '../eval/schemas/fixture.ts';
@@ -687,6 +687,180 @@ limits:
     assert.equal(result.status, 'incomplete', 'a hung turn past timeoutMs must be incomplete');
     assert.ok(Date.now() - started < 5000, 'run must return at the per-turn timeout, not the global wall clock');
     assert.ok(result.transcript.events.some((e) => e.type === 'error'), 'timeout must be recorded in the transcript');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('filterCorpus rejects unknown scenario ids instead of silently selecting nothing', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-filter-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, { 'onboarding-minimal': ONBOARDING_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.throws(() => filterCorpus(corpus, ['typo']), /unknown scenario id/, 'unknown --scenario value must throw, not no-op');
+    assert.throws(() => filterCorpus(corpus, ['onboarding-minimal', 'typo']), /unknown scenario id/, 'mixed known/unknown ids must throw');
+    const selected = filterCorpus(corpus, ['onboarding-minimal']);
+    assert.equal(selected.corpus.scenarios.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('redaction: canary in profile text that reaches the model prompt is caught at the model sink', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-canary-model-'));
+  try {
+    const leaky = SAVE_FLOW_FIXTURE.replace('Skills: TypeScript', 'Skills: CANARY_PROFILE').replace('model:\n  responses:', 'canaries:\n  - { value: "CANARY_PROFILE", sinks: [database] }\nmodel:\n  responses:');
+    await writeCorpus(dir, { 'save-flow': leaky }, { 'save-replay': SAVE_REPLAY_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'save-replay')!;
+    const fixture = corpus.fixtures.get('save-flow')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'a database-only canary that reaches the model prompt must fail the run');
+    assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
+    const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
+    assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('redaction: canary in persisted report content is caught at the report sink', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-canary-report-'));
+  try {
+    const fixture = `schemaVersion: 1
+id: report-leak
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  jobs:
+    - jobId: "job-9"
+      userId: "1001"
+      ownerId: career-owner-v0
+      chatId: "2001"
+      transportEventId: "telegram:1"
+      originalUrl: "https://linkedin.com/jobs/view/9"
+      canonicalUrl: "https://linkedin.com/jobs/view/9"
+      status: succeeded
+      reportId: "r-9"
+  reports:
+    - reportId: "r-9"
+      ownerId: career-owner-v0
+      jobId: "job-9"
+      content: "Executive summary CANARY_REPORT"
+canaries:
+  - { value: "CANARY_REPORT", sinks: [database] }
+model:
+  responses:
+    - purpose: chat
+      text: "ok"
+`;
+    const scenario = `schemaVersion: 1
+id: report-leak-scenario
+kind: contract
+persona: P03
+fixture: report-leak
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "hello" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-CANARY-CONTAINED, A-TRANSCRIPT-COMPLETE, A-BUDGET]
+limits:
+  maxTurns: 5
+  maxWallClockMs: 30000
+  maxModelCalls: 10
+`;
+    await writeCorpus(dir, { 'report-leak': fixture }, { 'report-leak-scenario': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios[0];
+    const fixtureEntry = corpus.fixtures.get('report-leak')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture: fixtureEntry, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'a canary in persisted report content must fail the run');
+    assert.ok(result.redaction.canariesFound.includes('CANARY_REPORT'), 'canary must be reported');
+    const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
+    assert.match(gate.evidence, /@report:/, 'hit must be attributed to the report sink');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('assertion context sees stub-merged identities, plans, and fetch (mergedFixture semantics)', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubmerge-'));
+  try {
+    const base = `schemaVersion: 1
+id: save-base
+ownerId: career-owner-v0
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada\\nExperience: 8 years backend\\nSkills: TypeScript"
+      active: true
+      version: 2
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/42"
+            profileContext: ""
+`;
+    const stub = `schemaVersion: 1
+id: save-stub
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+fetch:
+  - url: "https://linkedin.com/jobs/view/42"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+notifications:
+  - jobId: "fixture-0001"
+    deliver: fail-first
+model:
+  responses:
+    - purpose: analysis
+      object:
+        schemaVersion: 1
+        title: "Senior Platform Engineer"
+        company: "Example Corp"
+        location: "Remote"
+        summary: "Platform tooling for the core product."
+        fitScore: 82
+        nextStep: "Apply with the confirmed profile."
+    - purpose: chat
+      text: "Saved: Senior Platform Engineer at Example Corp."
+`;
+    const scenario = SAVE_REPLAY_SCENARIO.replace('fixture: save-flow', 'fixture: save-base\nstubs: [save-stub]');
+    await writeCorpus(dir, { 'save-base': base, 'save-stub': stub }, { 'save-replay': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios.find((entry) => entry.scenario.id === 'save-replay')!;
+    const fixture = corpus.fixtures.get('save-base')!.fixture;
+    const stubFixture = corpus.fixtures.get('save-stub')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture, stubs: [stubFixture], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    const toolContext = result.assertions.find((a) => a.id === 'A-TOOL-CONTEXT')!;
+    assert.equal(toolContext.status, 'passed', 'stub-provided identity must be authorized in assertion context');
+    assert.deepEqual(result.state.notifications.map((n) => ({ delivered: n.delivered, attempt: n.attempt })), [
+      { delivered: false, attempt: 1 },
+      { delivered: true, attempt: 2 },
+    ], 'stub-provided fail-first plan must drive the delivery ledger');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

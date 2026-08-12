@@ -19,6 +19,8 @@ export type ScriptedModelCall = {
   purpose: string;
   provider: string;
   model: string;
+  promptText: string;
+  outputText: string;
   promptChars: number;
   inputTokens: number | null;
   outputTokens: number | null;
@@ -117,6 +119,8 @@ export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger
       purpose,
       provider,
       model: modelId,
+      promptText: prompt,
+      outputText: JSON.stringify(content),
       promptChars: prompt.length,
       inputTokens: response.usage?.inputTokens ?? null,
       outputTokens: response.usage?.outputTokens ?? null,

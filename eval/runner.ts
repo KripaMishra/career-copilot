@@ -339,10 +339,14 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     const profiles = await store.listProfileDocuments(fixture.ownerId);
     const jobs = await store.list();
     const reports: Record<string, unknown>[] = [];
+    const reportContents: string[] = [];
     for (const job of jobs) {
       if (job.reportId) {
         const report = await store.getReport(job.reportId, fixture.ownerId);
-        if (report) reports.push({ reportId: report.reportId, ownerId: report.ownerId, jobId: report.jobId, version: report.version, byteSize: report.byteSize, createdAt: report.createdAt });
+        if (report) {
+          reports.push({ reportId: report.reportId, ownerId: report.ownerId, jobId: report.jobId, version: report.version, byteSize: report.byteSize, createdAt: report.createdAt });
+          reportContents.push(report.content);
+        }
       }
     }
     const state = {
@@ -380,6 +384,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       { name: 'replies', sink: 'reply', value: replyLedger.map((reply) => reply.text) },
       { name: 'logs', sink: 'log', value: allLogs },
       { name: 'database', sink: 'database', value: { onboarding: onboardingRows, profiles, jobs, reports } },
+      { name: 'reports', sink: 'report', value: reportContents },
       { name: 'sheets', sink: 'sheet', value: sheetsFake.rows },
       { name: 'model-calls', sink: 'model', value: modelLedger.calls },
       { name: 'notifications', sink: 'reply', value: notifications },
@@ -399,7 +404,9 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
 
     const ctx: RunContext = {
       scenario,
-      fixture,
+      // assertions judge what actually ran: the runtime is configured from the
+      // stub-merged fixture (identities, fetch plans, notification plans)
+      fixture: mergedFixture,
       limits,
       transcriptComplete,
       transcriptEvents: events,

@@ -144,7 +144,9 @@ export function filterCorpus(corpus: Corpus, ids: string[]): { corpus: Corpus; e
   const wanted = new Set(ids);
   const included = corpus.scenarios.filter(({ scenario }) => wanted.has(scenario.id));
   const excluded = corpus.scenarios.filter(({ scenario }) => !wanted.has(scenario.id)).map(({ scenario }) => scenario.id);
-  const missing = ids.filter((id) => !wanted.has(id) && !included.some(({ scenario }) => scenario.id === id));
+  // ids that match no live scenario are unknown, never a silent no-op (the
+  // previous `!wanted.has(id)` clause was always false: every id is in wanted)
+  const missing = ids.filter((id) => !included.some(({ scenario }) => scenario.id === id));
   if (missing.length > 0) throw new Error(`unknown scenario id(s): ${missing.join(', ')} (live corpus only)`);
   return { corpus: { ...corpus, scenarios: included, hash: corpusHashOf(included, corpus.fixtures) }, excluded };
 }
