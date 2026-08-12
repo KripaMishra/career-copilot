@@ -23,7 +23,7 @@ for (const [network, prefix] of [
 function privateAddress(address: string) { const type = isIP(address); return type === 0 || (type === 4 ? blockedIPv4.check(address, 'ipv4') : blockedIPv6.check(address, 'ipv6')); }
 export function validateJobUrl(value: string) { return assertJobUrl(value); }
 export function normalizeResponseStatus(value: number | undefined) { return typeof value === 'number' && Number.isInteger(value) && value >= 200 && value <= 599 ? value : 502; }
-type FetchDeps = { fetch?: typeof globalThis.fetch; resolve?: (host: string) => Promise<string[]>; maxDecodedBytes?: number; timeoutMs?: number };
+type FetchDeps = { fetch?: typeof globalThis.fetch; resolve?: (host: string) => Promise<string[]>; maxDecodedBytes?: number; timeoutMs?: number; signal?: AbortSignal };
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const abort = () => reject(new Error('Job fetch timed out.'));
@@ -63,7 +63,7 @@ async function bodyText(response: Response, limit: number, signal: AbortSignal) 
 }
 export async function acquireJobText(value: string, deps: FetchDeps = {}) {
   const fetcher = deps.fetch; const resolve = deps.resolve ?? (async (host: string) => (await lookup(host, { all: true })).map((entry) => entry.address));
-  let url = assertJobUrl(value); const original = url; const limit = deps.maxDecodedBytes ?? MAX_DECODED_BYTES; const timeoutMs = deps.timeoutMs ?? 15_000; const signal = AbortSignal.timeout(timeoutMs);
+  let url = assertJobUrl(value); const original = url; const limit = deps.maxDecodedBytes ?? MAX_DECODED_BYTES; const timeoutMs = deps.timeoutMs ?? 15_000; const signal = deps.signal ?? AbortSignal.timeout(timeoutMs);
   for (let redirectCount = 0; redirectCount <= 3; redirectCount++) {
     const addresses = await publicAddresses(url.hostname, resolve, signal);
     const response = fetcher ? await fetcher(url, { redirect: 'manual', headers: requestHeaders, signal }) : await pinnedFetch(url, addresses[0], limit, timeoutMs, signal);

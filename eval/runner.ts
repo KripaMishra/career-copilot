@@ -37,6 +37,8 @@ export type RunOptions = {
 };
 
 const FALLBACK_CLOCK_MS = Date.parse('2026-01-01T00:00:00Z');
+/** bounded wait for an aborted turn to settle before the runner snapshots state and cleans the sandbox */
+const TURN_SETTLE_GRACE_MS = 2000;
 
 async function listFiles(dir: string): Promise<string[]> {
   const all = await readdir(dir, { recursive: true }).catch(() => []);
@@ -178,7 +180,10 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     const sheetsFake = createSheetsFake(mergedFixture.sheets, sheetsLedger);
     const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);
-    const acquire = (url: string) => acquireJobText(url, { fetch: fetchFake.fetch, resolve: fetchFake.resolve, timeoutMs: 5000 });
+    // cancellation seam: the active turn's AbortSignal propagates into the SUT's
+    // fetch (acquireJobText), so a timed-out turn is aborted, not just abandoned
+    let activeTurnSignal: AbortSignal | null = null;
+    const acquire = (url: string) => acquireJobText(url, { fetch: fetchFake.fetch, resolve: fetchFake.resolve, timeoutMs: 5000, ...(activeTurnSignal ? { signal: activeTurnSignal } : {}) });
     memoryStorage = new LibSQLStore({ id: 'eval-memory', url: `file:${path.join(dir, 'memory.db')}` });
     await memoryStorage.init();
     const baselineFiles = new Set(await listFiles(dir));
@@ -247,16 +252,31 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
         // per-turn timeout (issue #13): a hung turn is incomplete, never stalls the scenario
         let result: Awaited<ReturnType<typeof runtime.handleTelegramUpdate>>;
         if (turn.timeoutMs) {
+          const controller = new AbortController();
+          activeTurnSignal = controller.signal;
           let timer: NodeJS.Timeout | undefined;
           try {
             result = await Promise.race([
               turnPromise,
               new Promise<never>((_resolve, reject) => {
-                timer = setTimeout(() => reject(Object.assign(new Error(`turn ${turn.id} exceeded per-turn timeoutMs ${turn.timeoutMs}`), { evalTurnTimeout: true })), turn.timeoutMs);
+                timer = setTimeout(() => {
+                  controller.abort();
+                  reject(Object.assign(new Error(`turn ${turn.id} exceeded per-turn timeoutMs ${turn.timeoutMs}`), { evalTurnTimeout: true }));
+                }, turn.timeoutMs);
               }),
             ]);
           } finally {
             clearTimeout(timer);
+            // the aborted turn settles (fetch rejects, job fails, agent unwinds)
+            // BEFORE the runner snapshots state and cleans the sandbox — bounded,
+            // so a signal-ignoring SUT still cannot stall the scenario
+            let settleTimer: NodeJS.Timeout | undefined;
+            await Promise.race([
+              turnPromise.catch(() => undefined),
+              new Promise<void>((resolve) => { settleTimer = setTimeout(resolve, TURN_SETTLE_GRACE_MS); }),
+            ]);
+            clearTimeout(settleTimer);
+            activeTurnSignal = null;
           }
         } else {
           result = await turnPromise;
@@ -381,7 +401,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     const everyTurnTerminal = turnOutcomes.every((outcome) => outcome.error === null);
     const everyToolClosed = openToolCalls.size === 0;
     const transcriptComplete = !incompleteReason && everyTurnTerminal && everyToolClosed;
-    emit('lifecycle', null, { event: 'run.completed', status });
 
     // scenario-level turn expectations (not catalog gates); an accepted turn is
     // terminal only when it produced a delivered reply or a (simulated) delivery
@@ -448,6 +467,10 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     if (failures.length > 0) markIncomplete(failures.map((failure) => `${failure.kind}: ${failure.message}`).join('; '));
 
     if (status === 'passed' && assertionResults.some((result) => result.status === 'failed')) status = 'failed';
+
+    // final completion event: after every incomplete condition is resolved, with
+    // the true final status and the reason (consumers need the transcript alone)
+    emit('lifecycle', null, { event: 'run.completed', status, ...(incompleteReason ? { reason: incompleteReason } : {}) });
 
     return parseRunResult({
       runSchemaVersion: 1,

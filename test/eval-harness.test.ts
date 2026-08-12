@@ -688,6 +688,10 @@ limits:
     assert.equal(result.status, 'incomplete', 'a hung turn past timeoutMs must be incomplete');
     assert.ok(Date.now() - started < 5000, 'run must return at the per-turn timeout, not the global wall clock');
     assert.ok(result.transcript.events.some((e) => e.type === 'error'), 'timeout must be recorded in the transcript');
+    // the timed-out turn must be cancelled and settle before the snapshot: the
+    // abort propagates through the SUT's fetch, the job lands as failed, and no
+    // work is left running after cleanup (pre-fix: still 'running' at snapshot)
+    assert.equal(result.state.jobs[0]?.status, 'failed', 'the hung job must settle to failed before the runner snapshots state');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -721,6 +725,83 @@ test('redaction: canary in profile text that reaches the model prompt is caught 
     assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
     const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
     assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('A-REPORT-BEFORE-SUCCESS requires a resolved report for every succeeded job', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-reportgate-'));
+  try {
+    const fixture = `schemaVersion: 1
+id: report-gate
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  jobs:
+    - jobId: "job-7"
+      userId: "1001"
+      ownerId: career-owner-v0
+      chatId: "2001"
+      transportEventId: "telegram:1"
+      originalUrl: "https://linkedin.com/jobs/view/7"
+      canonicalUrl: "https://linkedin.com/jobs/view/7"
+      status: succeeded
+      safeResult:
+        summary: "done"
+        reportId: null
+        reportPath: null
+        sheetReference: null
+    - jobId: "job-8"
+      userId: "1001"
+      ownerId: career-owner-v0
+      chatId: "2001"
+      transportEventId: "telegram:2"
+      originalUrl: "https://linkedin.com/jobs/view/8"
+      canonicalUrl: "https://linkedin.com/jobs/view/8"
+      status: succeeded
+      reportId: "r-missing"
+      safeResult:
+        summary: "done"
+        reportId: null
+        reportPath: null
+        sheetReference: null
+model:
+  responses:
+    - purpose: chat
+      text: "ok"
+`;
+    const scenario = `schemaVersion: 1
+id: report-gate-scenario
+kind: contract
+persona: P03
+fixture: report-gate
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "hello" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-REPORT-BEFORE-SUCCESS, A-TRANSCRIPT-COMPLETE, A-BUDGET]
+limits:
+  maxTurns: 5
+  maxWallClockMs: 30000
+  maxModelCalls: 10
+`;
+    await writeCorpus(dir, { 'report-gate': fixture }, { 'report-gate-scenario': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios[0];
+    const fixtureEntry = corpus.fixtures.get('report-gate')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture: fixtureEntry, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'failed', 'succeeded jobs without a report must fail A-REPORT-BEFORE-SUCCESS');
+    const gate = result.assertions.find((a) => a.id === 'A-REPORT-BEFORE-SUCCESS')!;
+    assert.equal(gate.status, 'failed', gate.evidence);
+    assert.match(gate.evidence, /job-7 succeeded without a report/, 'missing reportId must be flagged even with safeResult present');
+    assert.match(gate.evidence, /job-8 succeeded referencing missing report r-missing/, 'dangling reportId must be flagged');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -786,6 +867,10 @@ limits:
     assert.ok(result.redaction.canariesFound.includes('CANARY_REPORT'), 'canary must be reported');
     const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
     assert.match(gate.evidence, /@report:/, 'hit must be attributed to the report sink');
+    const completed = result.transcript.events.find((e) => e.type === 'lifecycle' && e.payload.event === 'run.completed');
+    assert.ok(completed, 'run.completed must be present');
+    assert.equal(completed.payload.status, 'incomplete', 'run.completed must carry the final status, not the pre-check status');
+    assert.match(String(completed.payload.reason ?? ''), /canary/, 'run.completed must carry the incomplete reason');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

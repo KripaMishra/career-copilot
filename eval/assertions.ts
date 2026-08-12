@@ -259,7 +259,8 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   'A-REPORT-BEFORE-SUCCESS': (ctx) => {
     const problems: string[] = [];
     for (const job of ctx.state.jobs.filter((candidate) => candidate.status === 'succeeded')) {
-      if (!job.reportId && !job.safeResult) problems.push(`job ${String(job.jobId)} succeeded without a report`);
+      if (!job.reportId) problems.push(`job ${String(job.jobId)} succeeded without a report`);
+      else if (!ctx.state.reports.some((report) => String(report.reportId) === String(job.reportId))) problems.push(`job ${String(job.jobId)} succeeded referencing missing report ${String(job.reportId)}`);
     }
     return problems.length === 0 ? pass('A-REPORT-BEFORE-SUCCESS', 'succeeded jobs carry reports') : fail('A-REPORT-BEFORE-SUCCESS', problems.join('; '));
   },
