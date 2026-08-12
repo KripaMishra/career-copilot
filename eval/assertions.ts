@@ -4,7 +4,7 @@ import type { AssertionResult } from './schemas/run.ts';
 import type { Fixture, Canary } from './schemas/fixture.ts';
 import type { Scenario, Turn, Limits } from './schemas/scenario.ts';
 import { assertJobUrl } from '../src/tools/job-url.ts';
-import { MAX_DECODED_BYTES, MAX_MODEL_CHARS } from '../src/tools/web-fetch-tool.ts';
+import { MAX_DECODED_BYTES, MAX_MODEL_CHARS, privateAddress } from '../src/tools/web-fetch-tool.ts';
 import { safeAppLogKeys } from '../src/observability.ts';
 import { OnboardingDraftSchema } from '../src/contracts/onboarding.ts';
 import { JobStatusSchema } from '../src/contracts/v0.ts';
@@ -217,7 +217,10 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
     return violating.length === 0 ? pass('A-REDIRECT-POLICY', `${chains.length} acquisition chain(s) within the 3-hop limit`) : fail('A-REDIRECT-POLICY', `acquisition chain(s) exceeded 3 redirect hops: ${violating.map((chain) => chain[0].url).join(', ')}`);
   },
   'A-SSRF-BLOCK': (ctx) => {
-    const privatePlans = ctx.fixture.fetch.filter((plan) => plan.dns.some((address) => /^(10\.|127\.|0\.|::1|fc00:|fe80:|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(address)));
+    // classification is derived from the production blocklist (acquireJobText's
+    // privateAddress), never a local regex — every reserved range the policy
+    // blocks must be treated as private here too
+    const privatePlans = ctx.fixture.fetch.filter((plan) => plan.dns.some((address) => privateAddress(address)));
     if (privatePlans.length === 0) return pass('A-SSRF-BLOCK', 'no private-address fetch plans in fixture');
     const problems: string[] = [];
     for (const plan of privatePlans) {

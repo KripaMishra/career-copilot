@@ -624,6 +624,27 @@ test('SSRF: private-DNS fetch plans are blocked by the real policy and recorded'
   }
 });
 
+test('SSRF: reserved ranges outside the legacy regex are still classified as blocked (CGNAT 100.64/10)', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-ssrf-cgnat-'));
+  try {
+    // 100.64.0.0/10 (CGNAT) is blocked by production's blocklist but was missed
+    // by the gate's regex — the gate must derive classification from the policy
+    const cgnatFixture = SSRF_FIXTURE.replace('dns: ["10.0.0.5"]', 'dns: ["100.64.0.5"]');
+    await writeCorpus(dir, { 'ssrf-flow': cgnatFixture }, { 'ssrf-block': SSRF_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'ssrf-block')!;
+    const fixture = corpus.fixtures.get('ssrf-flow')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    assert.equal(result.state.jobs[0].status, 'failed', 'CGNAT-address fetch must fail the job');
+    const gate = result.assertions.find((a) => a.id === 'A-SSRF-BLOCK')!;
+    assert.match(gate.evidence, /blocked before the network/, 'the plan must be classified as private by the gate, not skipped as a no-op');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('per-turn timeoutMs: a hung turn makes the run incomplete, never stalls', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-timeout-'));
   try {

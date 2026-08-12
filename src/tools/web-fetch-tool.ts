@@ -20,7 +20,7 @@ for (const [network, prefix] of [
   ['::', 96], ['::1', 128], ['::ffff:0:0', 96], ['64:ff9b::', 96], ['64:ff9b:1::', 48], ['100::', 64], ['2001::', 23],
   ['2001:db8::', 32], ['2002::', 16], ['3fff::', 20], ['5f00::', 16], ['fc00::', 7], ['fe80::', 10], ['fec0::', 10], ['ff00::', 8],
 ] as const) blockedIPv6.addSubnet(network, prefix, 'ipv6');
-function privateAddress(address: string) { const type = isIP(address); return type === 0 || (type === 4 ? blockedIPv4.check(address, 'ipv4') : blockedIPv6.check(address, 'ipv6')); }
+export function privateAddress(address: string) { const type = isIP(address); return type === 0 || (type === 4 ? blockedIPv4.check(address, 'ipv4') : blockedIPv6.check(address, 'ipv6')); }
 export function validateJobUrl(value: string) { return assertJobUrl(value); }
 export function normalizeResponseStatus(value: number | undefined) { return typeof value === 'number' && Number.isInteger(value) && value >= 200 && value <= 599 ? value : 502; }
 type FetchDeps = { fetch?: typeof globalThis.fetch; resolve?: (host: string) => Promise<string[]>; maxDecodedBytes?: number; timeoutMs?: number; signal?: AbortSignal };
