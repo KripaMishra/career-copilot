@@ -866,6 +866,291 @@ model:
   }
 });
 
+test('envelope fixtures: group and bot turns keep numeric ids and reach the authorization path', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-envelope-'));
+  try {
+    const fixture = `schemaVersion: 1
+id: envelope-flow
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+model:
+  responses:
+    - purpose: chat
+      text: "ok"
+`;
+    const scenario = `schemaVersion: 1
+id: envelope-scenario
+kind: contract
+persona: P11
+fixture: envelope-flow
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    envelope: group
+    expected: rejected
+  - id: t2
+    channel: telegram
+    input: { kind: text, text: "/onboarding" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    envelope: bot
+    expected: rejected
+assertions: [A-AUTH-BEFORE-MODEL, A-TRANSCRIPT-COMPLETE, A-BUDGET]
+limits:
+  maxTurns: 5
+  maxWallClockMs: 30000
+  maxModelCalls: 10
+`;
+    await writeCorpus(dir, { 'envelope-flow': fixture }, { 'envelope-scenario': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios[0];
+    const fixtureEntry = corpus.fixtures.get('envelope-flow')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture: fixtureEntry, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    const rejections = result.transcript.events.filter((e) => e.type === 'lifecycle' && e.payload.event === 'telegram.update.rejected');
+    assert.deepEqual(rejections.map((e) => e.payload.reason), ['unauthorized', 'unauthorized'], 'group/bot turns must reach envelope authorization, not be rejected as malformed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+const REDIRECT_PAIR_FIXTURE = `schemaVersion: 1
+id: redirect-pair
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada\\nExperience: 8 years backend\\nSkills: TypeScript"
+      active: true
+      version: 2
+fetch:
+  - url: "https://linkedin.com/jobs/view/1"
+    dns: ["93.184.216.34"]
+    redirect: { status: 301, location: "https://linkedin.com/jobs/view/11" }
+  - url: "https://linkedin.com/jobs/view/11"
+    dns: ["93.184.216.34"]
+    redirect: { status: 302, location: "https://linkedin.com/jobs/view/111" }
+  - url: "https://linkedin.com/jobs/view/111"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Platform Engineer Alpha at Example Corp</body></html>"
+  - url: "https://linkedin.com/jobs/view/2"
+    dns: ["93.184.216.34"]
+    redirect: { status: 301, location: "https://linkedin.com/jobs/view/22" }
+  - url: "https://linkedin.com/jobs/view/22"
+    dns: ["93.184.216.34"]
+    redirect: { status: 302, location: "https://linkedin.com/jobs/view/222" }
+  - url: "https://linkedin.com/jobs/view/222"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Platform Engineer Beta at Example Corp</body></html>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+notifications: []
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: ""
+    - purpose: chat
+      match: "jobs/view/2"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/2"
+            profileContext: ""
+    - purpose: analysis
+      match: "Alpha"
+      object:
+        schemaVersion: 1
+        title: "Platform Engineer Alpha"
+        company: "Example Corp"
+        location: "Remote"
+        summary: "Alpha platform tooling."
+        fitScore: 81
+        nextStep: "Apply with the confirmed profile."
+    - purpose: analysis
+      match: "Beta"
+      object:
+        schemaVersion: 1
+        title: "Platform Engineer Beta"
+        company: "Example Corp"
+        location: "Remote"
+        summary: "Beta platform tooling."
+        fitScore: 83
+        nextStep: "Apply with the confirmed profile."
+    - purpose: chat
+      text: "Saved."
+    - purpose: chat
+      match: "view/2"
+      text: "Saved second job."
+`;
+
+const REDIRECT_PAIR_SCENARIO = `schemaVersion: 1
+id: redirect-pair-scenario
+kind: contract
+persona: P03
+fixture: redirect-pair
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+    updateId: 9101
+  - id: t2
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/2" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+    updateId: 9102
+assertions:
+  - A-REDIRECT-POLICY
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-SSRF-BLOCK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+tools:
+  counts:
+    save-job: 2
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 20
+`;
+
+test('redirect policy is per acquisition chain: two jobs with two redirects each stay within the 3-hop limit', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-redirect-'));
+  try {
+    await writeCorpus(dir, { 'redirect-pair': REDIRECT_PAIR_FIXTURE }, { 'redirect-pair-scenario': REDIRECT_PAIR_SCENARIO });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario } = corpus.scenarios.find((entry) => entry.scenario.id === 'redirect-pair-scenario')!;
+    const fixture = corpus.fixtures.get('redirect-pair')!.fixture;
+    const result = await runScenario({ scenario, fixture, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'passed', JSON.stringify(result.assertions, null, 2));
+    const gate = result.assertions.find((a) => a.id === 'A-REDIRECT-POLICY')!;
+    assert.equal(gate.status, 'passed', gate.evidence);
+    assert.equal(result.state.jobs.length, 2);
+    assert.equal(result.state.jobs.filter((job) => job.status === 'succeeded').length, 2);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('stub-provided profileText reaches the agent: a database-only canary in it is caught at the model sink', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubprofile-'));
+  try {
+    const base = `schemaVersion: 1
+id: profile-base
+ownerId: career-owner-v0
+clock: "2026-01-01T00:00:00Z"
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/42"
+            profileContext: ""
+`;
+    const stub = `schemaVersion: 1
+id: profile-stub
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+profileText: "Name: Ada\\nSkills: CANARY_PROFILE"
+fetch:
+  - url: "https://linkedin.com/jobs/view/42"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+canaries:
+  - { value: "CANARY_PROFILE", sinks: [database] }
+model:
+  responses:
+    - purpose: analysis
+      object:
+        schemaVersion: 1
+        title: "Senior Platform Engineer"
+        company: "Example Corp"
+        location: "Remote"
+        summary: "Platform tooling for the core product."
+        fitScore: 82
+        nextStep: "Apply with the confirmed profile."
+    - purpose: chat
+      text: "Saved: Senior Platform Engineer at Example Corp."
+`;
+    const scenario = `schemaVersion: 1
+id: stub-profile-scenario
+kind: contract
+persona: P03
+fixture: profile-base
+stubs: [profile-stub]
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/42" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-TOOLS-EXACT, A-TOOL-CONTEXT, A-TRANSCRIPT-COMPLETE, A-BUDGET, A-CANARY-CONTAINED]
+tools:
+  counts:
+    save-job: 1
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 20
+`;
+    await writeCorpus(dir, { 'profile-base': base, 'profile-stub': stub }, { 'stub-profile-scenario': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios[0];
+    const fixture = corpus.fixtures.get('profile-base')!.fixture;
+    const stubFixture = corpus.fixtures.get('profile-stub')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture, stubs: [stubFixture], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'stub profileText must reach the agent; its database-only canary must trip the model sink');
+    assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
+    const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
+    assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('stub merge conflicts: sheets failure modes and notification plans fail validation', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubconflict-'));
   try {

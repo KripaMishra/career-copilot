@@ -65,11 +65,15 @@ function rawUpdateFor(turn: Turn, sequence: number): unknown {
   const userId = turn.actorId;
   const text = turn.input.kind === 'text' ? turn.input.text : undefined;
   const updateId = turn.updateId ?? 1000 + sequence;
+  // numeric ids: assertRawTelegramUpdate requires safe-integer chat/from ids;
+  // envelope variants only change the chat type or bot flag
+  const chat = { id: Number(chatId), type: 'private' as string };
+  const from = { id: Number(userId) };
   const message: Record<string, unknown> = {
     message_id: 1 + sequence,
     date: 1,
-    chat: { id: Number(chatId), type: 'private' },
-    from: { id: Number(userId) },
+    chat,
+    from,
     ...(text !== undefined ? { text } : {}),
     ...(turn.input.kind === 'non_text' ? { document: { file_name: 'resume.pdf' } } : {}),
   };
@@ -81,9 +85,9 @@ function rawUpdateFor(turn: Turn, sequence: number): unknown {
     case 'edited':
       return { update_id: updateId, edited_message: message };
     case 'group':
-      return { update_id: updateId, message: { ...message, chat: { id: chatId, type: 'group' } } };
+      return { update_id: updateId, message: { ...message, chat: { ...chat, type: 'group' } } };
     case 'bot':
-      return { update_id: updateId, message: { ...message, from: { id: userId, is_bot: true } } };
+      return { update_id: updateId, message: { ...message, from: { ...from, is_bot: true } } };
     default:
       return { update_id: updateId, message };
   }
@@ -125,6 +129,8 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
 
   const mergedFixture: Fixture = {
     ...fixture,
+    // scalar overrides follow the sheets.failure rule: base wins, stubs fill gaps
+    profileText: fixture.profileText ?? options.stubs.map((stub) => stub.profileText).find((text) => text !== undefined),
     db: {
       onboarding: [...fixture.db.onboarding, ...options.stubs.flatMap((stub) => stub.db.onboarding)],
       profiles: [...fixture.db.profiles, ...options.stubs.flatMap((stub) => stub.db.profiles)],
@@ -168,7 +174,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       await store.importOnboarding({ ownerId: row.ownerId, conversationId: row.conversationId, status: row.status, draft: row.draft, version: row.version, createdAt: clockMs, updatedAt: clockMs });
     }
 
-    const profileText = fixture.profileText ?? (await store.profileText(fixture.ownerId));
+    const profileText = mergedFixture.profileText ?? (await store.profileText(fixture.ownerId));
     const sheetsFake = createSheetsFake(mergedFixture.sheets, sheetsLedger);
     const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);

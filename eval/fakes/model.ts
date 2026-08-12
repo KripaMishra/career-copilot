@@ -50,22 +50,30 @@ export function detectPurpose(prompt: string): ModelResponse['purpose'] {
   return 'chat';
 }
 
+function messageText(message: unknown): string {
+  if (typeof message === 'string') return message;
+  const content = (message as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part === 'object' && part !== null && 'text' in part ? String((part as { text: unknown }).text) : '')).join('\n');
+  }
+  return typeof content === 'string' ? content : '';
+}
+
 function promptText(options: Record<string, unknown>): string {
   const prompt = options.prompt;
   if (typeof prompt === 'string') return prompt;
-  if (Array.isArray(prompt)) {
-    return prompt
-      .map((message) => {
-        if (typeof message === 'string') return message;
-        const content = (message as { content?: unknown }).content;
-        if (Array.isArray(content)) {
-          return content.map((part) => (typeof part === 'object' && part !== null && 'text' in part ? String((part as { text: unknown }).text) : '')).join('\n');
-        }
-        return typeof content === 'string' ? content : '';
-      })
-      .join('\n');
-  }
+  if (Array.isArray(prompt)) return prompt.map(messageText).join('\n');
   return '';
+}
+
+/** Purpose is read from the system instruction and the current request (first
+ * and last message) only — mid-prompt history can carry earlier
+ * "Job text:"/"Owner profile:" content via memory context and would misread a
+ * plain chat turn as an analysis call. */
+function purposeFromMessages(prompt: unknown): string {
+  if (typeof prompt === 'string') return prompt;
+  if (!Array.isArray(prompt) || prompt.length === 0) return '';
+  return `${messageText(prompt.at(0))}\n${messageText(prompt.at(-1))}`;
 }
 
 /** Structural raw-V3 model; cast to MastraModelConfig by the runner. */
@@ -98,7 +106,7 @@ export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger
   const generate = async (options: Record<string, unknown>) => {
     const started = clock();
     const prompt = promptText(options);
-    const purpose = detectPurpose(prompt);
+    const purpose = detectPurpose(purposeFromMessages(options.prompt));
     const response = serve(prompt, purpose);
     if (response.throws) throw new Error(response.throws);
     const id = `scripted-${served}`;

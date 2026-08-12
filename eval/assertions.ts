@@ -203,8 +203,18 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
     return problems.length === 0 ? pass('A-URL-POLICY', `${ctx.ledgers.toolCalls.filter((call) => call.url).length} url(s) policy-valid`) : fail('A-URL-POLICY', problems.join('; '));
   },
   'A-REDIRECT-POLICY': (ctx) => {
-    const redirects = ctx.ledgers.fetch.filter((call) => call.status >= 301 && call.status <= 308);
-    return redirects.length <= 3 ? pass('A-REDIRECT-POLICY', `${redirects.length} redirect(s) within limit`) : fail('A-REDIRECT-POLICY', `redirect chain exceeded 3 hops (${redirects.length})`);
+    // production allows up to 3 redirect hops per URL acquisition (acquireJobText);
+    // group consecutive ledger entries into acquisition chains — a redirect hop is
+    // always immediately followed by the next hop (runs execute acquisitions serially)
+    const chains: FetchLedgerRecord[][] = [];
+    for (const call of ctx.ledgers.fetch) {
+      const last = chains.at(-1);
+      const previous = last?.[last.length - 1];
+      if (previous && previous.status >= 301 && previous.status <= 308) last.push(call);
+      else chains.push([call]);
+    }
+    const violating = chains.filter((chain) => chain.filter((call) => call.status >= 301 && call.status <= 308).length > 3);
+    return violating.length === 0 ? pass('A-REDIRECT-POLICY', `${chains.length} acquisition chain(s) within the 3-hop limit`) : fail('A-REDIRECT-POLICY', `acquisition chain(s) exceeded 3 redirect hops: ${violating.map((chain) => chain[0].url).join(', ')}`);
   },
   'A-SSRF-BLOCK': (ctx) => {
     const privatePlans = ctx.fixture.fetch.filter((plan) => plan.dns.some((address) => /^(10\.|127\.|0\.|::1|fc00:|fe80:|169\.254\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(address)));
