@@ -33,8 +33,17 @@ function sourceRevision(): string {
     // dirty working trees can't be identified by HEAD alone (issue #13 provenance)
     const dirty = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     if (!dirty) return head;
-    const diff = execFileSync('git', ['diff'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-    return `${head}+dirty:${createHash('sha256').update(diff, 'utf8').digest('hex').slice(0, 12)}`;
+    // staged + unstaged tracked changes (`git diff` alone misses staged-only trees);
+    // plus untracked files that can affect run semantics, excluding harness-written
+    // artifact dirs — provenance must distinguish every distinct executed tree
+    const diff = execFileSync('git', ['diff', 'HEAD'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    const untracked = execFileSync('git', ['ls-files', '--others', '--exclude-standard'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+      .split('\n')
+      .map((file) => file.trim())
+      .filter((file) => file && !file.startsWith('eval/results/') && !file.startsWith('.code-review-graph/'))
+      .map((file) => `${file}:${createHash('sha256').update(readFileSync(file)).digest('hex')}`)
+      .join('\n');
+    return `${head}+dirty:${createHash('sha256').update(diff + '\n' + untracked, 'utf8').digest('hex').slice(0, 12)}`;
   } catch {
     return 'unknown';
   }

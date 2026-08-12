@@ -142,9 +142,12 @@ export async function loadCorpus(baseDir = process.cwd()): Promise<Corpus> {
 export function filterCorpus(corpus: Corpus, ids: string[]): { corpus: Corpus; excluded: string[] } {
   if (ids.length === 0) return { corpus, excluded: [] };
   const wanted = new Set(ids);
-  const included = corpus.scenarios.filter(({ scenario }) => wanted.has(scenario.id));
+  const live = corpus.scenarios.filter(({ scenario }) => wanted.has(scenario.id));
+  // staged scenarios never run by default, but an explicit selection must work
+  const staged = corpus.staged.filter(({ scenario }) => wanted.has(scenario.id));
+  const included = [...live, ...staged];
   const excluded = corpus.scenarios.filter(({ scenario }) => !wanted.has(scenario.id)).map(({ scenario }) => scenario.id);
-  // ids that match no live scenario are unknown, never a silent no-op (the
+  // ids that match neither a live nor a staged scenario are unknown, never a silent no-op (the
   // previous `!wanted.has(id)` clause was always false: every id is in wanted)
   const missing = ids.filter((id) => !included.some(({ scenario }) => scenario.id === id));
   if (missing.length > 0) throw new Error(`unknown scenario id(s): ${missing.join(', ')} (live corpus only)`);

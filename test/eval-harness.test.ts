@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { loadCorpus, filterCorpus } from '../eval/corpus.ts';
 import { runScenario } from '../eval/runner.ts';
+import { createScriptedModel } from '../eval/fakes/model.ts';
 import { parseScenario } from '../eval/schemas/scenario.ts';
 import { parseFixture } from '../eval/schemas/fixture.ts';
 
@@ -1146,6 +1147,105 @@ limits:
     assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
     const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
     assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('scripted model: memory extraction consumes no fixture chat responses', async () => {
+  const clock = () => 0;
+  const model = createScriptedModel({ responses: [{ purpose: 'chat', text: 'first chat' }, { purpose: 'chat', text: 'second chat' }] }, clock, { calls: [] });
+  const textOf = (output: Record<string, unknown>) => String((output.content as { text: string }[])[0]?.text ?? '');
+  const memory = await model.doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'Update working memory with observations you made during the previous conversation.' }] }] });
+  assert.equal(textOf(memory), '{}', 'memory extraction must take the {} default, not consume a chat response');
+  const first = await model.doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
+  assert.equal(textOf(first), 'first chat', 'first real chat call must receive the first scripted response');
+  const second = await model.doGenerate({ prompt: [{ role: 'user', content: [{ type: 'text', text: 'hello again' }] }] });
+  assert.equal(textOf(second), 'second chat', 'second real chat call must receive the second scripted response');
+});
+
+test('tool calls are closed only by the current turn: an unobserved final tool call leaves the run incomplete', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-maxsteps-'));
+  try {
+    // maxSteps:8 — the 8th agent call is a toolCalls response; the agent executes
+    // the tool and stops at the step cap without a model call observing the result
+    let responses = '';
+    for (let round = 0; round < 8; round++) {
+      responses += `    - purpose: chat\n      match: "Save this job now"\n      toolCalls:\n        - toolName: save-job\n          args:\n            url: "https://linkedin.com/jobs/view/42"\n            profileContext: ""\n`;
+    }
+    responses += `    - purpose: analysis\n      object:\n        schemaVersion: 1\n        title: "Platform Engineer Alpha"\n        company: "Example Corp"\n        location: "Remote"\n        summary: "Alpha platform tooling."\n        fitScore: 81\n        nextStep: "Apply with the confirmed profile."\n`;
+    const fixture = `schemaVersion: 1
+id: maxsteps-flow
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada"
+      active: true
+fetch:
+  - url: "https://linkedin.com/jobs/view/42"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body>Platform Engineer Alpha at Example Corp</body></html>"
+sheets:
+  headers: [jobId, status, title, company]
+  rows: []
+model:
+  responses:\n${responses}`;
+    const scenario = `schemaVersion: 1
+id: maxsteps-scenario
+kind: contract
+persona: P03
+fixture: maxsteps-flow
+turns:
+  - id: t1
+    channel: telegram
+    input: { kind: text, text: "/save https://linkedin.com/jobs/view/42" }
+    actorId: "1001"
+    conversationId: "telegram:2001"
+    expected: accepted
+assertions: [A-TRANSCRIPT-COMPLETE, A-TOOLS-EXACT, A-BUDGET]
+tools:
+  counts:
+    save-job: 8
+limits:
+  maxTurns: 5
+  maxWallClockMs: 60000
+  maxModelCalls: 30
+`;
+    await writeCorpus(dir, { 'maxsteps-flow': fixture }, { 'maxsteps-scenario': scenario });
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0, corpus.errors.map((e) => e.message).join('; '));
+    const { scenario: sc } = corpus.scenarios[0];
+    const fixtureEntry = corpus.fixtures.get('maxsteps-flow')!.fixture;
+    const result = await runScenario({ scenario: sc, fixture: fixtureEntry, stubs: [], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
+    assert.equal(result.status, 'incomplete', 'an agent transaction ending on an unobserved tool call must be incomplete');
+    const gate = result.assertions.find((a) => a.id === 'A-TRANSCRIPT-COMPLETE')!;
+    assert.equal(gate.status, 'failed', gate.evidence);
+    assert.ok(result.assertions.find((a) => a.id === 'A-TOOLS-EXACT')?.evidence.includes('save-job=8'), 'all eight tool calls still executed');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('explicitly selected staged scenarios run through filterCorpus', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'eval-staged-'));
+  try {
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE }, {});
+    await writeFile(path.join(dir, 'eval', 'scenarios', 'onboarding-minimal.yaml.staged'), ONBOARDING_SCENARIO);
+    const corpus = await loadCorpus(dir);
+    assert.equal(corpus.errors.length, 0);
+    assert.equal(corpus.staged.length, 1);
+    assert.equal(filterCorpus(corpus, []).corpus.scenarios.length, 0, 'unfiltered runs must not include staged scenarios');
+    const selected = filterCorpus(corpus, ['onboarding-minimal']);
+    assert.equal(selected.corpus.scenarios.length, 1, 'explicitly selected staged scenario must be selectable');
+    assert.equal(selected.corpus.scenarios[0].staged, true);
+    assert.throws(() => filterCorpus(corpus, ['typo']), /unknown scenario id/, 'unknown ids must still throw');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

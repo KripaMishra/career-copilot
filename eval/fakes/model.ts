@@ -27,6 +27,8 @@ export type ScriptedModelCall = {
   latencyMs: number;
   responseId: string | null;
   toolResultSeen: boolean;
+  /** response emitted tool-call parts (the agent loop may cut off before the result is observed) */
+  issuedToolCalls: boolean;
 };
 
 export type ScriptedModelLedger = { calls: ScriptedModelCall[] };
@@ -89,8 +91,11 @@ export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger
   let served = 0;
 
   const serve = (prompt: string, purpose: ModelResponse['purpose']): ModelResponse => {
+    // memory extraction may only consume explicitly scripted memory responses —
+    // it must never steal a generic chat response (Mastra's memory-call ordering
+    // would otherwise decide which fixtures pass)
     const index = queue.findIndex(
-      (response) => (response.purpose === purpose || response.purpose === 'chat') && (!response.match || prompt.toLowerCase().includes(response.match.toLowerCase())),
+      (response) => (response.purpose === purpose || (purpose !== 'memory' && response.purpose === 'chat')) && (!response.match || prompt.toLowerCase().includes(response.match.toLowerCase())),
     );
     if (index < 0) {
       // memory extraction noise is unlimited by default: fixtures that care can
@@ -135,6 +140,7 @@ export function createScriptedModel(plan: ModelPlan, clock: () => number, ledger
       latencyMs: Math.max(0, clock() - started),
       responseId: id,
       toolResultSeen: promptHasToolResult(options.prompt),
+      issuedToolCalls: (response.toolCalls?.length ?? 0) > 0,
     });
     return {
       content,

@@ -275,7 +275,9 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       }
       turnOutcomes.push(outcome);
 
-      // drain log-derived events (consumed once)
+      // drain log-derived events (consumed once); this turn's tool calls land at
+      // indexes >= turnToolLedgerStart (stale open calls from earlier turns stay)
+      const turnToolLedgerStart = toolLedger.length;
       const logs = logLedger.splice(0);
       allLogs.push(...logs);
       for (const log of logs) {
@@ -312,18 +314,24 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
         if (match?.jobId) record.jobId = match.jobId;
       }
 
-      // tool results: a subsequent model call that observed a tool result closes each open tool call
-      const calls = modelLedger.calls;
-      const sawResult = calls.some((call) => call.toolResultSeen);
-      if (sawResult) {
-        const closing = [...openToolCalls].map((index) => toolLedger[index].toolId);
-        if (closing.length > 0) emit('tool_result', turn.id, { tools: closing });
-        openToolCalls.clear();
-      }
-
       // model calls made during this turn (attributed for A-AUTH-BEFORE-MODEL and budgets)
+      const calls = modelLedger.calls;
       const newCalls = calls.slice(modelCallsAtTurnStart);
       modelCallsAtTurnStart = calls.length;
+
+      // tool results: a tool call closes only when a later model call observed its
+      // result. If the turn's FINAL agent call itself issued tool calls (e.g. cut
+      // off by the maxSteps cap), that tool call was never observed — it must stay
+      // open so A-TRANSCRIPT-COMPLETE fails. Stale calls from earlier turns are
+      // never closed by this turn's observations.
+      const agentCalls = newCalls.filter((call) => call.purpose !== 'memory');
+      const lastAgentCall = agentCalls.at(-1);
+      const closing = [...openToolCalls].filter((index) => index >= turnToolLedgerStart);
+      if (closing.length > 0 && lastAgentCall && !lastAgentCall.issuedToolCalls && newCalls.some((call) => call.toolResultSeen)) {
+        emit('tool_result', turn.id, { tools: closing.map((index) => toolLedger[index].toolId) });
+        for (const index of closing) openToolCalls.delete(index);
+      }
+
       for (const call of newCalls) {
         emit('model_call', turn.id, { purpose: call.purpose, provider: call.provider, model: call.model, inputTokens: call.inputTokens, outputTokens: call.outputTokens });
       }
