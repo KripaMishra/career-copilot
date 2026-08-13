@@ -268,7 +268,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
           emit('lifecycle', null, { event: log.event, ...log.data });
         }
       }
-      // pair recovery tool calls with their recovered job (identity + request)
+      // pair recovery tool calls with their recovered job identity
       for (const record of toolLedger) {
         if (record.turnId !== undefined) continue;
         // exact identity first: the save-job tool already logged the persisted
@@ -285,7 +285,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
             // production rows persist scoped identities (telegram:…)
             record.actorId = job.userId ?? undefined;
             record.conversationId = job.chatId;
-            record.requestId = record.requestId ?? job.transportEventId;
           }
         }
       }

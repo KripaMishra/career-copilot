@@ -76,7 +76,7 @@ Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault pla
 ## Verification of this report
 
 - `npm exec tsc -- --noEmit` green.
-- `npm test` green (106 tests) after the 2026-08-12 review fixes: full save replay
+- `npm test` green (106 tests) at #13c (2026-08-14): full save replay
   (analyzeJob + tool ledger + fail-first delivery), SSRF block capture, per-turn
   timeout, stub-merge conflicts, fixture-sensitive corpus hash.
 - Deliverable committed on `feat/evals`; `manifest.sourceRevision` records a
