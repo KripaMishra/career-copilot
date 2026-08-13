@@ -123,7 +123,7 @@ const modelResponseSchema = z.strictObject({
   usage: modelUsageSchema.optional(),
   throws: z.string().max(200).optional(),
   malformed: z.boolean().default(false),
-}).refine((response) => response.text !== undefined || response.object !== undefined || response.throws !== undefined || (response.toolCalls?.length ?? 0) > 0, {
+}).refine((response) => response.malformed || response.text !== undefined || response.object !== undefined || response.throws !== undefined || (response.toolCalls?.length ?? 0) > 0, {
   message: 'a scripted model response must supply text, object, toolCalls, or throws',
 });
 
@@ -153,7 +153,10 @@ export const fixtureSchema = z.strictObject({
   fetch: z.array(fetchPlanSchema).default([]),
   sheets: sheetPlanSchema.default({ headers: [], rows: [] }),
   notifications: z.array(notificationPlanSchema).default([]),
-  model: modelPlanSchema.default({ responses: [{ purpose: 'chat', text: 'Done.' }] }),
+  // inert default: a memory no-op is only consumable by memory extraction
+  // (serve() never matches it for chat/onboarding/analysis purposes), so a
+  // fixture that declares no model plan cannot pollute the scripted queue
+  model: modelPlanSchema.default({ responses: [{ purpose: 'memory', text: '{}' }] }),
   canaries: z.array(canarySchema).default([]),
 });
 

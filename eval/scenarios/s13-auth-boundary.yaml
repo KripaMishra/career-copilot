@@ -1,0 +1,28 @@
+schemaVersion: 1
+id: s13-auth-boundary
+description: "S13: malformed, forwarded, edited, group, bot, wrong-user, and wrong-chat Telegram updates fail closed before any model, tool, or effect. Direct agent.listTools() and forged capability rejection are covered by unit tests (minimal-v0.test.ts)."
+kind: contract
+persona: P11
+fixture: new-owner
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, envelope: malformed }
+  - { id: t2, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, envelope: group }
+  - { id: t3, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, envelope: bot }
+  - { id: t4, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, envelope: forwarded }
+  - { id: t5, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, envelope: edited }
+  - { id: t6, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1002", conversationId: "telegram:2001", expected: rejected }
+  - { id: t7, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2002", expected: rejected }
+assertions:
+  - A-AUTH-BEFORE-MODEL
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-AUTH-BEFORE-MODEL, path: "modelCalls", op: count, value: 0 }
+  - { id: A-AUTH-BEFORE-MODEL, path: "replies", op: count, value: 0 }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 10, maxWallClockMs: 30000, maxModelCalls: 4 }

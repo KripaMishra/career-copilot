@@ -1,0 +1,42 @@
+schemaVersion: 1
+id: s07-save-success
+description: "S07: an active profile plus a supported URL invokes save-job exactly once and completes only after the report and a verified Sheet row; one notification follows delivery."
+kind: contract
+persona: P07
+fixture: active-profile
+stubs: [normal-job-page, s07-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-REDIRECT-POLICY
+  - A-SSRF-BLOCK
+  - A-CONTENT-LIMIT
+  - A-LIFECYCLE-ORDER
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+  - { id: A-JOB-STATE, path: "state.jobs[0].jobId", op: eq, value: "fixture-0001" }
+  - { id: A-REPORT-BEFORE-SUCCESS, path: "state.reports", op: count, value: 1 }
+  - { id: A-SHEET-READBACK, path: "state.sheets", op: count, value: 1 }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications", op: count, value: 1 }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications[0].delivered", op: eq, value: true }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.jobs[0].notifiedAt", op: eq, value: 1767225600000 }
+tools:
+  require: [save-job]
+  forbid: [web_fetch, job-status, job-queue]
+  counts: { save-job: 1 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 20 }

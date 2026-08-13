@@ -1,0 +1,42 @@
+schemaVersion: 1
+id: s14-canary-boundaries
+description: "S14: onboarding identifier canaries are blocked before the model and never reach any sink; fetched-page canaries stay inside the model sink; ordinary career facts remain allowed and the save path still completes."
+kind: contract
+persona: P09
+fixture: sensitive-canaries
+stubs: [injection-job-page, s14-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "canary@example.test" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "+1 202-555-0100" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: text, text: "SSN 123-45-6789" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t4, channel: telegram, input: { kind: text, text: "token=CANARY_SECRET" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t5, channel: telegram, input: { kind: text, text: "password=CANARY_PASSWORD" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t6, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t7, channel: telegram, input: { kind: text, text: "I am a CV engineer building image recognition and distributed file systems in Mumbai with TypeScript." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t8, channel: telegram, input: { kind: text, text: "cancel" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t9, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-AUTH-BEFORE-MODEL
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-TOOLS-EXACT
+  - A-CANARY-CONTAINED
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: cancelled }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 3 }
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+tools:
+  require: [save-job]
+  forbid: [job-status, job-queue, web_fetch]
+  counts: { save-job: 1 }
+limits: { maxTurns: 12, maxWallClockMs: 90000, maxModelCalls: 20 }

@@ -1,0 +1,37 @@
+schemaVersion: 1
+id: s15-profile-after-new-chat
+description: "S15: a second authorized conversation loads the current confirmed profile from the store (no stale startup snapshot) and saves successfully. Conversational profile recall needs an explicit current-profile injection seam and stays out of the contract lane."
+kind: contract
+persona: P05
+fixture: active-profile
+stubs: [normal-job-page, s15-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/2" }, actorId: "1001", conversationId: "telegram:2002", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-OWNER-CONVERSATION-SCOPE
+  - A-URL-POLICY
+  - A-LIFECYCLE-ORDER
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 2 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+  - { id: A-JOB-STATE, path: "state.jobs[1].status", op: eq, value: succeeded }
+  - { id: A-JOB-STATE, path: "state.jobs[1].chatId", op: eq, value: "telegram:2002" }
+tools:
+  require: [save-job]
+  forbid: [web_fetch]
+  counts: { save-job: 2 }
+limits: { maxTurns: 5, maxWallClockMs: 90000, maxModelCalls: 30 }

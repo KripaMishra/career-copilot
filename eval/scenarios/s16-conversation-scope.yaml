@@ -1,0 +1,31 @@
+schemaVersion: 1
+id: s16-conversation-scope
+description: "S16: conversation B runs /job and /queue through the chat-scoped tools and creates no jobs or drafts of its own; a command inside A's active onboarding draft is blocked before the model. Tool OUTPUT text is scripted, so the harness asserts scoped state/tool counts, not reply text; output-scoping capture is a future ledger seam. Unconfirmed onboarding facts surfacing in B is a known product gap (resource-scoped working memory) and is not asserted here."
+kind: contract
+persona: P08
+fixture: two-conversations
+stubs: [s16-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2002", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "/queue" }, actorId: "1001", conversationId: "telegram:2002", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: text, text: "/job" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-OWNER-CONVERSATION-SCOPE
+  - A-JOB-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].chatId", op: eq, value: "telegram:2001" }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding", op: count, value: 1 }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].conversationId", op: eq, value: "telegram:2001" }
+tools:
+  forbid: [save-job]
+  counts: { job-status: 1, job-queue: 1 }
+limits: { maxTurns: 6, maxWallClockMs: 60000, maxModelCalls: 30 }

@@ -1,0 +1,18 @@
+schemaVersion: 1
+id: active-profile
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: onboarding.md
+      content: |
+        # Career onboarding profile
+        Current role/status: Senior backend/GenAI engineer with eight years of experience.
+        Skills: TypeScript, Node.js, SQL.
+        Location preferences: Remote from India.
+        Target roles: Staff or AI-platform engineer.
+      active: true
+      version: 1

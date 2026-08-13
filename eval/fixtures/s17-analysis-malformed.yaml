@@ -1,0 +1,16 @@
+schemaVersion: 1
+id: s17-analysis-malformed
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: "Senior backend/GenAI engineer."
+    - purpose: analysis
+      malformed: true
+    - purpose: chat
+      text: "The job could not be saved safely."

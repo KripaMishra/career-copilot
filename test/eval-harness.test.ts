@@ -255,6 +255,23 @@ test('redaction fails closed: canary in a forbidden sink blocks the run', async 
   }
 });
 
+import { canaryAllowedIn, scanValue } from '../eval/redaction.ts';
+
+test('redaction allows a canary only in its classified sinks (allow-direction regression)', () => {
+  // regression: a dangling-else in allowedSinks made any canary without the
+  // 'all' classification forbidden in EVERY sink, so model-classified injection
+  // canaries could never pass — only the fail-closed direction was tested
+  const modelOnly = { value: 'PAGE_INJECTION_CANARY', sinks: ['model'] as const };
+  const everywhere = { value: 'CANARY_SECRET', sinks: ['all'] as const };
+  assert.equal(canaryAllowedIn(modelOnly, 'model'), true);
+  assert.equal(canaryAllowedIn(modelOnly, 'reply'), false);
+  assert.equal(canaryAllowedIn(modelOnly, 'report'), false);
+  assert.equal(canaryAllowedIn(everywhere, 'model'), true);
+  assert.equal(canaryAllowedIn(everywhere, 'sheet'), true);
+  assert.deepEqual(scanValue({ promptText: 'x PAGE_INJECTION_CANARY y' }, 'model', [modelOnly], 'call'), []);
+  assert.equal(scanValue({ replyText: 'x PAGE_INJECTION_CANARY y' }, 'reply', [modelOnly], 'call').length, 1);
+});
+
 test('incomplete: uncaught model throw and budget breach are incomplete, never failed', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-incomplete-'));
   try {

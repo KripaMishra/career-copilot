@@ -1,0 +1,36 @@
+schemaVersion: 1
+id: s06-cancel-restart
+description: "S06: cancel clears the draft and preserves the confirmed profile; repeated cancel and restart behave; the active profile stays byte-identical."
+kind: contract
+persona: P04
+fixture: active-profile
+stubs: [s06-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "cancel" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "cancel" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: text, text: "/onboarding" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t4, channel: telegram, input: { kind: text, text: "I have five years of experience." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t5, channel: telegram, input: { kind: text, text: "/onboarding restart" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-NO-ACTIVATION-BEFORE-CONFIRM
+  - A-PROFILE-ACTIVATED
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: collecting }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 7 }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.currentStatus", op: absent }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles", op: count, value: 1 }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles[0].version", op: eq, value: 1 }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles[0].active", op: eq, value: true }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles[0].byteSize", op: eq, value: 231 }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 8, maxWallClockMs: 60000, maxModelCalls: 12 }

@@ -1,0 +1,30 @@
+schemaVersion: 1
+id: s03-collect-correct
+description: "S03: a multi-field answer patches exactly the stated fields; a later correction changes only the named field, leaving unrelated fields byte-equal."
+kind: contract
+persona: P02
+fixture: onboarding-collecting
+stubs: [s03-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "I am a senior backend engineer with skills in TypeScript and SQL." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "Actually, my skills are TypeScript and Node.js." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-NO-ACTIVATION-BEFORE-CONFIRM
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: collecting }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 5 }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.currentStatus", op: eq, value: "Senior backend engineer." }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.skills", op: eq, value: "TypeScript, Node.js" }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.experience", op: absent }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 5, maxWallClockMs: 30000, maxModelCalls: 10 }

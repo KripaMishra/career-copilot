@@ -1,9 +1,9 @@
 # Career Copilot Evaluation Harness (`eval/`)
 
-Implementation of issue #13 (contracts/seams `#13a` + hermetic runner `#13b`).
-Scenarios S01–S18 (`#13c`), the quality lane (`#13d`), and compare/pin (`#13e`)
-land separately; this README documents what exists and the exact contract for
-what comes next.
+Implementation of issue #13: contracts/seams (`#13a`), hermetic runner (`#13b`),
+and the S01–S18 contract scenario corpus (`#13c`, 27 scenario files). The quality
+lane (`#13d`) and compare/pin (`#13e`) land separately; this README documents
+what exists and the exact contract for what comes next.
 
 ## Commands
 
@@ -15,12 +15,31 @@ npm run eval:test -- [--scenario ID ...] [--keep-artifacts]
   set is printed in the manifest. Filtered runs are never comparable/pinnable.
 - `--keep-artifacts`: retain the per-scenario temp dir (mode 0700) and record
   its path in `redaction.rawArtifactPath`. Default: everything is deleted.
-- Exit 0 only for a documented successful terminal status. With an empty live
-  corpus (pre-`#13c`) the command validates the corpus and exits 0 with a notice.
+- Exit 0 only for a documented successful terminal status. The live corpus is
+  the 27 contract scenarios (`s01-*` … `s18-*`); a fully clean run is required
+  before quality runs or pinning.
 - Run artifacts (redacted aggregates) go to `eval/results/` (gitignored).
 
 Contract runs are keyless and network-free: no live model, no Telegram, no
 Google, no real fetch. Any provider/network call outside the fakes fails the run.
+
+## Scenario corpus (S01–S18)
+
+`eval/scenarios/*.yaml` implements the issue #13 matrix as 27 scenario files.
+The S10/S17/S18 rows are intentionally split into per-subcase files (isolated
+runs per the matrix), and S17g covers the failure-adapters unsafe-redirect row:
+
+- `s01-onboarding-collect` … `s06-cancel-restart`: onboarding state machine (collect, clarify, correct, review, exact confirm, cancel/restart, blocked inputs).
+- `s07-save-success` … `s10-natural-save`: the save path (command + natural entry, sparse defer + continue, exact tool/state/artifact contract).
+- `s11-injection-resist`, `s12-grounded-analysis`, `s13-auth-boundary`, `s14-canary-boundaries`: injection, grounding, authorization, and canary sink boundaries.
+- `s15-profile-after-new-chat`, `s16-conversation-scope`: profile recall across authorized conversations and owner/conversation scoping.
+- `s17a`–`s17g`: fetch unsafe/5xx/redirect, analysis schema failure, Sheets auth/write/read-back failures — safe failed state, no fabricated success.
+- `s18a`–`s18c`: startup recovery of queued jobs (persisted identity, exactly once), fail-first delivery + cached-reply replay + duplicate rejection, and revoked-identity recovery skip.
+
+Production defects found by the corpus and fixed at their owning boundaries:
+`safeErrorMessage` now classifies HTTP-status fetch failures and the "not
+supported" host message (S17b/S17g), with a focused regression test in
+`test/minimal-v0.test.ts`.
 
 ## Layout
 
@@ -131,6 +150,19 @@ Notes for `#13c` authors:
   per agent turn and consumes a `memory`-purpose response; an explicit one is
   consumed first, otherwise a no-op `{}` is synthesized. Script only `memory`
   responses when the extraction content itself matters.
+- **The fixture default model plan is an inert memory no-op**, never a chat
+  response — a chat default polluted the scripted queue and stole
+  onboarding/analysis responses (S01 regression).
+- **Purpose detection checks `^Job text:` first.** Analysis prompts may contain
+  the "Career onboarding profile" marker via production profile text
+  (`buildOnboardingProfileText`); the specific analysis marker must win over
+  the broader onboarding heuristics.
+- **Production job rows use scoped identities** (`telegram:…` user/chat ids).
+  Fixtures must match — an unscoped `userId` makes recovery reauth fail closed
+  (S18a regression).
+- **Startup recovery runs in the harness** (S18): fixture jobs in
+  `queued`/`running` state are resumed via `recoverUnfinished` before the
+  first turn, with tool-call identity paired from the persisted job.
 - **`analyzeJob` runs inside the harness.** The save-job tool passes the owner
   resource + conversation thread to the nested analysis generate (production
   fix, 2026-08-12); a full save replay works end to end against the scripted
@@ -175,12 +207,26 @@ Canaries are scanned across replies, logs, database state, sheets,
 model-call ledgers, and notifications. An exact (NFC-normalized) match in any
 sink the canary is not classified for blocks the run (`incomplete`). Fixture
 canaries that intentionally enter the model sink (injection tests) must be
-declared with `sinks: [model]`. Raw transcripts never leave the machine;
-`eval/results/` contains only redacted aggregates.
+declared with `sinks: [model]` — the allow-direction is real (dangling-else
+regression covered in `test/eval-harness.test.ts`). Raw transcripts never
+leave the machine; `eval/results/` contains only redacted aggregates.
 
 ## Self-tests
 
 `test/eval-harness.test.ts` (runs inside plain `npm test`) covers strict
 schema rejection, discovery failures, hash sensitivity, end-to-end hermetic
-replay with a scripted model, isolation/cleanup, redaction fail-closed,
-incomplete statuses, value operators, and turn outcomes.
+replay with a scripted model, isolation/cleanup, redaction fail-closed AND
+the sink allow-direction, incomplete statuses, value operators, and turn
+outcomes. `test/minimal-v0.test.ts` carries the production regression tests
+for defects the corpus surfaced.
+
+## Known stderr noise (benign)
+
+- `s01`: two `Error in agent stream { error: TypeError: this[#model].doStream is
+  not a function ...` lines — Mastra's internal stream path probes `doStream`;
+  the scripted model implements `doGenerate` only. Runs pass.
+- `s17c`: one `STRUCTURED_OUTPUT_SCHEMA_VALIDATION_FAILED` — the expected
+  reaction to the scenario's injected malformed analysis response; `A-SAFE-ERROR`
+  asserts the safe-failure contract it exercises.
+
+Both are harmless; exit codes stay 0.

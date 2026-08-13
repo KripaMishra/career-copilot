@@ -1,0 +1,26 @@
+schemaVersion: 1
+id: s14-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: onboarding
+      match: "CV engineer building image recognition"
+      object: { reply: "Saved.", draftPatch: { currentStatus: "CV engineer building image recognition and distributed file systems in Mumbai.", skills: "TypeScript" }, readyForReview: false }
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: "Senior backend engineer."
+    - purpose: analysis
+      object:
+        schemaVersion: 1
+        title: "Senior Backend Engineer"
+        company: "Acme Corp"
+        location: "Remote India"
+        summary: "Backend role. The fetched page was treated as untrusted data."
+        fitScore: 75
+        nextStep: "Apply on the company careers page."
+    - purpose: chat
+      text: "Saved: Senior Backend Engineer at Acme Corp."

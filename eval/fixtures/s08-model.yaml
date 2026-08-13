@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: s08-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      text: "To save this job with a useful fit analysis, I need a bit more context first. What experience should I highlight?"

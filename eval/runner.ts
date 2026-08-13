@@ -236,6 +236,71 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       onboard: createOnboardingResponder(kit.agent),
     });
 
+    const isLifecycleEvent = (event: string) => event.startsWith('job.') || event.startsWith('onboarding.') || event.startsWith('recovery.') || event.startsWith('telegram.update.') || event === 'command.received' || event === 'agent.turn.started' || event === 'agent.turn.succeeded' || event === 'agent.turn.failed';
+
+    // issue #13c (S18): production recovery seam. Fixture rows in queued/running
+    // state are resumed at startup exactly like the production index boots
+    // recoverUnfinished; recovery tool calls carry the persisted job identity
+    // (no owning turn) and close when the recovery turn's final model call
+    // observed their results.
+    const unfinished = mergedFixture.db.jobs.filter((job) => job.status === 'queued' || job.status === 'running');
+    if (unfinished.length > 0) {
+      await runtime.recoverUnfinished(deliver, { notify: true });
+      const logs = logLedger.splice(0);
+      allLogs.push(...logs);
+      for (const log of logs) {
+        if (log.event === 'tool.invoked') {
+          const record: ToolCallRecord = {
+            toolId: String(log.data.toolId ?? ''),
+            ...(typeof log.data.url === 'string' ? { url: log.data.url } : {}),
+            ...(typeof log.data.resumeJobId === 'string' ? { resumeJobId: log.data.resumeJobId } : {}),
+            ownerId: fixture.ownerId,
+          };
+          openToolCalls.add(toolLedger.length);
+          toolLedger.push(record);
+          emit('tool_call', null, { toolId: record.toolId });
+        } else if (isLifecycleEvent(log.event)) {
+          const record: LifecycleRecord = { event: log.event, data: { ...log.data }, turnId: null };
+          if (log.data.jobId) record.jobId = String(log.data.jobId);
+          if (log.data.phase) record.phase = String(log.data.phase);
+          if (log.data.status) record.status = String(log.data.status);
+          lifecycle.push(record);
+          emit('lifecycle', null, { event: log.event, ...log.data });
+        }
+      }
+      // pair recovery tool calls with their recovered job (identity + request)
+      for (const record of toolLedger) {
+        if (record.turnId !== undefined) continue;
+        // exact identity first: the save-job tool already logged the persisted
+        // resumeJobId, so multi-job recovery never falls through to the fuzzy
+        // first-lifecycle-event match (review round 1 finding)
+        if (!record.jobId && record.resumeJobId) record.jobId = record.resumeJobId;
+        if (!record.jobId) {
+          const match = lifecycle.find((event) => event.turnId === null && event.jobId && (event.event === 'job.resumed' || event.event === 'job.started'));
+          if (match?.jobId) record.jobId = match.jobId;
+        }
+        if (record.jobId) {
+          const job = await store.get(record.jobId);
+          if (job) {
+            // production rows persist scoped identities (telegram:…)
+            record.actorId = job.userId ?? undefined;
+            record.conversationId = job.chatId;
+            record.requestId = record.requestId ?? job.transportEventId;
+          }
+        }
+      }
+      // close recovery tool calls when the recovery turn observed their results
+      const recoveryCalls = modelLedger.calls.filter((call) => call.purpose !== 'memory');
+      const lastRecovery = recoveryCalls.at(-1);
+      if (openToolCalls.size > 0 && lastRecovery && !lastRecovery.issuedToolCalls && recoveryCalls.some((call) => call.toolResultSeen)) {
+        const closed = [...openToolCalls];
+        emit('tool_result', null, { tools: closed.map((index) => toolLedger[index].toolId) });
+        for (const index of closed) openToolCalls.delete(index);
+      }
+      // recovery model calls precede every user turn and stay unattributed
+      modelCallsAtTurnStart = modelLedger.calls.length;
+    }
+
     if (scenario.turns.length > limits.maxTurns) markIncomplete(`scenario declares ${scenario.turns.length} turns, exceeds maxTurns ${limits.maxTurns}`);
 
     for (const turn of scenario.turns) {
@@ -315,15 +380,13 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
           openToolCalls.add(toolLedger.length);
           toolLedger.push(record);
           emit('tool_call', turn.id, { toolId: record.toolId });
-        } else if (log.event.startsWith('job.') || log.event.startsWith('onboarding.') || log.event.startsWith('recovery.') || log.event.startsWith('telegram.update.') || log.event === 'command.received' || log.event === 'agent.turn.started' || log.event === 'agent.turn.succeeded' || log.event === 'agent.turn.failed') {
+        } else if (isLifecycleEvent(log.event)) {
           const record: LifecycleRecord = { event: log.event, data: { ...log.data }, turnId: turn.id };
           if (log.data.jobId) record.jobId = String(log.data.jobId);
           if (log.data.phase) record.phase = String(log.data.phase);
           if (log.data.status) record.status = String(log.data.status);
           lifecycle.push(record);
           emit('lifecycle', turn.id, { event: log.event, ...log.data });
-        } else if (log.event === 'agent.turn.failed') {
-          emit('error', turn.id, { event: log.event });
         }
       }
 

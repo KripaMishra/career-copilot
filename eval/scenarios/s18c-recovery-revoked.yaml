@@ -1,0 +1,28 @@
+schemaVersion: 1
+id: s18c-recovery-revoked
+description: "S18 recovery: a queued job whose persisted identity is no longer authorized is skipped at startup — no processing, no notification, state untouched."
+kind: contract
+persona: P11
+fixture: queued-job-revoked
+stubs: [s18c-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "hello" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-RECOVERY-REAUTH
+  - A-OWNER-CONVERSATION-SCOPE
+  - A-JOB-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: queued }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications", op: count, value: 0 }
+tools:
+  counts: { save-job: 0 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 10 }

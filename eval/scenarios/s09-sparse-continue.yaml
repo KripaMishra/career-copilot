@@ -1,0 +1,36 @@
+schemaVersion: 1
+id: s09-sparse-continue
+description: "S09: after one clarifying question the pending save resumes from the retained URL (bound to the SUT conversation history via the resume match) with exactly one save-job call and one acquisition, and no second URL request. Restart subcases stay incomplete until a durable needs_input seam exists."
+kind: contract
+persona: P06
+fixture: sparse-profile
+stubs: [normal-job-page, s09-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "I have five years of backend TypeScript experience." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-LIFECYCLE-ORDER
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+  - { id: A-JOB-STATE, path: "state.jobs[0].originalUrl", op: eq, value: "https://linkedin.com/jobs/view/1" }
+  - { id: A-JOB-STATE, path: "fetch", op: count, value: 1 }
+tools:
+  require: [save-job]
+  forbid: [web_fetch]
+  counts: { save-job: 1 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 20 }

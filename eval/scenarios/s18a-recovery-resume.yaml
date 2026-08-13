@@ -1,0 +1,41 @@
+schemaVersion: 1
+id: s18a-recovery-resume
+description: "S18 recovery: a queued job resumes at startup with its persisted job/request/owner/chat/URL identity exactly once, completes, and notifies only after delivery."
+kind: contract
+persona: P14
+fixture: queued-job
+stubs: [normal-job-page, s18a-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "hello" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-RECOVERY-REAUTH
+  - A-OWNER-CONVERSATION-SCOPE
+  - A-URL-POLICY
+  - A-LIFECYCLE-ORDER
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].jobId", op: eq, value: "job-001" }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+  - { id: A-JOB-STATE, path: "state.jobs[0].originalUrl", op: eq, value: "https://linkedin.com/jobs/view/1" }
+  - { id: A-JOB-STATE, path: "state.jobs[0].chatId", op: eq, value: "telegram:2001" }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications", op: count, value: 1 }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications[0].delivered", op: eq, value: true }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.jobs[0].notifiedAt", op: eq, value: 1767225600000 }
+tools:
+  require: [save-job]
+  forbid: [web_fetch, job-status, job-queue]
+  counts: { save-job: 1 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 20 }

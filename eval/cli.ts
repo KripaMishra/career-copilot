@@ -76,7 +76,7 @@ async function main() {
   }
 
   if (selected.scenarios.length === 0) {
-    console.log('eval:test: no live scenarios in the corpus (S01–S18 land with #13c); validation passed.');
+    console.log('eval:test: no live contract scenarios selected; nothing to run.');
     process.exit(0);
   }
   if (contractScenarios.length === 0) {

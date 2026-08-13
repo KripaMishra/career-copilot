@@ -36,7 +36,7 @@ export type SafeResult = z.infer<typeof SafeResultSchema>;
 export function safeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   if (/automatic retry limit/i.test(message)) return 'Automatic retry limit reached; use /job for recovery.';
-  if (/content type|size limit|redirect|unsupported|private or reserved|valid absolute|https/i.test(message)) return 'Job content could not be fetched safely.';
+  if (/content type|size limit|redirect|not supported|unsupported|\bfetch\b|private or reserved|valid absolute|https/i.test(message)) return 'Job content could not be fetched safely.';
   if (/authorization|scope|google sheets/i.test(message)) return 'Job tracker authorization failed.';
   return 'Job processing failed; use /job for recovery.';
 }

@@ -1,0 +1,31 @@
+schemaVersion: 1
+id: two-conversations
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001", "2002"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  onboarding:
+    - ownerId: career-owner-v0
+      conversationId: "telegram:2001"
+      status: collecting
+      version: 2
+      draft: { currentStatus: "Backend engineer." }
+  jobs:
+    - jobId: job-a
+      userId: "telegram:1001"
+      ownerId: career-owner-v0
+      chatId: "telegram:2001"
+      transportEventId: "telegram:8001"
+      originalUrl: "https://linkedin.com/jobs/view/7"
+      canonicalUrl: "https://linkedin.com/jobs/view/7"
+      status: succeeded
+      attempts: 1
+      reportId: job-a-v1
+      safeResult: { summary: "Platform Engineer at Example Corp: Apply on the careers page.", reportId: "job-a-v1", reportPath: null, sheetReference: "job-a" }
+      notifiedAt: 1767225600000
+  reports:
+    - reportId: job-a-v1
+      ownerId: career-owner-v0
+      jobId: job-a
+      content: "# Platform Engineer\n\nCompany: Example Corp\n\nA platform role.\n\nNext step: Apply on the careers page.\n"

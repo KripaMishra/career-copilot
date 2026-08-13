@@ -1,0 +1,39 @@
+schemaVersion: 1
+id: s18b-replay-delivery
+description: "S18 replay/delivery: a failed first delivery keeps the cached reply without rerunning effects; the same-update replay delivers once and marks notified; a further replay is rejected with no repeated effects."
+kind: contract
+persona: P13
+fixture: active-profile
+stubs: [normal-job-page, s18b-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted, updateId: 9001 }
+  - { id: t2, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted, updateId: 9001 }
+  - { id: t3, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, updateId: 9001 }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-LIFECYCLE-ORDER
+  - A-JOB-STATE
+  - A-REPORT-BEFORE-SUCCESS
+  - A-SHEET-READBACK
+  - A-NOTIFY-AFTER-COMPLETE
+  - A-NOTIFY-MARK-AFTER-SEND
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: succeeded }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications", op: count, value: 2 }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications[0].delivered", op: eq, value: false }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.notifications[1].delivered", op: eq, value: true }
+  - { id: A-NOTIFY-MARK-AFTER-SEND, path: "state.jobs[0].notifiedAt", op: eq, value: 1767225600000 }
+tools:
+  require: [save-job]
+  forbid: [web_fetch]
+  counts: { save-job: 1 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 20 }

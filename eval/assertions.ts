@@ -111,6 +111,7 @@ function contextView(ctx: RunContext): Record<string, unknown> {
     replies: ctx.ledgers.replies,
     notifications: ctx.ledgers.notifications,
     logs: ctx.ledgers.logs,
+    fetch: ctx.ledgers.fetch,
     redactionHits: ctx.redactionHits,
     transcriptComplete: ctx.transcriptComplete,
   };
@@ -143,7 +144,17 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   'A-TOOL-CONTEXT': (ctx) => {
     const problems: string[] = [];
     for (const call of ctx.ledgers.toolCalls) {
-      const turn = call.turnId ? ctx.scenario.turns.find((candidate) => candidate.id === call.turnId) : undefined;
+      if (call.turnId === undefined || call.turnId === null) {
+        // recovery-originated call (startup recovery, issue #13c S18): the
+        // persisted job identity must match the owner and stay authorized
+        if (call.ownerId !== ctx.fixture.ownerId) problems.push(`recovery tool ${call.toolId} owner mismatch`);
+        const actor = String(call.actorId ?? '').replace(/^telegram:/, '');
+        const chat = String(call.conversationId ?? '').replace(/^telegram:/, '');
+        if (!ctx.fixture.users.includes(actor)) problems.push(`recovery tool ${call.toolId} unauthorized actor ${actor || 'none'}`);
+        if (!ctx.fixture.chats.includes(chat)) problems.push(`recovery tool ${call.toolId} unauthorized chat ${chat || 'none'}`);
+        continue;
+      }
+      const turn = ctx.scenario.turns.find((candidate) => candidate.id === call.turnId);
       if (!turn) { problems.push(`tool ${call.toolId} has no owning turn`); continue; }
       if (turn.expected === 'rejected') { problems.push(`tool ${call.toolId} ran on turn ${turn.id} expected to be rejected`); continue; }
       const authorizedUser = ctx.fixture.users.includes(turn.actorId);

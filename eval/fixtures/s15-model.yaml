@@ -1,0 +1,50 @@
+schemaVersion: 1
+id: s15-model
+ownerId: career-owner-v0
+chats: ["2002"]
+fetch:
+  - url: "https://linkedin.com/jobs/view/2"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body><h1>Staff Engineer</h1><p>Globex is hiring a staff engineer for its platform group.</p></body></html>"
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: "Senior backend/GenAI engineer; TypeScript, Node.js, SQL; remote India."
+    - purpose: analysis
+      match: "Acme Corp is hiring"
+      object:
+        schemaVersion: 1
+        title: "Senior Backend Engineer"
+        company: "Acme Corp"
+        location: "Remote India"
+        summary: "Backend role requiring TypeScript, Node.js, and SQL."
+        fitScore: 80
+        nextStep: "Apply on the company careers page."
+    - purpose: chat
+      text: "Saved: Senior Backend Engineer at Acme Corp."
+    - purpose: chat
+      match: "/jobs/view/2"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/2"
+            profileContext: "Senior backend/GenAI engineer; TypeScript, Node.js, SQL; remote India."
+    - purpose: analysis
+      match: "Globex is hiring"
+      object:
+        schemaVersion: 1
+        title: "Staff Engineer"
+        company: "Globex"
+        location: "Remote India"
+        summary: "Staff platform role at Globex."
+        fitScore: 78
+        nextStep: "Apply on the Globex careers page."
+    - purpose: chat
+      text: "Saved: Staff Engineer at Globex."

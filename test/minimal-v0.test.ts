@@ -12,7 +12,7 @@ import { parseCommand, createCareerCopilotRuntime } from '../src/services/career
 import { assertOperationalDatabaseUrl, resolveDatabaseConfig, resolveRuntimeConfig } from '../src/config/runtime.ts';
 import { createTelegramPollingTransport } from '../src/channels/telegram-transport.ts';
 import { analyzeJob, careerMemoryOptions } from '../src/agents/agent.ts';
-import { AnalysisSchema } from '../src/contracts/v0.ts';
+import { AnalysisSchema, safeErrorMessage } from '../src/contracts/v0.ts';
 import { runImport } from '../scripts/import-career-data.ts';
 
 test('one career_jobs table deduplicates transport events and has minimal statuses', async () => {
@@ -519,6 +519,19 @@ test('profile reads at most 100000 bytes per file', async () => {
 test('analysis rejects blank title and company fields', () => {
   const base = { schemaVersion: 1, title: 'Title', company: 'Company', location: '', summary: 'Summary', fitScore: 1, nextStep: 'Apply' };
   assert.equal(AnalysisSchema.safeParse({ ...base, title: '   ' }).success, false); assert.equal(AnalysisSchema.safeParse({ ...base, company: '' }).success, false);
+});
+
+test('safeErrorMessage classifies every fetch failure without leaking internals', () => {
+  // regression: HTTP-status fetch failures and the host-policy message used to
+  // fall through to the generic category (the regexes said "unsupported" and had
+  // no "fetch" alternative) — surfaced by eval scenarios S17b/S17g
+  const fetchSafe = 'Job content could not be fetched safely.';
+  assert.equal(safeErrorMessage(new Error('Job fetch failed (500).')), fetchSafe);
+  assert.equal(safeErrorMessage(new Error('Job fetch failed (429).')), fetchSafe);
+  assert.equal(safeErrorMessage(new Error('Job URL host is not supported.')), fetchSafe);
+  assert.equal(safeErrorMessage(new Error('Job URL redirected to another site.')), fetchSafe);
+  assert.equal(safeErrorMessage(new Error('Job URL resolves to a private or reserved address.')), fetchSafe);
+  assert.equal(safeErrorMessage(new Error('something else')), 'Job processing failed; use /job for recovery.');
 });
 
 test('Mastra registrations live in the mandated entrypoint', async () => {

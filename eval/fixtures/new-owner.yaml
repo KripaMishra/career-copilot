@@ -1,0 +1,6 @@
+schemaVersion: 1
+id: new-owner
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
