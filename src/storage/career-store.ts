@@ -13,8 +13,6 @@ function rowSafeResult(row: Row): SafeResult | null {
   return SafeResultSchema.parse({
     ...parsed,
     reportId: parsed.reportId ?? (row.report_id ? String(row.report_id) : null),
-    reportPath: parsed.reportPath ?? (row.report_path ? String(row.report_path) : null),
-    sheetReference: parsed.sheetReference ?? (row.sheet_reference ? String(row.sheet_reference) : null),
   });
 }
 
@@ -38,15 +36,15 @@ function rowToOnboarding(row: Row): OnboardingRecord {
 
 function normalizeJobForImport(job: Job): Job {
   const reportId = job.reportId ?? job.safeResult?.reportId ?? null;
-  const reportPath = job.reportPath ?? job.safeResult?.reportPath ?? null;
-  const sheetReference = job.sheetReference ?? job.safeResult?.sheetReference ?? null;
+  const reportPath = job.reportPath ?? null;
+  const sheetReference = job.sheetReference ?? null;
   return {
     ...job,
     status: JobStatusSchema.parse(job.status),
     reportId,
     reportPath,
     sheetReference,
-    safeResult: job.safeResult ? SafeResultSchema.parse({ ...job.safeResult, reportId: job.safeResult.reportId ?? reportId, reportPath: job.safeResult.reportPath ?? reportPath, sheetReference: job.safeResult.sheetReference ?? sheetReference }) : null,
+    safeResult: job.safeResult ? SafeResultSchema.parse({ ...job.safeResult, reportId: job.safeResult.reportId ?? reportId }) : null,
   };
 }
 
@@ -78,15 +76,13 @@ const createSchema: InStatement[] = [
     updated_at INTEGER NOT NULL
   ) STRICT`,
   `CREATE TABLE IF NOT EXISTS career_reports (
-    report_id TEXT PRIMARY KEY,
+    report_id TEXT PRIMARY KEY,      -- = job_id for reports written by completeWithReport
     owner_id TEXT NOT NULL,
     job_id TEXT NOT NULL,
-    version INTEGER NOT NULL CHECK (version >= 1),
     content TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     byte_size INTEGER NOT NULL CHECK (byte_size >= 0),
-    created_at INTEGER NOT NULL,
-    UNIQUE(job_id, version)
+    created_at INTEGER NOT NULL
   ) STRICT`,
   `CREATE TABLE IF NOT EXISTS career_profile_documents (
     document_id TEXT PRIMARY KEY,
@@ -100,10 +96,6 @@ const createSchema: InStatement[] = [
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     UNIQUE(owner_id, name, version)
-  ) STRICT`,
-  `CREATE TABLE IF NOT EXISTS career_report_counters (
-    job_id TEXT PRIMARY KEY,
-    next_version INTEGER NOT NULL CHECK (next_version >= 2)
   ) STRICT`,
   `CREATE TABLE IF NOT EXISTS career_onboarding (
     owner_id TEXT NOT NULL,
@@ -188,23 +180,33 @@ export class CareerStore {
     return rows.map(rowToJob);
   }
   async markRunning(jobId: string, runId: string) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='running', mastra_run_id=?, attempts=attempts+1, updated_at=? WHERE job_id=? AND status IN ('queued','running')", args: [runId, this.#clock(), jobId] }); return this.get(jobId); }
-  async complete(jobId: string, result: SafeResult, reportId: string | null, sheetReference: string | null) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='succeeded', safe_result=?, report_id=?, report_path=NULL, sheet_reference=?, safe_error=NULL, updated_at=? WHERE job_id=?", args: [JSON.stringify(result), reportId, sheetReference, this.#clock(), jobId] }); return this.get(jobId); }
-  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_error=?, updated_at=? WHERE job_id=?", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
+  async completeWithReport(input: { jobId: string; ownerId: string; content: string; summary: string }) {
+    await this.#ready; const now = this.#clock(); let committed = false;
+    const transaction = await this.#client.transaction('write');
+    try {
+      const updated = await transaction.execute({ sql: "UPDATE career_jobs SET status='succeeded', safe_result=?, report_id=?, safe_error=NULL, updated_at=? WHERE job_id=? AND owner_id=? AND status='running'", args: [JSON.stringify(SafeResultSchema.parse({ summary: input.summary, reportId: input.jobId })), input.jobId, now, input.jobId, input.ownerId] });
+      if (updated.rowsAffected !== 1) {
+        const row = (await transaction.execute({ sql: 'SELECT owner_id, status, safe_result, report_id FROM career_jobs WHERE job_id=?', args: [input.jobId] })).rows[0];
+        if (!row || String(row.owner_id) !== input.ownerId) throw new Error('Completion job does not exist.');
+        if (String(row.status) !== 'succeeded') throw new Error('Completion job is not in a running state.');
+        const existing = rowSafeResult(row);
+        if (!existing) throw new Error('Completion job is already succeeded without a result.');
+        return { reportId: existing.reportId ?? input.jobId, hash: null, byteSize: null };
+      }
+      const contentHash = hash(input.content);
+      await transaction.execute({ sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?)', args: [input.jobId, input.ownerId, input.jobId, input.content, contentHash, bytes(input.content), now] });
+      await transaction.commit(); committed = true;
+      return { reportId: input.jobId, hash: `sha256:${contentHash}`, byteSize: bytes(input.content) };
+    } catch (error) {
+      if (!committed) try { await transaction.rollback(); } catch { /* rollback best effort */ }
+      throw error;
+    } finally { transaction.close(); }
+  }
+  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_result=NULL, safe_error=?, updated_at=? WHERE job_id=?", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
   async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [this.#clock(), this.#clock(), jobId] }); return this.get(jobId); }
   async unfinished() { return (await this.list()).filter((job) => job.status === 'queued' || job.status === 'running'); }
 
-  async saveReport(input: { ownerId: string; jobId: string; content: string }) {
-    await this.#ready; const now = this.#clock();
-    const job = (await this.#client.execute({ sql: 'SELECT owner_id FROM career_jobs WHERE job_id = ?', args: [input.jobId] })).rows[0];
-    if (!job) throw new Error('Report job does not exist.');
-    const ownerId = String(job.owner_id);
-    if (ownerId !== input.ownerId) throw new Error('Report owner does not match job owner.');
-    const allocated = (await this.#client.execute({ sql: `INSERT INTO career_report_counters (job_id,next_version) VALUES (?, COALESCE((SELECT MAX(version) FROM career_reports WHERE job_id=?), 0) + 2) ON CONFLICT(job_id) DO UPDATE SET next_version=next_version+1 RETURNING next_version - 1 AS version`, args: [input.jobId, input.jobId] })).rows[0];
-    const version = Number(allocated?.version); const reportId = `${input.jobId}-v${version}`; const contentHash = hash(input.content);
-    await this.#client.execute({ sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,version,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?,?)', args: [reportId, ownerId, input.jobId, version, input.content, contentHash, bytes(input.content), now] });
-    return { reportId, hash: `sha256:${contentHash}`, byteSize: bytes(input.content), version };
-  }
-  async getReport(reportId: string, ownerId: string) { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_reports WHERE report_id = ? AND owner_id = ?', args: [reportId, ownerId] })).rows[0]; return row ? { reportId: String(row.report_id), ownerId: String(row.owner_id), jobId: String(row.job_id), version: Number(row.version), content: String(row.content), sha256: String(row.sha256), byteSize: Number(row.byte_size), createdAt: Number(row.created_at) } : null; }
+  async getReport(reportId: string, ownerId: string) { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_reports WHERE report_id = ? AND owner_id = ?', args: [reportId, ownerId] })).rows[0]; return row ? { reportId: String(row.report_id), ownerId: String(row.owner_id), jobId: String(row.job_id), content: String(row.content), sha256: String(row.sha256), byteSize: Number(row.byte_size), createdAt: Number(row.created_at) } : null; }
   async saveProfileDocument(input: { ownerId: string; name: string; content: string; active?: boolean }) {
     await this.#ready; const name = safeDocumentName(input.name); assertSafeProfileContent(input.content); const now = this.#clock();
     const current = (await this.#client.execute({ sql: 'SELECT COALESCE(MAX(version), 0) AS version FROM career_profile_documents WHERE owner_id=? AND name=?', args: [input.ownerId, name] })).rows[0];
@@ -286,15 +288,14 @@ export class CareerStore {
     if (existing) {
       assertImportMatch(String(existing.owner_id) === input.ownerId && String(existing.job_id) === input.jobId && String(existing.sha256) === contentHash && Number(existing.byte_size) === byteSize, 'Imported report collision does not match source content.');
       if (!job.report_id) await this.#client.execute({ sql: 'UPDATE career_jobs SET report_id=?, updated_at=? WHERE job_id=? AND report_id IS NULL', args: [input.reportId, input.createdAt ?? this.#clock(), input.jobId] });
-      return { reportId: String(existing.report_id), hash: `sha256:${String(existing.sha256)}`, byteSize: Number(existing.byte_size), version: Number(existing.version), imported: false };
+      return { reportId: String(existing.report_id), hash: `sha256:${String(existing.sha256)}`, byteSize: Number(existing.byte_size), imported: false };
     }
-    const allocated = (await this.#client.execute({ sql: `INSERT INTO career_report_counters (job_id,next_version) VALUES (?, COALESCE((SELECT MAX(version) FROM career_reports WHERE job_id=?), 0) + 2) ON CONFLICT(job_id) DO UPDATE SET next_version=next_version+1 RETURNING next_version - 1 AS version`, args: [input.jobId, input.jobId] })).rows[0];
-    const version = Number(allocated?.version); const now = input.createdAt ?? this.#clock();
+    const now = input.createdAt ?? this.#clock();
     await this.#client.batch([
-      { sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,version,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?,?)', args: [input.reportId, input.ownerId, input.jobId, version, input.content, contentHash, byteSize, now] },
+      { sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?)', args: [input.reportId, input.ownerId, input.jobId, input.content, contentHash, byteSize, now] },
       { sql: 'UPDATE career_jobs SET report_id=?, updated_at=? WHERE job_id=? AND (report_id IS NULL OR report_id=?)', args: [input.reportId, now, input.jobId, input.reportId] },
     ], 'write');
-    return { reportId: input.reportId, hash: `sha256:${contentHash}`, byteSize, version, imported: true };
+    return { reportId: input.reportId, hash: `sha256:${contentHash}`, byteSize, imported: true };
   }
   async importProfileDocument(input: { ownerId: string; name: string; content: string; active?: boolean; createdAt?: number }) {
     await this.#ready; const name = safeDocumentName(input.name); assertSafeProfileContent(input.content); const contentHash = hash(input.content);

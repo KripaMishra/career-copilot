@@ -46,8 +46,6 @@ const jobRowSchema = z.strictObject({
     .strictObject({
       summary: z.string().min(1).max(4000),
       reportId: z.string().max(500).nullable(),
-      reportPath: z.string().max(2048).nullable(),
-      sheetReference: z.string().max(500).nullable(),
     })
     .nullable()
     .default(null),
@@ -62,7 +60,6 @@ const reportRowSchema = z.strictObject({
   ownerId: z.string().min(1).max(200),
   jobId: z.string().min(1).max(200),
   content: z.string().max(100_000),
-  version: z.number().int().min(1).max(10_000).default(1),
 });
 
 const dbSchema = z.strictObject({

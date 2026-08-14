@@ -21,11 +21,11 @@ db:
       canonicalUrl: "https://linkedin.com/jobs/view/7"
       status: succeeded
       attempts: 1
-      reportId: job-a-v1
-      safeResult: { summary: "Platform Engineer at Example Corp: Apply on the careers page.", reportId: "job-a-v1", reportPath: null, sheetReference: "job-a" }
+      reportId: job-a
+      safeResult: { summary: "Platform Engineer at Example Corp: Apply on the careers page.", reportId: "job-a" }
       notifiedAt: 1767225600000
   reports:
-    - reportId: job-a-v1
+    - reportId: job-a
       ownerId: career-owner-v0
       jobId: job-a
       content: "# Platform Engineer\n\nCompany: Example Corp\n\nA platform role.\n\nNext step: Apply on the careers page.\n"

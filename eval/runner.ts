@@ -440,7 +440,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       if (job.reportId) {
         const report = await store.getReport(job.reportId, fixture.ownerId);
         if (report) {
-          reports.push({ reportId: report.reportId, ownerId: report.ownerId, jobId: report.jobId, version: report.version, byteSize: report.byteSize, createdAt: report.createdAt });
+          reports.push({ reportId: report.reportId, ownerId: report.ownerId, jobId: report.jobId, byteSize: report.byteSize, createdAt: report.createdAt });
           reportContents.push(report.content);
         }
       }

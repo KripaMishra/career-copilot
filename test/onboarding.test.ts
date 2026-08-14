@@ -334,7 +334,7 @@ test('failed normal reply retry resends cached response without rerunning side e
     calls++;
     const job = (await store.enqueue({ jobId: 'cached-normal-job', userId: turn.actorId, ownerId: 'owner', chatId: turn.conversationId, transportEventId: turn.requestId, originalUrl: 'https://linkedin.com/jobs/cached', canonicalUrl: 'https://linkedin.com/jobs/cached' })).job;
     await store.markRunning(job.jobId, 'run-cached');
-    await store.complete(job.jobId, { summary: 'cached summary', reportId: null, reportPath: null, sheetReference: job.jobId }, null, job.jobId);
+    await store.completeWithReport({ jobId: job.jobId, ownerId: 'owner', content: '# cached', summary: 'cached summary' });
     return 'cached normal reply';
   } });
   await assert.rejects(() => runtime.handleTelegramUpdate(update(510, 'save my cached job'), async (text) => { if (fail) { fail = false; throw new Error('telegram unavailable'); } replies.push(text); }), /telegram unavailable/);

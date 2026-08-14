@@ -46,11 +46,11 @@ export async function executeSaveJob(options: SaveJobDeps & { input: JobInput; p
     const acquired = await timed('fetch', eventData, log, () => retryTransient(() => (options.acquire ?? acquireJobText)(persistedInput.canonicalUrl)));
     const analysis = await timed('analysis', eventData, log, () => retryTransient(() => options.analyze(acquired.text, profile)));
     const content = `# ${analysis.title}\n\nCompany: ${analysis.company}\nLocation: ${analysis.location}\n\n${analysis.summary}\n\nNext step: ${analysis.nextStep}\n`;
-    const report = await timed('report', eventData, log, () => options.store.saveReport({ ownerId: persistedInput.ownerId, jobId: persistedInput.jobId, content }));
+    const summary = `${analysis.title} at ${analysis.company}: ${analysis.nextStep}`;
+    const report = await timed('report', eventData, log, () => options.store.completeWithReport({ ownerId: persistedInput.ownerId, jobId: persistedInput.jobId, content, summary }));
     const sheetData = { ...eventData, reportId: report.reportId };
-    const row = await timed('sheets', sheetData, log, () => upsertSheetRow(options.sheet, { jobId: persistedInput.jobId, status: 'succeeded', title: analysis.title, company: analysis.company, reportPath: report.reportId }));
-    const result = SafeResultSchema.parse({ summary: `${analysis.title} at ${analysis.company}: ${analysis.nextStep}`, reportId: report.reportId, reportPath: null, sheetReference: String(row.jobId) });
-    await timed('complete', sheetData, log, () => options.store.complete(persistedInput.jobId, result, report.reportId, String(row.jobId)));
+    await timed('sheets', sheetData, log, () => upsertSheetRow(options.sheet, { jobId: persistedInput.jobId, status: 'succeeded', title: analysis.title, company: analysis.company, reportPath: report.reportId }));
+    const result = SafeResultSchema.parse({ summary, reportId: report.reportId });
     log('info', 'job.succeeded', { ...sheetData, status: 'succeeded' });
     return SaveJobResultSchema.parse({ jobId: persistedInput.jobId, ...result });
   } catch (error) {

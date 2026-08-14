@@ -790,8 +790,6 @@ db:
       safeResult:
         summary: "done"
         reportId: null
-        reportPath: null
-        sheetReference: null
     - jobId: "job-8"
       userId: "1001"
       ownerId: career-owner-v0
@@ -804,8 +802,6 @@ db:
       safeResult:
         summary: "done"
         reportId: null
-        reportPath: null
-        sheetReference: null
 model:
   responses:
     - purpose: chat
