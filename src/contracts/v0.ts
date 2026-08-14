@@ -1,6 +1,6 @@
 import { z } from 'zod';
 
-export const JobStatusSchema = z.enum(['queued', 'running', 'needs_input', 'succeeded', 'failed']);
+export const JobStatusSchema = z.enum(['queued', 'running', 'succeeded', 'failed']);
 export type JobStatus = z.infer<typeof JobStatusSchema>;
 
 export const JobInputSchema = z.object({
@@ -35,7 +35,6 @@ export function safeErrorMessage(error: unknown): string {
   const message = error instanceof Error ? error.message : '';
   if (/automatic retry limit/i.test(message)) return 'Automatic retry limit reached; use /job for recovery.';
   if (/content type|size limit|redirect|not supported|unsupported|\bfetch\b|private or reserved|valid absolute|https/i.test(message)) return 'Job content could not be fetched safely.';
-  if (/authorization|scope|google sheets/i.test(message)) return 'Job tracker authorization failed.';
   return 'Job processing failed; use /job for recovery.';
 }
 
@@ -44,8 +43,6 @@ export type Job = Omit<JobInput, 'userId'> & { userId: string | null } & {
   mastraRunId: string | null;
   attempts: number;
   reportId: string | null;
-  reportPath: string | null;
-  sheetReference: string | null;
   safeResult: SafeResult | null;
   safeError: string | null;
   notifiedAt: number | null;

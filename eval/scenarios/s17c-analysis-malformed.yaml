@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s17c-analysis-malformed
-description: "S17 analysis: an invalid analysis schema fails the job safely; no success-only report, row, or claim exists."
+description: "S17 analysis: an invalid analysis schema fails the job safely; no success-only report or claim exists."
 kind: contract
 persona: P12
 fixture: active-profile
@@ -14,7 +14,6 @@ assertions:
   - A-SAFE-ERROR
   - A-JOB-STATE
   - A-REPORT-BEFORE-SUCCESS
-  - A-SHEET-READBACK
   - A-TRANSCRIPT-COMPLETE
   - A-BUDGET
   - A-CANARY-CONTAINED
@@ -26,7 +25,6 @@ assertions:
   - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
   - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job processing failed; use /job for recovery." }
   - { id: A-REPORT-BEFORE-SUCCESS, path: "state.reports", op: count, value: 0 }
-  - { id: A-SHEET-READBACK, path: "state.sheets", op: count, value: 0 }
 tools:
   require: [save-job]
   counts: { save-job: 1 }

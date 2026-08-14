@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s08-sparse-question
-description: "S08: a sparse profile defers the save; no save/fetch/report/Sheet work happens and the owner gets one concise question instead of a fabricated success."
+description: "S08: a sparse profile defers the save; no save, fetch, or report work happens and the owner gets one concise question instead of a fabricated success."
 kind: contract
 persona: P06
 fixture: sparse-profile

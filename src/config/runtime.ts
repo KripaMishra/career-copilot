@@ -1,9 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { resolve, join, isAbsolute, relative, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { SHEETS_SCOPE } from '../integrations/google-sheets.ts';
 
-export type RuntimeConfig = { dataDir: string; databaseUrl: string; databaseAuthToken?: string; memoryModel: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> }; sheetsTarget: { spreadsheetId: string; trackerTab: string; auditTab: string; topicsTab: string }; sheetsOAuth: { clientId: string; clientSecret: string; refreshToken: string; scope: string } };
+export type RuntimeConfig = { dataDir: string; databaseUrl: string; databaseAuthToken?: string; memoryModel: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> } };
 type Input = { env?: Record<string, string | undefined>; dataDir?: string; databaseUrl?: string; databaseAuthToken?: string; requireDeployment?: boolean };
 function ids(value: string | undefined, name: string, deployment: boolean) {
   if (!value?.trim()) { if (deployment) throw new Error(`${name} is required.`); return new Set<string>(); }
@@ -43,9 +42,7 @@ export function resolveRuntimeConfig(input: Input = {}): RuntimeConfig {
   const database = resolveDatabaseConfig(configuredDatabaseUrl ?? `file:${join(dataDir, 'career-copilot.db')}`, input.databaseAuthToken ?? env.TURSO_AUTH_TOKEN, dataDir, { requireRemote: requiredDeployment }); const ownerId = requiredDeployment ? required(env, 'CAREER_COPILOT_OWNER_RESOURCE_ID') : (env.CAREER_COPILOT_OWNER_RESOURCE_ID ?? 'career-owner-v0');
   const allowedUserIds = ids(env.TELEGRAM_ALLOWED_USER_IDS, 'TELEGRAM_ALLOWED_USER_IDS', requiredDeployment);
   const privateChatIds = ids(env.CAREER_COPILOT_PRIVATE_CHAT_IDS, 'CAREER_COPILOT_PRIVATE_CHAT_IDS', requiredDeployment);
-  const sheetsTarget = { spreadsheetId: requiredDeployment ? required(env, 'GOOGLE_SHEETS_SPREADSHEET_ID') : (env.GOOGLE_SHEETS_SPREADSHEET_ID ?? ''), trackerTab: env.GOOGLE_SHEETS_TRACKER_TAB ?? 'Applications', auditTab: env.GOOGLE_SHEETS_APPLICATION_LOG_TAB ?? 'Application Log', topicsTab: env.GOOGLE_SHEETS_TOPICS_TAB ?? 'Topics' };
-  const sheetsOAuth = { clientId: requiredDeployment ? required(env, 'GOOGLE_OAUTH_CLIENT_ID') : (env.GOOGLE_OAUTH_CLIENT_ID ?? ''), clientSecret: requiredDeployment ? required(env, 'GOOGLE_OAUTH_CLIENT_SECRET') : (env.GOOGLE_OAUTH_CLIENT_SECRET ?? ''), refreshToken: requiredDeployment ? required(env, 'GOOGLE_OAUTH_REFRESH_TOKEN') : (env.GOOGLE_OAUTH_REFRESH_TOKEN ?? ''), scope: SHEETS_SCOPE };
   const mainModel = env.CAREER_COPILOT_MODEL?.trim() || 'opencode-go/deepseek-v4-flash';
   const memoryModel = env.CAREER_COPILOT_MEMORY_MODEL?.trim() || mainModel;
-  return { dataDir, databaseUrl: database.url, ...(database.authToken ? { databaseAuthToken: database.authToken } : {}), memoryModel, owner: { resourceId: ownerId, enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false' }, telegram: { botToken: requiredDeployment ? required(env, 'TELEGRAM_BOT_TOKEN') : (env.TELEGRAM_BOT_TOKEN ?? ''), allowedUserIds, privateChatIds }, sheetsTarget, sheetsOAuth };
+  return { dataDir, databaseUrl: database.url, ...(database.authToken ? { databaseAuthToken: database.authToken } : {}), memoryModel, owner: { resourceId: ownerId, enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false' }, telegram: { botToken: requiredDeployment ? required(env, 'TELEGRAM_BOT_TOKEN') : (env.TELEGRAM_BOT_TOKEN ?? ''), allowedUserIds, privateChatIds } };
 }

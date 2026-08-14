@@ -6,7 +6,7 @@ import { SCHEMA_VERSION } from './scenario.ts';
  *
  * A fixture declares every external fact a scenario may depend on: owner/actor/
  * conversation/request identity, the fixed clock, initial persisted rows,
- * profile text, fetch/DNS/redirect plans, Sheet state, the notification plan,
+ * profile text, fetch/DNS/redirect plans, the notification plan,
  * scripted model responses (with optional usage), and canaries.
  */
 
@@ -36,12 +36,10 @@ const jobRowSchema = z.strictObject({
   transportEventId: z.string().min(1).max(200),
   originalUrl: z.string().url().max(2048),
   canonicalUrl: z.string().url().max(2048),
-  status: z.enum(['queued', 'running', 'needs_input', 'succeeded', 'failed']),
+  status: z.enum(['queued', 'running', 'succeeded', 'failed']),
   mastraRunId: z.string().nullable().default(null),
   attempts: z.number().int().min(0).max(3).default(0),
   reportId: z.string().nullable().default(null),
-  reportPath: z.string().nullable().default(null),
-  sheetReference: z.string().nullable().default(null),
   safeResult: z
     .strictObject({
       summary: z.string().min(1).max(4000),
@@ -85,20 +83,6 @@ const fetchPlanSchema = z.strictObject({
   abort: z.boolean().default(false),
 });
 
-const sheetRowSchema = z.strictObject({
-  jobId: z.string().min(1).max(200),
-  status: z.string().max(50),
-  title: z.string().max(500),
-  company: z.string().max(500),
-  reportPath: z.string().nullable().default(null),
-});
-
-const sheetPlanSchema = z.strictObject({
-  headers: z.array(z.string()).default([]),
-  rows: z.array(sheetRowSchema).default([]),
-  failure: z.enum(['auth', 'write', 'readback', 'ambiguous']).optional(),
-});
-
 const notificationPlanSchema = z.strictObject({
   jobId: z.string().min(1).max(200),
   deliver: z.enum(['ok', 'fail-first']).default('ok'),
@@ -128,7 +112,7 @@ const modelPlanSchema = z.strictObject({
   responses: z.array(modelResponseSchema).min(1).max(1000),
 });
 
-export const canarySinkSchema = z.enum(['all', 'model', 'reply', 'trace', 'log', 'database', 'report', 'sheet', 'judge']);
+export const canarySinkSchema = z.enum(['all', 'model', 'reply', 'trace', 'log', 'database', 'report', 'judge']);
 
 const canarySchema = z.strictObject({
   value: z.string().min(1).max(500),
@@ -148,7 +132,6 @@ export const fixtureSchema = z.strictObject({
   db: dbSchema.default(EMPTY_DB),
   profileText: z.string().max(100_000).optional(),
   fetch: z.array(fetchPlanSchema).default([]),
-  sheets: sheetPlanSchema.default({ headers: [], rows: [] }),
   notifications: z.array(notificationPlanSchema).default([]),
   // inert default: a memory no-op is only consumable by memory extraction
   // (serve() never matches it for chat/onboarding/analysis purposes), so a
@@ -159,7 +142,6 @@ export const fixtureSchema = z.strictObject({
 
 export type Fixture = z.infer<typeof fixtureSchema>;
 export type FetchPlan = z.infer<typeof fetchPlanSchema>;
-export type SheetPlan = z.infer<typeof sheetPlanSchema>;
 export type ModelResponse = z.infer<typeof modelResponseSchema>;
 export type ModelPlan = z.infer<typeof modelPlanSchema>;
 export type Canary = z.infer<typeof canarySchema>;
@@ -167,7 +149,7 @@ export type CanarySink = z.infer<typeof canarySinkSchema>;
 export type NotificationPlan = z.infer<typeof notificationPlanSchema>;
 export type JobRow = z.infer<typeof jobRowSchema>;
 
-export const ALL_SINKS: CanarySink[] = ['all', 'model', 'reply', 'trace', 'log', 'database', 'report', 'sheet', 'judge'];
+export const ALL_SINKS: CanarySink[] = ['all', 'model', 'reply', 'trace', 'log', 'database', 'report', 'judge'];
 
 export function parseFixture(value: unknown): Fixture {
   return fixtureSchema.parse(value);

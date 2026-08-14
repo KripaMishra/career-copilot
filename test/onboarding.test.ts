@@ -231,8 +231,8 @@ test('confirmed onboarding profile context is available to save-job immediately 
   const started = await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });
   const review = await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: started.version, draft, status: 'review' });
   await store.completeOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: review.version });
-  let profileSeen = ''; const rows = new Map<string, Record<string, unknown>>();
-  await executeSaveJob({ input: { jobId: 'job-onboarded', userId: 'telegram:1', ownerId: 'owner', chatId: 'telegram:2', transportEventId: 'telegram:job-onboarded', originalUrl: 'https://linkedin.com/jobs/onboarded', canonicalUrl: 'https://linkedin.com/jobs/onboarded' }, store, profileText: 'STALE STARTUP PROFILE', sheet: { findByJobId: async (id) => rows.get(id) ?? null, write: async (row) => { rows.set(String(row.jobId), row); } }, acquire: async () => ({ contentType: 'text/plain', text: 'AI platform role' }), analyze: async (_job, profile) => { profileSeen = profile; return { schemaVersion: 1, title: 'AI Engineer', company: 'Example', location: 'Remote', summary: 'fit', fitScore: 90, nextStep: 'Apply' }; } });
+  let profileSeen = '';
+  await executeSaveJob({ input: { jobId: 'job-onboarded', userId: 'telegram:1', ownerId: 'owner', chatId: 'telegram:2', transportEventId: 'telegram:job-onboarded', originalUrl: 'https://linkedin.com/jobs/onboarded', canonicalUrl: 'https://linkedin.com/jobs/onboarded' }, store, profileText: 'STALE STARTUP PROFILE', acquire: async () => ({ contentType: 'text/plain', text: 'AI platform role' }), analyze: async (_job, profile) => { profileSeen = profile; return { schemaVersion: 1, title: 'AI Engineer', company: 'Example', location: 'Remote', summary: 'fit', fitScore: 90, nextStep: 'Apply' }; } });
   assert.match(profileSeen, /Staff product engineer/);
   assert.doesNotMatch(profileSeen, /STALE STARTUP PROFILE/);
   assert.equal((await store.get('job-onboarded'))?.status, 'succeeded');

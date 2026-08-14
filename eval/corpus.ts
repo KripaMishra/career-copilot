@@ -118,15 +118,11 @@ export async function loadCorpus(baseDir = process.cwd()): Promise<Corpus> {
     }
   }
 
-  // stub merge conflicts: sheets failure modes and notification delivery plans
-  // must agree across the fixture and its stubs (mergedFixture semantics)
+  // stub merge conflicts: notification delivery plans must agree across the
+  // fixture and its stubs (mergedFixture semantics)
   for (const { scenario, file } of scenarios) {
     const base = fixtures.get(scenario.fixture)?.fixture;
     const stubFixtures = (scenario.stubs ?? []).map((id) => fixtures.get(id)?.fixture).filter((entry): entry is Fixture => entry !== undefined);
-    const sheetFailures = new Set<string>();
-    if (base?.sheets.failure) sheetFailures.add(base.sheets.failure);
-    for (const stub of stubFixtures) if (stub.sheets.failure) sheetFailures.add(stub.sheets.failure);
-    if (sheetFailures.size > 1) errors.push({ file, message: `stub merge conflict: sheets failure modes ${[...sheetFailures].join(', ')}` });
     const deliveries = new Map<string, string>();
     for (const plan of [base, ...stubFixtures].flatMap((entry) => entry?.notifications ?? [])) {
       const prior = deliveries.get(plan.jobId);
