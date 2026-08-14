@@ -144,9 +144,11 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
       const response = await options.respond({ text: injectCommand(message!.text!), channel: 'telegram', actorId: request.userId, conversationId: request.chatId, requestId: transportEventId });
       const completed = await store.getByTransportEventId(scoped(transportEventId)) ?? await store.getByTransportEventId(transportEventId);
       const notifyJobId = completed?.status === 'succeeded' && completed.ownerId === options.ownerId && completed.userId !== null && telegramId(completed.userId) === request.userId && telegramId(completed.chatId) === request.chatId ? completed.jobId : undefined;
+      let text = response;
+      if (notifyJobId && completed.reportId) { const report = await store.getReport(completed.reportId, options.ownerId); if (report) text = report.content; } // deliver the exact persisted report; agent response only when the report row is missing (pre-report legacy data)
       const result: TelegramResult = { outcome: 'accepted', command: appCommand };
-      cachedReplies.set(raw.update_id, { text: response, result, updateId: raw.update_id, requestId: transportEventId, ...(notifyJobId ? { notifyJobId } : {}) });
-      await reply(response); if (notifyJobId) await store.markNotified(notifyJobId); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);
+      cachedReplies.set(raw.update_id, { text, result, updateId: raw.update_id, requestId: transportEventId, ...(notifyJobId ? { notifyJobId } : {}) });
+      await reply(text); if (notifyJobId) await store.markNotified(notifyJobId); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);
       log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: appCommand });
       return result;
     });
@@ -161,13 +163,13 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
       for (const job of unfinished) if (reauthorized(job)) {
         try {
           const response = await respond({ text: `Resume saving the previously persisted job ${job.originalUrl}. Use the save-job tool with the profile context already in memory.`, channel: 'telegram', actorId: telegramId(job.userId!), conversationId: telegramId(job.chatId), requestId: telegramId(job.transportEventId), resumeJobId: job.jobId });
-          if (notify) { const current = await store.get(job.jobId); await reply(current?.safeResult?.summary ?? response, telegramId(job.chatId)); if (current?.status === 'succeeded') await store.markNotified(job.jobId); }
+          if (notify) { const current = await store.get(job.jobId); let text = current?.safeResult?.summary ?? response; if (current?.status === 'succeeded' && current.reportId) { const report = await store.getReport(current.reportId, options.ownerId); if (report) text = report.content; } await reply(text, telegramId(job.chatId)); if (current?.status === 'succeeded') await store.markNotified(job.jobId); }
         } catch (error) { if ((await store.get(job.jobId))?.status !== 'succeeded') await store.fail(job.jobId, error); log('error', 'job.failed', { jobId: job.jobId, phase: 'recovery', errorName: error instanceof Error ? error.name : 'UnknownError' }); }
       }
       log('info', 'recovery.completed', { unfinishedJobs: unfinished.length });
       if (!notify) return;
       for (const job of await store.list('succeeded')) if (!job.notifiedAt && reauthorized(job)) {
-        try { await reply(job.safeResult?.summary ?? 'Job completed.', telegramId(job.chatId)); await store.markNotified(job.jobId); log('info', 'job.notification.sent', { jobId: job.jobId, recovery: true }); } catch { log('warn', 'job.notification.failed', { jobId: job.jobId, recovery: true }); }
+        try { let text = job.safeResult?.summary ?? 'Job completed.'; if (job.reportId) { const report = await store.getReport(job.reportId, options.ownerId); if (report) text = report.content; } await reply(text, telegramId(job.chatId)); await store.markNotified(job.jobId); log('info', 'job.notification.sent', { jobId: job.jobId, recovery: true }); } catch { log('warn', 'job.notification.failed', { jobId: job.jobId, recovery: true }); }
       }
     })().finally(() => { recoveryPromise = null; });
     return recoveryPromise;

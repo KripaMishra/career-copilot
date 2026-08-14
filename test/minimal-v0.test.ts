@@ -206,11 +206,11 @@ test('durable agent work remains stored when its Telegram reply fails', async ()
   assert.equal((await store.get('job-ack'))?.status, 'succeeded'); await runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('successful Telegram reply marks the completed agent job notified', async () => {
-  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-notified-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = (await store.enqueue({ jobId: 'job-notified', userId: turn.actorId, ownerId: 'owner', chatId: turn.conversationId, transportEventId: turn.requestId, originalUrl: 'https://linkedin.com/jobs/notified', canonicalUrl: 'https://linkedin.com/jobs/notified' })).job; await store.markRunning(job.jobId, 'agent-run'); await store.completeWithReport({ jobId: job.jobId, ownerId: 'owner', content: '# stored', summary: 'stored' }); return 'stored'; } });
-  await runtime.handleTelegramUpdate({ update_id: 32, message: { message_id: 32, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'save my job' } }, async () => {});
-  assert.ok((await store.get('job-notified'))?.notifiedAt); await runtime.close(); await rm(dir, { recursive: true, force: true });
+test('successful Telegram reply delivers the exact persisted report and marks notified', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-notified-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const delivered: string[] = [];
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { const job = (await store.enqueue({ jobId: 'job-notified', userId: turn.actorId, ownerId: 'owner', chatId: turn.conversationId, transportEventId: turn.requestId, originalUrl: 'https://linkedin.com/jobs/notified', canonicalUrl: 'https://linkedin.com/jobs/notified' })).job; await store.markRunning(job.jobId, 'agent-run'); await store.completeWithReport({ jobId: job.jobId, ownerId: 'owner', content: '# stored', summary: 'stored' }); return 'agent paraphrase'; } });
+  await runtime.handleTelegramUpdate({ update_id: 32, message: { message_id: 32, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'save my job' } }, async (text) => { delivered.push(text); });
+  assert.deepEqual(delivered, ['# stored']); assert.equal(delivered[0], (await store.getReport('job-notified', 'owner'))?.content); assert.ok((await store.get('job-notified'))?.notifiedAt); await runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('notification failure leaves stored success for one restart retry', async () => {
@@ -229,7 +229,7 @@ test('recovery resumes unfinished work through the same conversational agent', a
   const turns: Array<Record<string, unknown>> = []; const replies: Array<[string, string | undefined]> = [];
   const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async (turn) => { turns.push(turn); await store.markRunning('agent-recovery', 'agent-run'); await store.completeWithReport({ jobId: 'agent-recovery', ownerId: 'owner', content: '# Recovered.', summary: 'Recovered.' }); return 'Recovered.'; } });
   await runtime.recoverUnfinished(async (text, chatId) => { replies.push([text, chatId]); });
-  assert.equal(turns[0].resumeJobId, 'agent-recovery'); assert.match(String(turns[0].text), /resume saving/i); assert.deepEqual(replies, [['Recovered.', '2']]);
+  assert.equal(turns[0].resumeJobId, 'agent-recovery'); assert.match(String(turns[0].text), /resume saving/i); assert.deepEqual(replies, [['# Recovered.', '2']]);
   runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -239,7 +239,19 @@ test('recovery delivers completion to the job chat', async () => {
   await store.markRunning('job-recovery', 'run-1'); await store.completeWithReport({ jobId: 'job-recovery', ownerId: 'owner', content: '# recovered', summary: 'recovered' });
   const delivered: Array<[string, string]> = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => 'unused' });
   await runtime.recoverUnfinished((text, chatId) => { delivered.push([chatId ?? '', text]); return Promise.resolve(); });
-  assert.deepEqual(delivered, [['2', 'recovered']]); runtime.close(); await rm(dir, { recursive: true, force: true });
+  assert.deepEqual(delivered, [['2', '# recovered']]); runtime.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('succeeded job without a report row falls back and still marks notified', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-report-missing-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const legacy = (transportEventId: string, jobId: string) => ({ jobId, userId: '1', ownerId: 'owner', chatId: '2', transportEventId, originalUrl: 'https://linkedin.com/jobs/legacy', canonicalUrl: 'https://linkedin.com/jobs/legacy', status: 'succeeded' as const, mastraRunId: null, attempts: 0, reportId: null, reportPath: null, sheetReference: null, safeResult: { summary: 'legacy done', reportId: null }, safeError: null, notifiedAt: null, createdAt: 1, updatedAt: 1 });
+  await store.importJob(legacy('42', 'legacy-normal')); await store.importJob(legacy('legacy-sweep-event', 'legacy-sweep'));
+  const delivered: string[] = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => 'agent paraphrase' });
+  await runtime.handleTelegramUpdate({ update_id: 42, message: { message_id: 42, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'what happened to my job?' } }, async (text) => { delivered.push(text); });
+  assert.deepEqual(delivered, ['agent paraphrase']); assert.ok((await store.get('legacy-normal'))?.notifiedAt);
+  const swept: string[] = []; await runtime.recoverUnfinished(async (text) => { swept.push(text); });
+  assert.deepEqual(swept, ['legacy done']); assert.ok((await store.get('legacy-sweep'))?.notifiedAt);
+  await runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('single-agent save operation persists before completing the full pipeline', async () => {

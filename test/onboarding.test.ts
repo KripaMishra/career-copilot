@@ -343,7 +343,7 @@ test('failed normal reply retry resends cached response without rerunning side e
   const retried = await runtime.handleTelegramUpdate(update(510, 'save my cached job'), async (text) => { replies.push(text); });
   assert.deepEqual(retried, { outcome: 'accepted', command: 'chat' });
   assert.equal(calls, 1);
-  assert.deepEqual(replies, ['cached normal reply']);
+  assert.deepEqual(replies, ['# cached']);
   assert.ok((await store.get('cached-normal-job'))?.notifiedAt);
   await runtime.close();
 }));
