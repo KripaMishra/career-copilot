@@ -1,6 +1,8 @@
 import { mkdtemp, chmod, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { createClient } from '@libsql/client';
 import { createCareerAgentKit } from '../src/agents/agent.ts';
 import { createAgentResponder, createCareerCopilotRuntime, createOnboardingResponder } from '../src/services/career-runtime.ts';
 import { CareerStore } from '../src/storage/career-store.ts';
@@ -13,7 +15,6 @@ import type { RunResult, TranscriptEvent, AssertionResult } from './schemas/run.
 import { parseRunResult } from './schemas/run.ts';
 import { createScriptedModel, asModelConfig, type ScriptedModelLedger } from './fakes/model.ts';
 import { createFetchFake, type FetchLedger } from './fakes/fetch.ts';
-import { createSheetsFake, type SheetsLedger } from './fakes/sheets.ts';
 import { createCollectingLogger } from './fakes/logger.ts';
 import { scanTargets, type ScanTarget } from './redaction.ts';
 
@@ -121,7 +122,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   const allLogs: LogRecord[] = [];
   const modelLedger: ScriptedModelLedger = { calls: [] };
   const fetchLedger: FetchLedger = { calls: [] };
-  const sheetsLedger: SheetsLedger = { calls: [] };
   const replyLedger: { text: string; delivered: boolean; turnId: string | null; atMs: number }[] = [];
   const notifications: { jobId: string; delivered: boolean; atMs: number; attempt: number }[] = [];
   const toolLedger: ToolCallRecord[] = [];
@@ -131,7 +131,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
 
   const mergedFixture: Fixture = {
     ...fixture,
-    // scalar overrides follow the sheets.failure rule: base wins, stubs fill gaps
+    // scalar overrides: base wins, stubs fill gaps
     profileText: fixture.profileText ?? options.stubs.map((stub) => stub.profileText).find((text) => text !== undefined),
     db: {
       onboarding: [...fixture.db.onboarding, ...options.stubs.flatMap((stub) => stub.db.onboarding)],
@@ -142,11 +142,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     fetch: [...fixture.fetch, ...options.stubs.flatMap((stub) => stub.fetch)],
     users: [...fixture.users, ...options.stubs.flatMap((stub) => stub.users)],
     chats: [...fixture.chats, ...options.stubs.flatMap((stub) => stub.chats)],
-    sheets: {
-      headers: [...fixture.sheets.headers, ...options.stubs.flatMap((stub) => stub.sheets.headers)],
-      rows: [...fixture.sheets.rows, ...options.stubs.flatMap((stub) => stub.sheets.rows)],
-      failure: fixture.sheets.failure ?? options.stubs.map((stub) => stub.sheets.failure).find((failure) => failure !== undefined),
-    },
     notifications: [...fixture.notifications, ...options.stubs.flatMap((stub) => stub.notifications)],
     model: { responses: [...fixture.model.responses, ...options.stubs.flatMap((stub) => stub.model.responses)] },
   };
@@ -163,21 +158,30 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   try {
     store = new CareerStore(`file:${dbFile}`, { clock });
     await store.ready();
-    for (const row of mergedFixture.db.jobs) {
-      await store.importJob({ ...row, userId: row.userId ?? null, safeResult: row.safeResult ?? null, mastraRunId: row.mastraRunId ?? null, reportId: row.reportId ?? null, reportPath: row.reportPath ?? null, sheetReference: row.sheetReference ?? null, safeError: row.safeError ?? null, notifiedAt: row.notifiedAt ?? null, createdAt: row.createdAt ?? clockMs, updatedAt: row.updatedAt ?? clockMs });
-    }
-    for (const row of mergedFixture.db.reports) {
-      await store.importReport({ reportId: row.reportId, ownerId: row.ownerId, jobId: row.jobId, content: row.content, createdAt: clockMs });
-    }
-    for (const row of mergedFixture.db.profiles) {
-      await store.importProfileDocument({ ownerId: row.ownerId, name: row.name, content: row.content, active: row.active, createdAt: clockMs });
-    }
-    for (const row of mergedFixture.db.onboarding) {
-      await store.importOnboarding({ ownerId: row.ownerId, conversationId: row.conversationId, status: row.status, draft: row.draft, version: row.version, createdAt: clockMs, updatedAt: clockMs });
+    // fixture rows are seeded directly into the harness's own sandbox DB; the
+    // store's public surface has no legacy import path (start-afresh, D1/D7)
+    const seeder = createClient({ url: `file:${dbFile}` });
+    const seedHash = (content: string) => createHash('sha256').update(content).digest('hex');
+    const seedBytes = (content: string) => Buffer.byteLength(content, 'utf8');
+    try {
+      for (const row of mergedFixture.db.jobs) {
+        await seeder.execute({ sql: `INSERT INTO career_jobs (job_id,user_id,owner_id,chat_id,transport_event_id,original_url,canonical_url,status,mastra_run_id,attempts,report_id,safe_result,safe_error,notified_at,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [row.jobId, row.userId ?? null, row.ownerId, row.chatId, row.transportEventId, row.originalUrl, row.canonicalUrl, row.status, row.mastraRunId ?? null, row.attempts ?? 0, row.reportId ?? null, row.safeResult ? JSON.stringify(row.safeResult) : null, row.safeError ?? null, row.notifiedAt ?? null, row.createdAt ?? clockMs, row.updatedAt ?? clockMs] });
+      }
+      for (const row of mergedFixture.db.reports) {
+        await seeder.execute({ sql: 'INSERT INTO career_reports (report_id,owner_id,job_id,content,sha256,byte_size,created_at) VALUES (?,?,?,?,?,?,?)', args: [row.reportId, row.ownerId, row.jobId, row.content, seedHash(row.content), seedBytes(row.content), clockMs] });
+      }
+      for (const row of mergedFixture.db.profiles) {
+        const documentId = `seed-${seedHash(`${row.ownerId}:${row.name}:${row.content}`).slice(0, 32)}`;
+        await seeder.execute({ sql: 'INSERT INTO career_profile_documents (document_id,owner_id,name,version,active,content,sha256,byte_size,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)', args: [documentId, row.ownerId, row.name, row.version ?? 1, row.active ? 1 : 0, row.content, seedHash(row.content), seedBytes(row.content), clockMs, clockMs] });
+      }
+      for (const row of mergedFixture.db.onboarding) {
+        await seeder.execute({ sql: 'INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?)', args: [row.ownerId, row.conversationId, row.status, JSON.stringify(row.draft ?? {}), row.version ?? 1, clockMs, clockMs] });
+      }
+    } finally {
+      seeder.close();
     }
 
     const profileText = mergedFixture.profileText ?? (await store.profileText(fixture.ownerId));
-    const sheetsFake = createSheetsFake(mergedFixture.sheets, sheetsLedger);
     const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);
     // cancellation seam: the active turn's AbortSignal propagates into the SUT's
@@ -218,7 +222,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     const kit = createCareerAgentKit({
       store,
       profileText,
-      sheet: sheetsFake.adapter,
       model: asModelConfig(scripted),
       memoryModel: asModelConfig(scripted),
       storage: memoryStorage,
@@ -450,7 +453,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       profiles: profiles.map((profile) => ({ documentId: profile.documentId, ownerId: profile.ownerId, name: profile.name, version: profile.version, active: profile.active, byteSize: profile.byteSize })),
       jobs,
       reports,
-      sheets: sheetsFake.rows,
       notifications,
     };
 
@@ -480,7 +482,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       { name: 'logs', sink: 'log', value: allLogs },
       { name: 'database', sink: 'database', value: { onboarding: onboardingRows, profiles, jobs, reports } },
       { name: 'reports', sink: 'report', value: reportContents },
-      { name: 'sheets', sink: 'sheet', value: sheetsFake.rows },
       { name: 'model-calls', sink: 'model', value: modelLedger.calls },
       { name: 'notifications', sink: 'reply', value: notifications },
     ];
@@ -561,7 +562,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       corpusHash,
       manifest,
       transcript: { complete: false, events },
-      state: { onboarding: [], profiles: [], jobs: [], reports: [], sheets: [], notifications: [] },
+      state: { onboarding: [], profiles: [], jobs: [], reports: [], notifications: [] },
       assertions: [],
       metrics: { durationMs: Date.now() - startedAt, ttFirstResponseMs: null, modelCalls: modelLedger.calls.length, inputTokens: null, outputTokens: null, peakRssBytes: null, transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8') },
       redaction: { canariesFound: [], sinksScanned: [], rawArtifactPath: keepArtifacts ? dir : null },

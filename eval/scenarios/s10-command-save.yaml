@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s10-command-save
-description: "S10a: the /save command entry runs the same fetch/analysis/report/Sheet/state contract as a natural-language save, exactly once."
+description: "S10a: the /save command entry runs the same fetch/analysis/report/state contract as a natural-language save, exactly once."
 kind: contract
 persona: P07
 fixture: active-profile
@@ -14,7 +14,6 @@ assertions:
   - A-LIFECYCLE-ORDER
   - A-JOB-STATE
   - A-REPORT-BEFORE-SUCCESS
-  - A-SHEET-READBACK
   - A-NOTIFY-AFTER-COMPLETE
   - A-NOTIFY-MARK-AFTER-SEND
   - A-TRANSCRIPT-COMPLETE

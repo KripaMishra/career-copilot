@@ -2,14 +2,12 @@ import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { JobInputSchema, SafeResultSchema, safeErrorMessage, type Analysis, type JobInput } from '../contracts/v0.ts';
 import { acquireJobText } from './web-fetch-tool.ts';
-import { upsertSheetRow, type SheetAdapter } from '../integrations/google-sheets.ts';
 import type { CareerStore } from '../storage/career-store.ts';
 import type { AppLogger } from '../observability.ts';
 
 export const SaveJobResultSchema = SafeResultSchema.extend({ jobId: z.string().min(1).max(200) });
 export type SaveJobDeps = {
   store: CareerStore;
-  sheet: SheetAdapter;
   profileText?: string;
   acquire?: typeof acquireJobText;
   analyze: (text: string, profile: string) => Promise<Analysis>;
@@ -48,10 +46,8 @@ export async function executeSaveJob(options: SaveJobDeps & { input: JobInput; p
     const content = `# ${analysis.title}\n\nCompany: ${analysis.company}\nLocation: ${analysis.location}\n\n${analysis.summary}\n\nNext step: ${analysis.nextStep}\n`;
     const summary = `${analysis.title} at ${analysis.company}: ${analysis.nextStep}`;
     const report = await timed('report', eventData, log, () => options.store.completeWithReport({ ownerId: persistedInput.ownerId, jobId: persistedInput.jobId, content, summary }));
-    const sheetData = { ...eventData, reportId: report.reportId };
-    await timed('sheets', sheetData, log, () => upsertSheetRow(options.sheet, { jobId: persistedInput.jobId, status: 'succeeded', title: analysis.title, company: analysis.company, reportPath: report.reportId }));
     const result = SafeResultSchema.parse({ summary, reportId: report.reportId });
-    log('info', 'job.succeeded', { ...sheetData, status: 'succeeded' });
+    log('info', 'job.succeeded', { ...eventData, reportId: report.reportId, status: 'succeeded' });
     return SaveJobResultSchema.parse({ jobId: persistedInput.jobId, ...result });
   } catch (error) {
     const failed = await options.store.fail(persistedInput.jobId, error); log('error', 'job.failed', { jobId: persistedInput.jobId, requestId: persistedInput.transportEventId, attempt: failed?.attempts ?? running.attempts, status: 'failed', errorName: error instanceof Error ? error.name : 'UnknownError' });

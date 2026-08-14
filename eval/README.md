@@ -1,7 +1,7 @@
 # Career Copilot Evaluation Harness (`eval/`)
 
 Implementation of issue #13: contracts/seams (`#13a`), hermetic runner (`#13b`),
-and the S01–S18 contract scenario corpus (`#13c`, 27 scenario files). The quality
+and the S01–S18 contract scenario corpus (`#13c`, 24 scenario files). The quality
 lane (`#13d`) and compare/pin (`#13e`) land separately; this README documents
 what exists and the exact contract for what comes next.
 
@@ -16,7 +16,7 @@ npm run eval:test -- [--scenario ID ...] [--keep-artifacts]
 - `--keep-artifacts`: retain the per-scenario temp dir (mode 0700) and record
   its path in `redaction.rawArtifactPath`. Default: everything is deleted.
 - Exit 0 only for a documented successful terminal status. The live corpus is
-  the 27 contract scenarios (`s01-*` … `s18-*`); a fully clean run is required
+  the 24 contract scenarios (`s01-*` … `s18-*`); a fully clean run is required
   before quality runs or pinning.
 - Run artifacts (redacted aggregates) go to `eval/results/` (gitignored).
 
@@ -25,7 +25,7 @@ Google, no real fetch. Any provider/network call outside the fakes fails the run
 
 ## Scenario corpus (S01–S18)
 
-`eval/scenarios/*.yaml` implements the issue #13 matrix as 27 scenario files.
+`eval/scenarios/*.yaml` implements the issue #13 matrix as 24 scenario files.
 The S10/S17/S18 rows are intentionally split into per-subcase files (isolated
 runs per the matrix), and S17g covers the failure-adapters unsafe-redirect row:
 
@@ -33,7 +33,7 @@ runs per the matrix), and S17g covers the failure-adapters unsafe-redirect row:
 - `s07-save-success` … `s10-natural-save`: the save path (command + natural entry, sparse defer + continue, exact tool/state/artifact contract).
 - `s11-injection-resist`, `s12-grounded-analysis`, `s13-auth-boundary`, `s14-canary-boundaries`: injection, grounding, authorization, and canary sink boundaries.
 - `s15-profile-after-new-chat`, `s16-conversation-scope`: profile recall across authorized conversations and owner/conversation scoping.
-- `s17a`–`s17g`: fetch unsafe/5xx/redirect, analysis schema failure, Sheets auth/write/read-back failures — safe failed state, no fabricated success.
+- `s17a`–`s17c`, `s17g`: fetch unsafe/5xx/redirect, analysis schema failure — safe failed state, no fabricated success.
 - `s18a`–`s18c`: startup recovery of queued jobs (persisted identity, exactly once), fail-first delivery + cached-reply replay + duplicate rejection, and revoked-identity recovery skip.
 
 Production defects found by the corpus and fixed at their owning boundaries:
@@ -49,9 +49,9 @@ supported" host message (S17b/S17g), with a focused regression test in
 | `eval/fixtures/*.yaml` | Synthetic fixtures (strict v1 schema). |
 | `eval/schemas/` | Zod v1 schemas: scenario, fixture, assertion, run artifact. Unknown keys fail validation. |
 | `eval/corpus.ts` | Recursive POSIX-ordered discovery, duplicate/ID/filename checks, content-sensitive corpus hash (SHA-256 over canonical scenario + referenced-fixture JSON). |
-| `eval/assertions.ts` | The 27 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
+| `eval/assertions.ts` | The 26 catalog gates (A-*) plus value operators (eq, member, count, prefix, order, path, absent). |
 | `eval/redaction.ts` | Sink-aware canary scanner (NFC-normalized, recursive, fail-closed). |
-| `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, Sheets fake, collecting logger. |
+| `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, collecting logger. |
 | `eval/runner.ts` | Hermetic per-scenario runner: temp dir 0700, fresh libSQL DB + memory store, fixed clock/IDs, scripted turns, ledgers, state projection, redaction scan, cleanup. |
 | `eval/status.ts` | passed/failed/incomplete/skipped semantics and run aggregation. |
 | `eval/cli.ts` | `eval:test` entry point. |
@@ -74,7 +74,7 @@ turns:
     envelope: forwarded            # optional: malformed|forwarded|edited|group|bot (P11)
     timeoutMs: 10000               # optional per-turn budget; expiry = incomplete
     updateId: 9001                 # optional fixed Telegram update id (replay turns: repeat the id of the turn being replayed)
-stubs: [onboarding-review-default] # optional additional fixtures (later rows win on conflicts; sheets failure modes and notification plans must agree across fixture+stubs)
+stubs: [onboarding-review-default] # optional additional fixtures (later rows win on conflicts; notification plans must agree across fixture+stubs)
 assertions:                        # catalog IDs and/or value assertions
   - A-ONBOARDING-STATE
   - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 0 }
@@ -121,10 +121,6 @@ fetch:                             # real URL/DNS/redirect policy runs against t
     body: "..."
     timeout: false                 # hangs until the policy aborts
     abort: false
-sheets:
-  headers: []
-  rows: []
-  failure: auth | write | readback | ambiguous   # optional injected failure
 model:
   responses:                       # consumed in order; one per expected call
     - purpose: memory              # onboarding|analysis|chat|memory
@@ -141,7 +137,7 @@ notifications: [{ jobId: "job-001", deliver: "ok" }]
 # failure); notified_at must only be set after a successful delivery, so the
 # SUT must leave it unset until the same update is replayed and delivered.
 canaries:
-  - { value: "CANARY_SECRET", sinks: [model] }  # allowed sinks: all|model|reply|trace|log|database|report|sheet|judge
+  - { value: "CANARY_SECRET", sinks: [model] }  # allowed sinks: all|model|reply|trace|log|database|report|judge
 ```
 
 Notes for `#13c` authors:
@@ -203,7 +199,7 @@ Notes for `#13c` authors:
 
 ## Redaction
 
-Canaries are scanned across replies, logs, database state, sheets,
+Canaries are scanned across replies, logs, database state,
 model-call ledgers, and notifications. An exact (NFC-normalized) match in any
 sink the canary is not classified for blocks the run (`incomplete`). Fixture
 canaries that intentionally enter the model sink (injection tests) must be

@@ -35,7 +35,7 @@ export type RunContext = {
   limits: Required<Limits>;
   transcriptComplete: boolean;
   transcriptEvents: { sequence: number; turnId: string | null; type: string; atMs: number }[];
-  state: { onboarding: Record<string, unknown>[]; profiles: Record<string, unknown>[]; jobs: Record<string, unknown>[]; reports: Record<string, unknown>[]; sheets: Record<string, unknown>[]; notifications: Record<string, unknown>[] };
+  state: { onboarding: Record<string, unknown>[]; profiles: Record<string, unknown>[]; jobs: Record<string, unknown>[]; reports: Record<string, unknown>[]; notifications: Record<string, unknown>[] };
   ledgers: Ledgers;
   metrics: { durationMs: number; ttFirstResponseMs: number | null; modelCalls: number; transcriptBytes: number };
   redactionHits: { canary: string; sink: string; where: string }[];
@@ -117,7 +117,7 @@ function contextView(ctx: RunContext): Record<string, unknown> {
   };
 }
 
-const PHASE_ORDER = ['fetch', 'analysis', 'report', 'sheets', 'complete'] as const;
+const PHASE_ORDER = ['fetch', 'analysis', 'report', 'complete'] as const;
 
 const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   'A-AUTH-BEFORE-MODEL': (ctx) => {
@@ -277,14 +277,6 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
       else if (!ctx.state.reports.some((report) => String(report.reportId) === String(job.reportId))) problems.push(`job ${String(job.jobId)} succeeded referencing missing report ${String(job.reportId)}`);
     }
     return problems.length === 0 ? pass('A-REPORT-BEFORE-SUCCESS', 'succeeded jobs carry reports') : fail('A-REPORT-BEFORE-SUCCESS', problems.join('; '));
-  },
-  'A-SHEET-READBACK': (ctx) => {
-    const problems: string[] = [];
-    for (const job of ctx.state.jobs.filter((candidate) => candidate.status === 'succeeded')) {
-      const inSheet = ctx.state.sheets.some((row) => row.jobId === job.jobId);
-      if (!inSheet) problems.push(`job ${String(job.jobId)} missing verified sheet row`);
-    }
-    return problems.length === 0 ? pass('A-SHEET-READBACK', `${ctx.state.sheets.length} verified sheet row(s)`) : fail('A-SHEET-READBACK', problems.join('; '));
   },
   'A-NOTIFY-AFTER-COMPLETE': (ctx) => {
     const problems: string[] = [];

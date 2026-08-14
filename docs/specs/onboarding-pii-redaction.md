@@ -88,7 +88,7 @@ Career Copilot uses `redactText()` before calling `agent.generate()`. The model 
 
 1. Authorization completes before text or files are downloaded, parsed, or inspected.
 2. Raw resume bytes and text remain process-memory-only and are discarded after redaction.
-3. Raw resume content never reaches the main agent, Mastra memory, working memory, traces, logs, metrics, errors, Turso, reports, or Sheets.
+3. Raw resume content never reaches the main agent, Mastra memory, working memory, traces, logs, metrics, errors, Turso, or reports.
 4. Deterministic and NER layer failures block onboarding ingestion by default.
 5. No layer logs or returns original values, OpenRedaction `original`, `redactionMap`, or detection `value` fields.
 6. Redaction is irreversible in V1. Use typed placeholders such as `<PERSON_1>`; do not hash direct identifiers.
@@ -468,9 +468,9 @@ For accepted Telegram updates, cache the completed outbound response/result in m
 
 ### Terminal app logs
 
-`npm run dev` must show useful app-wide events directly in the terminal through one shared structured terminal logger created in `src/mastra/index.ts`, not Mastra's default logger. Inject that logger through Telegram transport, runtime, agent/tools, and the save pipeline. Emit one JSON line per event with an allowlisted payload only. Safe fields include event name, phase, status, version, attempt, duration, field keys, update/request ID, generated job/report ID, command/tool name, and error class/name. Never log owner/user/chat IDs, message text, draft/profile values, fetched content, URLs, analysis/report content, spreadsheet identifiers, credentials, tokens, or raw errors.
+`npm run dev` must show useful app-wide events directly in the terminal through one shared structured terminal logger created in `src/mastra/index.ts`, not Mastra's default logger. Inject that logger through Telegram transport, runtime, agent/tools, and the save pipeline. Emit one JSON line per event with an allowlisted payload only. Safe fields include event name, phase, status, version, attempt, duration, field keys, update/request ID, generated job/report ID, command/tool name, and error class/name. Never log owner/user/chat IDs, message text, draft/profile values, fetched content, URLs, analysis/report content, credentials, tokens, or raw errors.
 
-Required useful events include runtime/startup, Telegram polling/update/reply, normal agent turns, commands, protected tool invocation, job fetch/analysis/report/Sheets/completion/failure, recovery/notification, and onboarding model/draft/review/completion. Cap allowed string and array-item values before writing terminal JSON. Do not log empty Telegram polls or intentional stop aborts as failures.
+Required useful events include runtime/startup, Telegram polling/update/reply, normal agent turns, commands, protected tool invocation, job fetch/analysis/report/completion/failure, recovery/notification, and onboarding model/draft/review/completion. Cap allowed string and array-item values before writing terminal JSON. Do not log empty Telegram polls or intentional stop aborts as failures.
 
 ### Deferred resume/PDF ingestion
 
@@ -587,7 +587,7 @@ Create a package feature branch/worktree from `main` when package implementation
 - confirmation refreshes approved profile context without restart;
 - cancel clears draft content and restart begins cleanly;
 - start/resume/confirm idempotency;
-- existing `/save`, `/job`, `/queue`, recovery, authorization, and Sheets tests unchanged.
+- existing `/save`, `/job`, `/queue`, recovery, authorization, and tracker tests unchanged.
 
 ### Career Copilot resume integration follow-up
 
@@ -625,7 +625,7 @@ Any high-risk canary leak blocks release.
 - [x] Only confirmed structured context becomes an active Turso profile document.
 - [ ] A later integration enables bounded resume file/PDF ingestion only after deterministic + NER readiness succeeds.
 - [ ] Every resume-derived draft/profile write is revalidated by both local layers.
-- [ ] Synthetic canary tests prove raw PII never reaches the main agent, memory, traces, logs, Turso, reports, Sheets, or user replies.
+- [ ] Synthetic canary tests prove raw PII never reaches the main agent, memory, traces, logs, Turso, reports, or user replies.
 - [ ] Existing Career Copilot behavior and tests remain green.
 - [ ] Package prerelease and application integration are reviewed independently before stable release.
 
