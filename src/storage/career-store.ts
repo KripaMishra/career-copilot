@@ -225,8 +225,11 @@ export class CareerStore {
       if (!current || current.version !== input.expectedVersion || current.status !== 'review') throw new Error('Onboarding draft version is stale.');
       if (onboardingMissingFields(current.draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
       const content = buildOnboardingProfileText(current.draft); assertSafeProfileContent(content);
-      const updated = await transaction.execute({ sql: "UPDATE career_onboarding SET status='completed', version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status='review'", args: [now, input.ownerId, input.conversationId, input.expectedVersion] });
-      if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
+      // D6: the draft row is deleted inside the same transaction that activates
+      // the profile document, so loadOnboarding returns null afterwards and the
+      // next /onboarding starts clean. The version/status guard runs first.
+      const deleted = await transaction.execute({ sql: "DELETE FROM career_onboarding WHERE owner_id=? AND conversation_id=? AND version=? AND status='review'", args: [input.ownerId, input.conversationId, input.expectedVersion] });
+      if (deleted.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
       const currentVersion = (await transaction.execute({ sql: 'SELECT COALESCE(MAX(version), 0) AS version FROM career_profile_documents WHERE owner_id=? AND name=?', args: [input.ownerId, name] })).rows[0];
       const version = Number(currentVersion?.version ?? 0) + 1; const documentId = `${hash(`${input.ownerId}:${name}`).slice(0, 16)}-v${version}`; const contentHash = hash(content);
       await transaction.execute({ sql: 'UPDATE career_profile_documents SET active=0, updated_at=? WHERE owner_id=? AND name=?', args: [now, input.ownerId, name] });
@@ -236,7 +239,7 @@ export class CareerStore {
       if (!committed) try { await transaction.rollback(); } catch { /* rollback best effort */ }
       throw error;
     } finally { transaction.close(); }
-    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
+    return this.loadOnboarding(input.ownerId, input.conversationId);
   }
   async profileText(ownerId: string) {
     await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT name, content FROM career_profile_documents WHERE owner_id=? AND active=1 ORDER BY name', args: [ownerId] })).rows;

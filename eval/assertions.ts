@@ -165,7 +165,9 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   },
   'A-ONBOARDING-STATE': (ctx) => {
     const rows = ctx.state.onboarding;
-    if (rows.length === 0) return fail('A-ONBOARDING-STATE', 'no final onboarding rows captured');
+    // D6: completion deletes the draft row, so a completed onboarding leaves no
+    // row; zero rows is a valid final state, not a failure.
+    if (rows.length === 0) return pass('A-ONBOARDING-STATE', 'no onboarding rows captured (draft cleared on completion)');
     const problems: string[] = [];
     for (const row of rows) {
       const status = String(row.status ?? '');
@@ -191,7 +193,8 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   },
   'A-DRAFT-PATCH-ONLY': (ctx) => {
     const rows = ctx.state.onboarding;
-    if (rows.length === 0) return fail('A-DRAFT-PATCH-ONLY', 'no onboarding rows to inspect');
+    // D6: completion deletes the draft row; nothing to inspect when it is gone.
+    if (rows.length === 0) return pass('A-DRAFT-PATCH-ONLY', 'no onboarding rows to inspect (draft cleared on completion)');
     const problems: string[] = [];
     for (const row of rows) {
       const draft = (row.draft ?? {}) as Record<string, unknown>;

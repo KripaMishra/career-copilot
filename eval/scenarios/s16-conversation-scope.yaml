@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s16-conversation-scope
-description: "S16: conversation B runs /job and /queue through the chat-scoped tools and creates no jobs or drafts of its own; a command inside A's active onboarding draft is blocked before the model. Tool OUTPUT text is scripted, so the harness asserts scoped state/tool counts, not reply text; output-scoping capture is a future ledger seam. Unconfirmed onboarding facts surfacing in B is a known product gap (resource-scoped working memory) and is not asserted here."
+description: "S16: conversation B runs /job and /queue through the chat-scoped tools and creates no jobs or drafts of its own; a command inside A's active onboarding draft is blocked before the model. Tool OUTPUT text is scripted, so the harness asserts scoped state/tool counts, not reply text; output-scoping capture is a future ledger seam. Unconfirmed onboarding facts stay in A's conversation-scoped draft and are not asserted here (working memory is disabled; the canonical profile is store-only)."
 kind: contract
 persona: P08
 fixture: two-conversations

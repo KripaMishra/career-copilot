@@ -13,10 +13,9 @@ const config = resolveRuntimeConfig({ requireDeployment: process.env.NODE_ENV ==
 const storageConfig = { id: 'mastra-storage', url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) };
 const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) });
 await store.ready();
-const profileText = await store.profileText(config.owner.resourceId);
 const logger = createTerminalAppLogger();
 
-const career = createCareerAgentKit({ store, profileText, logger, memoryModel: config.memoryModel });
+const career = createCareerAgentKit({ store, logger, memoryModel: config.memoryModel });
 export const agent = career.agent;
 export const careerTools = career.tools;
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });

@@ -107,7 +107,7 @@ test('stale completion does not deactivate or insert profile documents', async (
     async execute(stmt: unknown) {
       const sql = typeof stmt === 'string' ? stmt : String((stmt as { sql: string }).sql);
       if (sql.startsWith('SELECT * FROM career_onboarding')) return result([onboardingRow(2, 'review')]);
-      if (sql.startsWith('UPDATE career_onboarding')) return result([], 0);
+      if (sql.startsWith('DELETE FROM career_onboarding')) return result([], 0);
       if (sql.startsWith('UPDATE career_profile_documents') || sql.startsWith('INSERT INTO career_profile_documents')) profileWrites.push(sql);
       if (sql.startsWith('SELECT COALESCE(MAX(version)')) return result([{ version: 3 }]);
       return result([]);
@@ -205,7 +205,7 @@ test('runtime supports review, edit, explicit confirmation, cancellation, and cl
   assert.match(replies.at(-1) ?? '', /Ready to review/i);
   assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'review');
   await send('confirm');
-  assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'completed');
+  assert.equal(await store.loadOnboarding('owner', 'telegram:2'), null);
   assert.match(await store.profileText('owner'), /TypeScript, Mastra, libSQL/);
   await send('/onboarding restart');
   assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'collecting');
@@ -222,7 +222,9 @@ test('onboarding completion atomically activates one profile version and rejects
   const review = await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: started.version, draft, status: 'review' });
   await assert.rejects(() => store.completeOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: review.version - 1 }), /stale/i);
   const completed = await store.completeOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: review.version });
-  assert.equal(completed.status, 'completed'); assert.match(await store.profileText('owner'), /Career onboarding profile/);
+  assert.equal(completed, null, 'the draft row is deleted on completion (D6); loadOnboarding returns null');
+  assert.equal(await store.loadOnboarding('owner', 'telegram:2'), null);
+  assert.match(await store.profileText('owner'), /Career onboarding profile/);
   const db = new DatabaseSync(file); const rows = db.prepare("SELECT name, version, active FROM career_profile_documents WHERE owner_id='owner' AND name='onboarding.md'").all(); db.close();
   assert.deepEqual(rows.map((row) => Number(row.active)), [1]);
 }));
@@ -232,9 +234,8 @@ test('confirmed onboarding profile context is available to save-job immediately 
   const review = await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: started.version, draft, status: 'review' });
   await store.completeOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: review.version });
   let profileSeen = '';
-  await executeSaveJob({ input: { jobId: 'job-onboarded', userId: 'telegram:1', ownerId: 'owner', chatId: 'telegram:2', transportEventId: 'telegram:job-onboarded', originalUrl: 'https://linkedin.com/jobs/onboarded', canonicalUrl: 'https://linkedin.com/jobs/onboarded' }, store, profileText: 'STALE STARTUP PROFILE', acquire: async () => ({ contentType: 'text/plain', text: 'AI platform role' }), analyze: async (_job, profile) => { profileSeen = profile; return { schemaVersion: 1, title: 'AI Engineer', company: 'Example', location: 'Remote', summary: 'fit', fitScore: 90, nextStep: 'Apply' }; } });
+  await executeSaveJob({ input: { jobId: 'job-onboarded', userId: 'telegram:1', ownerId: 'owner', chatId: 'telegram:2', transportEventId: 'telegram:job-onboarded', originalUrl: 'https://linkedin.com/jobs/onboarded', canonicalUrl: 'https://linkedin.com/jobs/onboarded' }, store, acquire: async () => ({ contentType: 'text/plain', text: 'AI platform role' }), analyze: async (_job, profile) => { profileSeen = profile; return { schemaVersion: 1, title: 'AI Engineer', company: 'Example', location: 'Remote', summary: 'fit', fitScore: 90, nextStep: 'Apply' }; } });
   assert.match(profileSeen, /Staff product engineer/);
-  assert.doesNotMatch(profileSeen, /STALE STARTUP PROFILE/);
   assert.equal((await store.get('job-onboarded'))?.status, 'succeeded');
 }));
 
@@ -309,7 +310,7 @@ test('runtime-only confirm keeps atomic activation path', async () => withStore(
   await runtime.handleTelegramUpdate(update(432, 'yes confirm'), async (text) => { replies.push(text); });
   assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'review');
   await runtime.handleTelegramUpdate(update(433, 'confirm'), async (text) => { replies.push(text); });
-  assert.equal((await store.loadOnboarding('owner', 'telegram:2'))?.status, 'completed');
+  assert.equal(await store.loadOnboarding('owner', 'telegram:2'), null);
   assert.match(await store.profileText('owner'), /Career onboarding profile/);
   await runtime.close();
 }));

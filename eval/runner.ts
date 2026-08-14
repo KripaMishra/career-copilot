@@ -131,8 +131,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
 
   const mergedFixture: Fixture = {
     ...fixture,
-    // scalar overrides: base wins, stubs fill gaps
-    profileText: fixture.profileText ?? options.stubs.map((stub) => stub.profileText).find((text) => text !== undefined),
     db: {
       onboarding: [...fixture.db.onboarding, ...options.stubs.flatMap((stub) => stub.db.onboarding)],
       profiles: [...fixture.db.profiles, ...options.stubs.flatMap((stub) => stub.db.profiles)],
@@ -181,7 +179,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       seeder.close();
     }
 
-    const profileText = mergedFixture.profileText ?? (await store.profileText(fixture.ownerId));
     const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);
     // cancellation seam: the active turn's AbortSignal propagates into the SUT's
@@ -221,7 +218,6 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     };
     const kit = createCareerAgentKit({
       store,
-      profileText,
       model: asModelConfig(scripted),
       memoryModel: asModelConfig(scripted),
       storage: memoryStorage,

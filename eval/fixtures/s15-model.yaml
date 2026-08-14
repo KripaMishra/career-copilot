@@ -32,6 +32,10 @@ model:
     - purpose: chat
       match: "/jobs/view/2"
       toolCalls:
+        - toolName: career-profile
+          args: {}
+    - purpose: chat
+      toolCalls:
         - toolName: save-job
           args:
             url: "https://linkedin.com/jobs/view/2"

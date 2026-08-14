@@ -8,7 +8,6 @@ import type { AppLogger } from '../observability.ts';
 export const SaveJobResultSchema = SafeResultSchema.extend({ jobId: z.string().min(1).max(200) });
 export type SaveJobDeps = {
   store: CareerStore;
-  profileText?: string;
   acquire?: typeof acquireJobText;
   analyze: (text: string, profile: string) => Promise<Analysis>;
   uuid?: () => string;
@@ -27,7 +26,7 @@ export async function executeSaveJob(options: SaveJobDeps & { input: JobInput; p
   const input = JobInputSchema.parse(options.input);
   const log: AppLogger = (level, event, data) => { try { options.logger?.(level, event, data); } catch { /* logging cannot break work */ } };
   const storedProfile = await options.store.profileText(input.ownerId);
-  const profile = [storedProfile.trim() ? storedProfile : options.profileText, options.profileContext].filter((value) => value?.trim()).join('\n\n').slice(0, 100_000);
+  const profile = [storedProfile, options.profileContext].filter((value) => value?.trim()).join('\n\n').slice(0, 100_000);
   if (!profile) throw new Error('Profile context is required before saving a job.');
   const stored = await options.store.enqueue(input); log('info', stored.duplicate ? 'job.duplicate' : 'job.queued', { jobId: stored.job.jobId, requestId: input.transportEventId });
   if (!stored.job.userId || stored.job.ownerId !== input.ownerId || stored.job.userId !== input.userId || stored.job.chatId !== input.chatId || stored.job.originalUrl !== input.originalUrl || stored.job.canonicalUrl !== input.canonicalUrl) throw new Error('Persisted job does not match the authorized request.');

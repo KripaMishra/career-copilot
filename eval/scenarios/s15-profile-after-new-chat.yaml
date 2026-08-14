@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s15-profile-after-new-chat
-description: "S15: a second authorized conversation loads the current confirmed profile from the store (no stale startup snapshot) and saves successfully. Conversational profile recall needs an explicit current-profile injection seam and stays out of the contract lane."
+description: "S15: a second authorized conversation loads the current confirmed profile from the store via the career-profile retriever tool (no startup snapshot, no working memory) and saves successfully."
 kind: contract
 persona: P05
 fixture: active-profile
@@ -30,7 +30,7 @@ assertions:
   - { id: A-JOB-STATE, path: "state.jobs[1].status", op: eq, value: succeeded }
   - { id: A-JOB-STATE, path: "state.jobs[1].chatId", op: eq, value: "telegram:2002" }
 tools:
-  require: [save-job]
+  require: [save-job, career-profile]
   forbid: [web_fetch]
-  counts: { save-job: 2 }
+  counts: { save-job: 2, career-profile: 1 }
 limits: { maxTurns: 5, maxWallClockMs: 90000, maxModelCalls: 30 }

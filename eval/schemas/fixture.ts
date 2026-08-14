@@ -5,8 +5,9 @@ import { SCHEMA_VERSION } from './scenario.ts';
  * Fixture schema v1 — strict; unknown keys fail validation.
  *
  * A fixture declares every external fact a scenario may depend on: owner/actor/
- * conversation/request identity, the fixed clock, initial persisted rows,
- * profile text, fetch/DNS/redirect plans, the notification plan,
+ * conversation/request identity, the fixed clock, initial persisted rows (the
+ * canonical profile lives in db.profiles rows, read via the career-profile
+ * tool / store), fetch/DNS/redirect plans, the notification plan,
  * scripted model responses (with optional usage), and canaries.
  */
 
@@ -130,7 +131,6 @@ export const fixtureSchema = z.strictObject({
   users: z.array(z.string().min(1).max(200)).default([]),
   chats: z.array(z.string().min(1).max(200)).default([]),
   db: dbSchema.default(EMPTY_DB),
-  profileText: z.string().max(100_000).optional(),
   fetch: z.array(fetchPlanSchema).default([]),
   notifications: z.array(notificationPlanSchema).default([]),
   // inert default: a memory no-op is only consumable by memory extraction

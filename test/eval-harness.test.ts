@@ -1164,7 +1164,7 @@ test('redirect policy is per acquisition chain: two jobs with two redirects each
   }
 });
 
-test('stub-provided profileText reaches the agent: a database-only canary in it is caught at the model sink', async () => {
+test('store-provided profile reaches the save flow: a database-only canary in it is caught at the model sink', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubprofile-'));
   try {
     const base = `schemaVersion: 1
@@ -1187,7 +1187,12 @@ ownerId: career-owner-v0
 users: ["1001"]
 chats: ["2001"]
 clock: "2026-01-01T00:00:00Z"
-profileText: "Name: Ada\\nSkills: CANARY_PROFILE"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada\\nSkills: CANARY_PROFILE"
+      active: true
 fetch:
   - url: "https://linkedin.com/jobs/view/42"
     dns: ["93.184.216.34"]
@@ -1239,7 +1244,7 @@ limits:
     const fixture = corpus.fixtures.get('profile-base')!.fixture;
     const stubFixture = corpus.fixtures.get('profile-stub')!.fixture;
     const result = await runScenario({ scenario: sc, fixture, stubs: [stubFixture], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
-    assert.equal(result.status, 'incomplete', 'stub profileText must reach the agent; its database-only canary must trip the model sink');
+    assert.equal(result.status, 'incomplete', 'the store-seeded profile must reach the save flow; its database-only canary must trip the model sink');
     assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
     const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
     assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');

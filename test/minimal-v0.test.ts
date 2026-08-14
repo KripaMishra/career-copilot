@@ -83,29 +83,28 @@ test('completeWithReport commits once and re-entry returns the cached result wit
 test('Career Copilot exposes protected tools only to authenticated ingress', async () => {
   const [{ createCareerAgent }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const agent = createCareerAgent({ store, profileText: '' });
+  const agent = createCareerAgent({ store });
   assert.ok(await agent.getMemory());
   assert.deepEqual(Object.keys(await agent.listTools()), []);
   const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
-  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['job-queue', 'job-status', 'save-job']);
+  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['career-profile', 'job-queue', 'job-status', 'save-job']);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
 test('job-status logs no caller-supplied job ID', async () => {
   const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-log-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`); const logs: unknown[] = [];
-  const { tools } = createCareerAgentKit({ store, profileText: '', logger: (_level, _event, data) => { logs.push(data); } });
+  const { tools } = createCareerAgentKit({ store, logger: (_level, _event, data) => { logs.push(data); } });
   const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
   await tools['job-status'].execute?.({ jobId: 'password=secret-value' }, { requestContext } as never);
   assert.doesNotMatch(JSON.stringify(logs), /password=secret-value/);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
-test('career memory keeps message history, working memory, and thread-scoped observations', () => {
+test('career memory keeps message history and thread-scoped observations without working memory', () => {
   const options = careerMemoryOptions('test-memory-model');
   assert.equal(options.lastMessages, 20);
-  assert.deepEqual({ enabled: options.workingMemory.enabled, scope: options.workingMemory.scope }, { enabled: true, scope: 'resource' });
-  assert.match(options.workingMemory.template, /Career Profile/);
+  assert.equal(options.workingMemory, undefined, 'working memory is disabled (D5 option a); the canonical profile lives in the store');
   assert.deepEqual(options.observationalMemory, { model: 'test-memory-model', scope: 'thread' });
 });
 

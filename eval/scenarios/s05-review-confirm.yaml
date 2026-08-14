@@ -1,6 +1,6 @@
 schemaVersion: 1
 id: s05-review-confirm
-description: "S05: near-miss confirmations never activate; only trimmed case-insensitive exact confirm activates atomically; a stale replayed confirm cannot mutate state."
+description: "S05: near-miss confirmations never activate; only trimmed case-insensitive exact confirm activates atomically and clears the onboarding draft row (D6); a stale replayed confirm cannot mutate state."
 kind: contract
 persona: P03
 fixture: onboarding-review
@@ -29,9 +29,7 @@ assertions:
   - A-LOG-ALLOWLIST
   - A-ISOLATED-FIXTURE
   - A-NO-UNHANDLED-ERROR
-  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: completed }
-  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 9 }
-  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.skills", op: eq, value: "TypeScript, Node.js, SQL" }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding", op: count, value: 0 }
   - { id: A-PROFILE-ACTIVATED, path: "state.profiles", op: count, value: 1 }
   - { id: A-PROFILE-ACTIVATED, path: "state.profiles[0].active", op: eq, value: true }
 tools:
