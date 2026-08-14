@@ -171,7 +171,7 @@ export class CareerStore {
       throw error;
     } finally { transaction.close(); }
   }
-  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_result=NULL, safe_error=?, updated_at=? WHERE job_id=?", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
+  async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_result=NULL, safe_error=?, updated_at=? WHERE job_id=? AND status IN ('queued','running')", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
   async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [this.#clock(), this.#clock(), jobId] }); return this.get(jobId); }
   async unfinished() { return (await this.list()).filter((job) => job.status === 'queued' || job.status === 'running'); }
 
