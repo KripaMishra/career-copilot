@@ -101,6 +101,21 @@ test('job-status logs no caller-supplied job ID', async () => {
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
+test('career-profile returns the owner canonical profile only', async () => {
+  const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-profile-tool-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  await store.saveProfileDocument({ ownerId: 'owner', name: 'profile.md', content: 'Experienced GenAI engineer.' });
+  await store.saveProfileDocument({ ownerId: 'other', name: 'profile.md', content: 'OTHER OWNER SECRET PROFILE.' });
+  const { tools } = createCareerAgentKit({ store });
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  const result = await tools['career-profile'].execute?.({}, { requestContext } as never);
+  assert.ok(result && typeof result === 'object' && 'profile' in result);
+  const profile = (result as { profile: string }).profile;
+  assert.match(profile, /Experienced GenAI engineer/);
+  assert.doesNotMatch(profile, /OTHER OWNER SECRET PROFILE/);
+  await store.close(); await rm(dir, { recursive: true, force: true });
+});
+
 test('career memory keeps message history and thread-scoped observations without working memory', () => {
   const options = careerMemoryOptions('test-memory-model');
   assert.equal(options.lastMessages, 20);
