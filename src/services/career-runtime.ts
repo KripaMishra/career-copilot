@@ -145,7 +145,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
       const completed = await store.getByTransportEventId(scoped(transportEventId)) ?? await store.getByTransportEventId(transportEventId);
       const notifyJobId = completed?.status === 'succeeded' && completed.ownerId === options.ownerId && completed.userId !== null && telegramId(completed.userId) === request.userId && telegramId(completed.chatId) === request.chatId ? completed.jobId : undefined;
       let text = response;
-      if (notifyJobId && completed.reportId) { const report = await store.getReport(completed.reportId, options.ownerId); if (report) text = report.content; } // deliver the exact persisted report; agent response only when the report row is missing (pre-report legacy data)
+      if (notifyJobId && completed && completed.reportId) { const report = await store.getReport(completed.reportId, options.ownerId); if (report) text = report.content; } // deliver the exact persisted report; agent response only when the report row is missing (pre-report legacy data)
       const result: TelegramResult = { outcome: 'accepted', command: appCommand };
       cachedReplies.set(raw.update_id, { text, result, updateId: raw.update_id, requestId: transportEventId, ...(notifyJobId ? { notifyJobId } : {}) });
       await reply(text); if (notifyJobId) await store.markNotified(notifyJobId); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);

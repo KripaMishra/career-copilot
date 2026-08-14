@@ -230,8 +230,8 @@ test('recovery delivers completion to the job chat', async () => {
 
 test('succeeded job without a report row falls back and still marks notified', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'career-report-missing-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
-  const legacy = (transportEventId: string, jobId: string) => ({ jobId, userId: '1', ownerId: 'owner', chatId: '2', transportEventId, originalUrl: 'https://linkedin.com/jobs/legacy', canonicalUrl: 'https://linkedin.com/jobs/legacy', status: 'succeeded' as const, mastraRunId: null, attempts: 0, reportId: null, reportPath: null, sheetReference: null, safeResult: { summary: 'legacy done', reportId: null }, safeError: null, notifiedAt: null, createdAt: 1, updatedAt: 1 });
-  await store.importJob(legacy('42', 'legacy-normal')); await store.importJob(legacy('legacy-sweep-event', 'legacy-sweep'));
+  const seedLegacy = (transportEventId: string, jobId: string) => { const db = new DatabaseSync(path.join(dir, 'jobs.db')); db.prepare('INSERT INTO career_jobs (job_id,user_id,owner_id,chat_id,transport_event_id,original_url,canonical_url,status,attempts,report_id,safe_result,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(jobId, '1', 'owner', '2', transportEventId, 'https://linkedin.com/jobs/legacy', 'https://linkedin.com/jobs/legacy', 'succeeded', 0, null, JSON.stringify({ summary: 'legacy done', reportId: null }), 1, 1); db.close(); };
+  seedLegacy('42', 'legacy-normal'); seedLegacy('legacy-sweep-event', 'legacy-sweep');
   const delivered: string[] = []; const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => 'agent paraphrase' });
   await runtime.handleTelegramUpdate({ update_id: 42, message: { message_id: 42, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: 'what happened to my job?' } }, async (text) => { delivered.push(text); });
   assert.deepEqual(delivered, ['agent paraphrase']); assert.ok((await store.get('legacy-normal'))?.notifiedAt);
