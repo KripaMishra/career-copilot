@@ -18,6 +18,7 @@ src/mastra/public/
 # Local agent configuration
 .agents/
 .claude/
+.pi/
 .pi-subagents/
 
 # Evaluation harness artifacts (issue #13): raw transcripts and run results stay local

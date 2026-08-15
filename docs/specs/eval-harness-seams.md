@@ -18,7 +18,6 @@ Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault pla
 | Deterministic job IDs | `createCareerAgentKit({ uuid?: () => string })` flows into save-job tool (jobId) and `executeSaveJob` (mastraRunId). **Added 2026-08-10.** | `src/agents/agent.ts`, `src/tools/save-job-tool.ts` |
 | Fixed clock | `new CareerStore(url, { clock?: () => number })` — every persisted timestamp (`career_jobs`, `career_reports`, `career_profile_documents`, `career_onboarding`) routes through the injected clock; defaults to `Date.now`. **Added 2026-08-10.** | `src/storage/career-store.ts` |
 | Fetch/DNS/redirect policy | `acquireJobText(url, { fetch?, resolve?, maxDecodedBytes?, timeoutMs? })` — injectable `fetch` (redirect:'manual') and DNS `resolve`; real policy code (blocklists, redirect limits, content-type gate, size limit) still runs. Also injectable wholesale via `SaveJobDeps.acquire`. | `src/tools/web-fetch-tool.ts` |
-| Sheets boundary | `SheetAdapter = { findByJobId, write }` (`upsertSheetRow` adapter). Fake replaces Google HTTP entirely. | `src/integrations/google-sheets.ts` |
 | Notification/reply capture | Runtime takes `reply(text)` per update; `recoverUnfinished(reply)` takes reply+sendMessage. The harness's `reply` is a real delivery seam: it attributes each delivery to the job it notifies and honors the fixture `notifications` plan (`ok` / `fail-first`), recording delivered/failed attempts. | `src/services/career-runtime.ts`, `eval/runner.ts` |
 | Logger | `AppLogger = (level, event, data?) => void`; terminal logger already accepts `now` + output. A collector fake implements the same type. | `src/observability.ts` |
 | Telegram envelope validation | `assertRawTelegramUpdate(raw)` + `deriveTelegramRequest(raw)` — pure functions over raw updates; unauthorized/malformed paths are testable without transport. | `src/channels/telegram-auth.ts` |
@@ -76,7 +75,7 @@ Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault pla
 ## Verification of this report
 
 - `npm exec tsc -- --noEmit` green.
-- `npm test` green (92 tests) after the 2026-08-12 review fixes: full save replay
+- `npm test` green (106 tests) at #13c (2026-08-14): full save replay
   (analyzeJob + tool ledger + fail-first delivery), SSRF block capture, per-turn
   timeout, stub-merge conflicts, fixture-sensitive corpus hash.
 - Deliverable committed on `feat/evals`; `manifest.sourceRevision` records a
@@ -84,3 +83,33 @@ Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault pla
 - Type evidence: `MastraModelConfig` (incl. `MastraLanguageModel`) exported from `@mastra/core/llm`;
   `MemoryObservationalMemoryOptions.model` accepts `ObservationalMemoryConfig['model']` which is
   `Exclude<AgentConfig['model'], undefined> | ModelByInputTokens` (LanguageModel instance allowed).
+
+## #13c corpus update (2026-08-14)
+
+S01–S18 landed as 27 scenario files (`eval/scenarios/`) over the shared
+fixtures (`eval/fixtures/`). Additions beyond the seams report above:
+
+- **Startup recovery seam (runner):** fixture jobs in `queued`/`running` resume
+  via `recoverUnfinished(deliver, { notify: true })` before the first turn;
+  recovery tool calls pair identity from the persisted job row and close when
+  the recovery turn's final model call observed their results.
+- **A-TOOL-CONTEXT** accepts turn-less (recovery) tool calls when owner +
+  scoped actor/chat identity match the fixture.
+- **Fixture default model plan** is now an inert memory no-op (was `chat
+  "Done."`) — a consumable chat default stole onboarding responses from the
+  scripted queue.
+- **Purpose detection order:** `^Job text:` (analysis) wins over the broader
+  onboarding heuristics because production profile text contains the
+  "Career onboarding profile" marker.
+- **Redaction allow-direction fixed:** a dangling-else made non-`all` sink
+  classifications forbid every sink; `sinks: [model]` injection canaries now
+  pass while everything else still fails closed.
+- **`malformed` model responses** are expressible without content fields
+  (schema refine updated).
+- Production fix surfaced by the corpus: `safeErrorMessage` classifies
+  HTTP-status fetch failures and the "not supported" host-policy message
+  (was generic) — regression test in `test/minimal-v0.test.ts`.
+
+Verification: 27/27 contract scenarios pass on `eval:test`; `npm test` 106/106;
+strict tsc; Mastra build; `git diff --check` clean. #13c complete; #13d
+(quality lane), #13e (compare/pin), #13f (ops/CI) remain.

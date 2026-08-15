@@ -8,7 +8,6 @@
     "dev": "mastra dev --dir src/mastra",
     "build": "mastra build --dir src/mastra",
     "start": "mastra start",
-    "import:career": "node --experimental-strip-types scripts/import-career-data.ts",
     "test": "node --experimental-strip-types --test test/*.test.ts",
     "eval:test": "node --experimental-strip-types eval/cli.ts"
   },

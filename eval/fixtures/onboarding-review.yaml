@@ -1,0 +1,25 @@
+schemaVersion: 1
+id: onboarding-review
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  onboarding:
+    - ownerId: career-owner-v0
+      conversationId: "telegram:2001"
+      status: review
+      version: 7
+      draft:
+        currentStatus: "Senior backend engineer."
+        experience: "Eight years."
+        education: "B.Tech in computer science."
+        skills: "TypeScript, SQL."
+        projects: "A rate limiter."
+        achievements: "Shipped an agent platform."
+        targetRoles: "Staff engineer."
+        locationPreferences: "Remote India."
+        workAuthorization: "Indian citizen."
+        employmentPreferences: "Full-time."
+        motivators: "Autonomy."
+        careerGoals: "Lead an AI platform team."

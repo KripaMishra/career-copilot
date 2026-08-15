@@ -6,7 +6,6 @@ import { createCareerAgentKit } from '../agents/agent.ts';
 import { resolveRuntimeConfig } from '../config/runtime.ts';
 import { CareerStore } from '../storage/career-store.ts';
 import { createAgentResponder, createCareerCopilotRuntime, createOnboardingResponder } from '../services/career-runtime.ts';
-import { GoogleSheetsBoundary, GoogleOAuthRefreshProvider, GoogleSheetsHttpApi, type SheetAdapter } from '../integrations/google-sheets.ts';
 import { createTelegramPollingTransport } from '../channels/telegram-transport.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
 
@@ -14,13 +13,9 @@ const config = resolveRuntimeConfig({ requireDeployment: process.env.NODE_ENV ==
 const storageConfig = { id: 'mastra-storage', url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) };
 const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) });
 await store.ready();
-const oauth = new GoogleOAuthRefreshProvider(config.sheetsOAuth);
-const sheets = new GoogleSheetsBoundary({ target: config.sheetsTarget, authorize: () => oauth.getAccessToken(), api: new GoogleSheetsHttpApi() });
-const sheet: SheetAdapter = { findByJobId: (jobId) => sheets.findByJobId(jobId), write: async (row) => { await sheets.upsert(row); } };
-const profileText = await store.profileText(config.owner.resourceId);
 const logger = createTerminalAppLogger();
 
-const career = createCareerAgentKit({ store, profileText, sheet, logger, memoryModel: config.memoryModel });
+const career = createCareerAgentKit({ store, logger, memoryModel: config.memoryModel });
 export const agent = career.agent;
 export const careerTools = career.tools;
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });

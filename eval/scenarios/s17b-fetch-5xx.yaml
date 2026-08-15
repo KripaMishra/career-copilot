@@ -1,0 +1,31 @@
+schemaVersion: 1
+id: s17b-fetch-5xx
+description: "S17 fetch: a transient 5xx retries up to the cap, then the job fails with a safe category — no fabricated success."
+kind: contract
+persona: P12
+fixture: active-profile
+stubs: [s17-fetch-5xx]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/save https://linkedin.com/jobs/view/1" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-TOOLS-EXACT
+  - A-TOOL-CONTEXT
+  - A-URL-POLICY
+  - A-SAFE-ERROR
+  - A-JOB-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
+  - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
+  - { id: A-JOB-STATE, path: "state.jobs[0].attempts", op: eq, value: 1 }
+  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job content could not be fetched safely." }
+  - { id: A-JOB-STATE, path: "fetch", op: count, value: 3 }
+tools:
+  require: [save-job]
+  counts: { save-job: 1 }
+limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 10 }

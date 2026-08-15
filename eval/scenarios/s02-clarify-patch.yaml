@@ -1,0 +1,30 @@
+schemaVersion: 1
+id: s02-clarify-patch
+description: "S02: a clarification leaves the draft byte-identical; a valid answer patches only the named field and increments the version once."
+kind: contract
+persona: P02
+fixture: onboarding-collecting
+stubs: [s02-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "What do you mean?" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "I am good with TypeScript and SQL." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-NO-ACTIVATION-BEFORE-CONFIRM
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: collecting }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 4 }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.currentStatus", op: eq, value: "Senior backend engineer." }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.skills", op: eq, value: "TypeScript, SQL" }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.profiles", op: count, value: 0 }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 5, maxWallClockMs: 30000, maxModelCalls: 10 }

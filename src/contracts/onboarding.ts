@@ -1,5 +1,8 @@
 import { z } from 'zod';
 
+// 'completed' is kept for legacy-compat only: pre-D6 rows may carry it, and
+// removing it from the enum would throw in rowToOnboarding on those rows.
+// No code writes it anymore (completeOnboarding deletes the row).
 export const OnboardingStatusSchema = z.enum(['collecting', 'review', 'completed', 'cancelled']);
 export type OnboardingStatus = z.infer<typeof OnboardingStatusSchema>;
 

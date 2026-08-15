@@ -19,8 +19,11 @@ function containsAny(haystack: string, needles: string[]): boolean {
 function allowedSinks(canary: Canary): Set<CanarySink> {
   const sinks = new Set<CanarySink>();
   for (const sink of canary.sinks) {
-    if (sink === 'all') for (const every of ALL_SINKS) if (every !== 'all') sinks.add(every);
-    else sinks.add(sink);
+    if (sink === 'all') {
+      for (const every of ALL_SINKS) if (every !== 'all') sinks.add(every);
+    } else {
+      sinks.add(sink);
+    }
   }
   return sinks;
 }

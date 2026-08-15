@@ -1,0 +1,24 @@
+schemaVersion: 1
+id: s12-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: "Senior backend/GenAI engineer; TypeScript, Node.js, SQL; remote India."
+    - purpose: analysis
+      match: "Acme Corp is hiring"
+      object:
+        schemaVersion: 1
+        title: "Senior Backend Engineer"
+        company: "Acme Corp"
+        location: "Remote India"
+        summary: "Backend role at Acme Corp requiring TypeScript, Node.js, and SQL; the page names the role, company, and requirements explicitly."
+        fitScore: 80
+        nextStep: "Apply on the company careers page."
+    - purpose: chat
+      text: "Saved: Senior Backend Engineer at Acme Corp. Next step: Apply on the company careers page."

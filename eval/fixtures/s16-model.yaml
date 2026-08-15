@@ -1,0 +1,19 @@
+schemaVersion: 1
+id: s16-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: chat
+      match: "Report the status of the latest job"
+      toolCalls:
+        - toolName: job-status
+          args: {}
+    - purpose: chat
+      text: "No jobs saved in this conversation yet."
+    - purpose: chat
+      match: "List my saved jobs"
+      toolCalls:
+        - toolName: job-queue
+          args: {}
+    - purpose: chat
+      text: "No jobs saved in this conversation yet."

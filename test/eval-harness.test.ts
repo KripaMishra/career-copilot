@@ -255,6 +255,22 @@ test('redaction fails closed: canary in a forbidden sink blocks the run', async 
   }
 });
 
+import { canaryAllowedIn, scanValue } from '../eval/redaction.ts';
+
+test('redaction allows a canary only in its classified sinks (allow-direction regression)', () => {
+  // regression: a dangling-else in allowedSinks made any canary without the
+  // 'all' classification forbidden in EVERY sink, so model-classified injection
+  // canaries could never pass — only the fail-closed direction was tested
+  const modelOnly = { value: 'PAGE_INJECTION_CANARY', sinks: ['model'] as const };
+  const everywhere = { value: 'CANARY_SECRET', sinks: ['all'] as const };
+  assert.equal(canaryAllowedIn(modelOnly, 'model'), true);
+  assert.equal(canaryAllowedIn(modelOnly, 'reply'), false);
+  assert.equal(canaryAllowedIn(modelOnly, 'report'), false);
+  assert.equal(canaryAllowedIn(everywhere, 'model'), true);
+  assert.deepEqual(scanValue({ promptText: 'x PAGE_INJECTION_CANARY y' }, 'model', [modelOnly], 'call'), []);
+  assert.equal(scanValue({ replyText: 'x PAGE_INJECTION_CANARY y' }, 'reply', [modelOnly], 'call').length, 1);
+});
+
 test('incomplete: uncaught model throw and budget breach are incomplete, never failed', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-incomplete-'));
   try {
@@ -415,9 +431,6 @@ fetch:
     status: 200
     contentType: "text/html"
     body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 notifications:
   - jobId: "fixture-0001"
     deliver: fail-first
@@ -473,7 +486,6 @@ assertions:
   - A-NOTIFY-MARK-AFTER-SEND
   - A-JOB-STATE
   - A-REPORT-BEFORE-SUCCESS
-  - A-SHEET-READBACK
   - A-SAFE-ERROR
   - A-TRANSCRIPT-COMPLETE
   - A-BUDGET
@@ -508,8 +520,6 @@ test('full save replay: analyzeJob runs inside the harness, tool ledger is exact
     assert.equal(job.status, 'succeeded');
     assert.ok(job.safeResult, 'job must carry a safe result');
     assert.ok(job.reportId, 'job must carry a report');
-    assert.equal(result.state.sheets.length, 1, 'sheet row must be verified');
-    assert.equal(result.state.sheets[0].jobId, 'fixture-0001');
     assert.ok(job.notifiedAt, 'notification must be marked only after the successful delivery');
 
     // tool ledger is non-destructive and exact: 1 call, identity + url captured
@@ -556,9 +566,6 @@ fetch:
     status: 200
     contentType: "text/html"
     body: "<p>internal</p>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 notifications: []
 model:
   responses:
@@ -666,9 +673,6 @@ fetch:
   - url: "https://linkedin.com/jobs/view/77"
     dns: ["93.184.216.34"]
     timeout: true
-sheets:
-  headers: []
-  rows: []
 notifications: []
 model:
   responses:
@@ -773,8 +777,6 @@ db:
       safeResult:
         summary: "done"
         reportId: null
-        reportPath: null
-        sheetReference: null
     - jobId: "job-8"
       userId: "1001"
       ownerId: career-owner-v0
@@ -787,8 +789,6 @@ db:
       safeResult:
         summary: "done"
         reportId: null
-        reportPath: null
-        sheetReference: null
 model:
   responses:
     - purpose: chat
@@ -933,9 +933,6 @@ fetch:
     status: 200
     contentType: "text/html"
     body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 notifications:
   - jobId: "fixture-0001"
     deliver: fail-first
@@ -1063,9 +1060,6 @@ fetch:
     status: 200
     contentType: "text/html"
     body: "<html><body>Platform Engineer Beta at Example Corp</body></html>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 notifications: []
 model:
   responses:
@@ -1139,7 +1133,6 @@ assertions:
   - A-NOTIFY-AFTER-COMPLETE
   - A-JOB-STATE
   - A-REPORT-BEFORE-SUCCESS
-  - A-SHEET-READBACK
   - A-TRANSCRIPT-COMPLETE
   - A-BUDGET
   - A-CANARY-CONTAINED
@@ -1171,7 +1164,7 @@ test('redirect policy is per acquisition chain: two jobs with two redirects each
   }
 });
 
-test('stub-provided profileText reaches the agent: a database-only canary in it is caught at the model sink', async () => {
+test('store-provided profile reaches the save flow: a database-only canary in it is caught at the model sink', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubprofile-'));
   try {
     const base = `schemaVersion: 1
@@ -1194,16 +1187,18 @@ ownerId: career-owner-v0
 users: ["1001"]
 chats: ["2001"]
 clock: "2026-01-01T00:00:00Z"
-profileText: "Name: Ada\\nSkills: CANARY_PROFILE"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: Ada
+      content: "Name: Ada\\nSkills: CANARY_PROFILE"
+      active: true
 fetch:
   - url: "https://linkedin.com/jobs/view/42"
     dns: ["93.184.216.34"]
     status: 200
     contentType: "text/html"
     body: "<html><body>Senior Platform Engineer at Example Corp</body></html>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 canaries:
   - { value: "CANARY_PROFILE", sinks: [database] }
 model:
@@ -1249,7 +1244,7 @@ limits:
     const fixture = corpus.fixtures.get('profile-base')!.fixture;
     const stubFixture = corpus.fixtures.get('profile-stub')!.fixture;
     const result = await runScenario({ scenario: sc, fixture, stubs: [stubFixture], manifest: MANIFEST, keepArtifacts: false, corpusHash: corpus.hash, runId: `test-${Date.now()}` });
-    assert.equal(result.status, 'incomplete', 'stub profileText must reach the agent; its database-only canary must trip the model sink');
+    assert.equal(result.status, 'incomplete', 'the store-seeded profile must reach the save flow; its database-only canary must trip the model sink');
     assert.ok(result.redaction.canariesFound.includes('CANARY_PROFILE'), 'canary must be reported');
     const gate = result.assertions.find((a) => a.id === 'A-CANARY-CONTAINED')!;
     assert.match(gate.evidence, /@model:/, 'hit must be attributed to the model sink');
@@ -1298,9 +1293,6 @@ fetch:
     status: 200
     contentType: "text/html"
     body: "<html><body>Platform Engineer Alpha at Example Corp</body></html>"
-sheets:
-  headers: [jobId, status, title, company]
-  rows: []
 model:
   responses:\n${responses}`;
     const scenario = `schemaVersion: 1
@@ -1357,21 +1349,10 @@ test('explicitly selected staged scenarios run through filterCorpus', async () =
   }
 });
 
-test('stub merge conflicts: sheets failure modes and notification plans fail validation', async () => {
+test('stub merge conflicts: notification delivery plans fail validation', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'eval-stubconflict-'));
   try {
-    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE, 'stub-sheets': `schemaVersion: 1
-id: stub-sheets
-ownerId: career-owner-v0
-users: ["1001"]
-chats: ["2001"]
-sheets:
-  failure: auth
-model:
-  responses:
-    - purpose: chat
-      text: "stub"
-`, 'stub-notify': `schemaVersion: 1
+    await writeCorpus(dir, { 'new-owner': NEW_OWNER_FIXTURE, 'stub-notify': `schemaVersion: 1
 id: stub-notify
 ownerId: career-owner-v0
 users: ["1001"]
@@ -1383,14 +1364,14 @@ model:
     - purpose: chat
       text: "stub"
 ` }, {});
-    const baseFixture = NEW_OWNER_FIXTURE.replace('id: new-owner', 'id: new-owner-conflict').replace('clock: "2026-01-01T00:00:00Z"\n', 'clock: "2026-01-01T00:00:00Z"\nsheets:\n  failure: write\nnotifications:\n  - { jobId: "job-1", deliver: "fail-first" }\n');
+    const baseFixture = NEW_OWNER_FIXTURE.replace('id: new-owner', 'id: new-owner-conflict').replace('clock: "2026-01-01T00:00:00Z"\n', 'clock: "2026-01-01T00:00:00Z"\nnotifications:\n  - { jobId: "job-1", deliver: "fail-first" }\n');
     await writeFile(path.join(dir, 'eval', 'fixtures', 'new-owner-conflict.yaml'), baseFixture);
     await writeFile(path.join(dir, 'eval', 'scenarios', 'conflict.yaml'), `schemaVersion: 1
 id: conflict
 kind: contract
 persona: P01
 fixture: new-owner-conflict
-stubs: [stub-sheets, stub-notify]
+stubs: [stub-notify]
 turns:
   - id: t1
     channel: telegram
@@ -1402,7 +1383,6 @@ assertions: [A-BUDGET]
 `);
     const corpus = await loadCorpus(dir);
     const messages = corpus.errors.map((e) => e.message).join('; ');
-    assert.ok(/sheets failure modes write, auth/.test(messages), `sheets conflict must fail validation: ${messages}`);
     assert.ok(/conflicting delivery modes fail-first\/ok/.test(messages), `notification conflict must fail validation: ${messages}`);
   } finally {
     await rm(dir, { recursive: true, force: true });

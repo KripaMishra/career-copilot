@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: s18c-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: chat
+      match: "hello"
+      text: "Hello!"

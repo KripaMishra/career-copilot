@@ -1,0 +1,25 @@
+schemaVersion: 1
+id: queued-job-revoked
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+db:
+  profiles:
+    - ownerId: career-owner-v0
+      name: onboarding.md
+      content: |
+        # Career onboarding profile
+        Current role/status: Senior backend/GenAI engineer with eight years of experience.
+      active: true
+      version: 1
+  jobs:
+    - jobId: job-002
+      userId: "1002"
+      ownerId: career-owner-v0
+      chatId: "telegram:2002"
+      transportEventId: "telegram:9002"
+      originalUrl: "https://linkedin.com/jobs/view/1"
+      canonicalUrl: "https://linkedin.com/jobs/view/1"
+      status: queued
+      attempts: 0

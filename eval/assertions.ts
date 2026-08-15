@@ -35,7 +35,7 @@ export type RunContext = {
   limits: Required<Limits>;
   transcriptComplete: boolean;
   transcriptEvents: { sequence: number; turnId: string | null; type: string; atMs: number }[];
-  state: { onboarding: Record<string, unknown>[]; profiles: Record<string, unknown>[]; jobs: Record<string, unknown>[]; reports: Record<string, unknown>[]; sheets: Record<string, unknown>[]; notifications: Record<string, unknown>[] };
+  state: { onboarding: Record<string, unknown>[]; profiles: Record<string, unknown>[]; jobs: Record<string, unknown>[]; reports: Record<string, unknown>[]; notifications: Record<string, unknown>[] };
   ledgers: Ledgers;
   metrics: { durationMs: number; ttFirstResponseMs: number | null; modelCalls: number; transcriptBytes: number };
   redactionHits: { canary: string; sink: string; where: string }[];
@@ -111,12 +111,13 @@ function contextView(ctx: RunContext): Record<string, unknown> {
     replies: ctx.ledgers.replies,
     notifications: ctx.ledgers.notifications,
     logs: ctx.ledgers.logs,
+    fetch: ctx.ledgers.fetch,
     redactionHits: ctx.redactionHits,
     transcriptComplete: ctx.transcriptComplete,
   };
 }
 
-const PHASE_ORDER = ['fetch', 'analysis', 'report', 'sheets', 'complete'] as const;
+const PHASE_ORDER = ['fetch', 'analysis', 'report', 'complete'] as const;
 
 const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   'A-AUTH-BEFORE-MODEL': (ctx) => {
@@ -143,7 +144,17 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   'A-TOOL-CONTEXT': (ctx) => {
     const problems: string[] = [];
     for (const call of ctx.ledgers.toolCalls) {
-      const turn = call.turnId ? ctx.scenario.turns.find((candidate) => candidate.id === call.turnId) : undefined;
+      if (call.turnId === undefined || call.turnId === null) {
+        // recovery-originated call (startup recovery, issue #13c S18): the
+        // persisted job identity must match the owner and stay authorized
+        if (call.ownerId !== ctx.fixture.ownerId) problems.push(`recovery tool ${call.toolId} owner mismatch`);
+        const actor = String(call.actorId ?? '').replace(/^telegram:/, '');
+        const chat = String(call.conversationId ?? '').replace(/^telegram:/, '');
+        if (!ctx.fixture.users.includes(actor)) problems.push(`recovery tool ${call.toolId} unauthorized actor ${actor || 'none'}`);
+        if (!ctx.fixture.chats.includes(chat)) problems.push(`recovery tool ${call.toolId} unauthorized chat ${chat || 'none'}`);
+        continue;
+      }
+      const turn = ctx.scenario.turns.find((candidate) => candidate.id === call.turnId);
       if (!turn) { problems.push(`tool ${call.toolId} has no owning turn`); continue; }
       if (turn.expected === 'rejected') { problems.push(`tool ${call.toolId} ran on turn ${turn.id} expected to be rejected`); continue; }
       const authorizedUser = ctx.fixture.users.includes(turn.actorId);
@@ -154,7 +165,9 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   },
   'A-ONBOARDING-STATE': (ctx) => {
     const rows = ctx.state.onboarding;
-    if (rows.length === 0) return fail('A-ONBOARDING-STATE', 'no final onboarding rows captured');
+    // D6: completion deletes the draft row, so a completed onboarding leaves no
+    // row; zero rows is a valid final state, not a failure.
+    if (rows.length === 0) return pass('A-ONBOARDING-STATE', 'no onboarding rows captured (draft cleared on completion)');
     const problems: string[] = [];
     for (const row of rows) {
       const status = String(row.status ?? '');
@@ -180,7 +193,8 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
   },
   'A-DRAFT-PATCH-ONLY': (ctx) => {
     const rows = ctx.state.onboarding;
-    if (rows.length === 0) return fail('A-DRAFT-PATCH-ONLY', 'no onboarding rows to inspect');
+    // D6: completion deletes the draft row; nothing to inspect when it is gone.
+    if (rows.length === 0) return pass('A-DRAFT-PATCH-ONLY', 'no onboarding rows to inspect (draft cleared on completion)');
     const problems: string[] = [];
     for (const row of rows) {
       const draft = (row.draft ?? {}) as Record<string, unknown>;
@@ -266,14 +280,6 @@ const gates: Record<AssertionId, (ctx: RunContext) => AssertionResult> = {
       else if (!ctx.state.reports.some((report) => String(report.reportId) === String(job.reportId))) problems.push(`job ${String(job.jobId)} succeeded referencing missing report ${String(job.reportId)}`);
     }
     return problems.length === 0 ? pass('A-REPORT-BEFORE-SUCCESS', 'succeeded jobs carry reports') : fail('A-REPORT-BEFORE-SUCCESS', problems.join('; '));
-  },
-  'A-SHEET-READBACK': (ctx) => {
-    const problems: string[] = [];
-    for (const job of ctx.state.jobs.filter((candidate) => candidate.status === 'succeeded')) {
-      const inSheet = ctx.state.sheets.some((row) => row.jobId === job.jobId);
-      if (!inSheet) problems.push(`job ${String(job.jobId)} missing verified sheet row`);
-    }
-    return problems.length === 0 ? pass('A-SHEET-READBACK', `${ctx.state.sheets.length} verified sheet row(s)`) : fail('A-SHEET-READBACK', problems.join('; '));
   },
   'A-NOTIFY-AFTER-COMPLETE': (ctx) => {
     const problems: string[] = [];

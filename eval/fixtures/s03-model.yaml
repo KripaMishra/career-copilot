@@ -1,0 +1,11 @@
+schemaVersion: 1
+id: s03-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: onboarding
+      match: "senior backend engineer with skills"
+      object: { reply: "Saved both fields.", draftPatch: { currentStatus: "Senior backend engineer.", skills: "TypeScript, SQL" }, readyForReview: false }
+    - purpose: onboarding
+      match: "Actually, my skills"
+      object: { reply: "Skills corrected.", draftPatch: { skills: "TypeScript, Node.js" }, readyForReview: false }

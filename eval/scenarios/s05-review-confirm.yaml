@@ -1,0 +1,37 @@
+schemaVersion: 1
+id: s05-review-confirm
+description: "S05: near-miss confirmations never activate; only trimmed case-insensitive exact confirm activates atomically and clears the onboarding draft row (D6); a stale replayed confirm cannot mutate state."
+kind: contract
+persona: P03
+fixture: onboarding-review
+stubs: [s05-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "yes" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "looks good" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: text, text: "yes confirm" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t4, channel: telegram, input: { kind: text, text: "confirm!" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t5, channel: telegram, input: { kind: text, text: "confirmed" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t6, channel: telegram, input: { kind: text, text: "confirm now" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t7, channel: telegram, input: { kind: text, text: "edit skills: TypeScript, Node.js, SQL" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t8, channel: telegram, input: { kind: text, text: "edit unknown: value" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t9, channel: telegram, input: { kind: text, text: "  CoNfIrM  " }, actorId: "1001", conversationId: "telegram:2001", expected: accepted, updateId: 9001 }
+  - { id: t10, channel: telegram, input: { kind: text, text: "  CoNfIrM  " }, actorId: "1001", conversationId: "telegram:2001", expected: rejected, updateId: 9001 }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-NO-ACTIVATION-BEFORE-CONFIRM
+  - A-PROFILE-ACTIVATED
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding", op: count, value: 0 }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles", op: count, value: 1 }
+  - { id: A-PROFILE-ACTIVATED, path: "state.profiles[0].active", op: eq, value: true }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 12, maxWallClockMs: 60000, maxModelCalls: 20 }

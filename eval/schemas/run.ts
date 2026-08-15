@@ -67,7 +67,6 @@ export const runResultSchema = z.strictObject({
     profiles: z.array(z.record(z.string(), z.unknown())),
     jobs: z.array(z.record(z.string(), z.unknown())),
     reports: z.array(z.record(z.string(), z.unknown())),
-    sheets: z.array(z.record(z.string(), z.unknown())),
     notifications: z.array(z.record(z.string(), z.unknown())),
   }),
   assertions: z.array(assertionResultSchema),

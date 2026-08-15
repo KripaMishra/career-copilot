@@ -1,0 +1,47 @@
+schemaVersion: 1
+id: s01-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: onboarding
+      match: "senior backend engineer with eight years"
+      object: { reply: "Saved. Next: experience.", draftPatch: { currentStatus: "Senior backend engineer with eight years of experience." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Eight years of backend engineering"
+      object: { reply: "Saved. Next: education.", draftPatch: { experience: "Eight years of backend engineering." }, readyForReview: false }
+    - purpose: onboarding
+      match: "B.Tech in computer science"
+      object: { reply: "Saved. Next: skills.", draftPatch: { education: "B.Tech in computer science." }, readyForReview: false }
+    - purpose: onboarding
+      match: "TypeScript, Node.js, and SQL"
+      object: { reply: "Saved. Next: projects.", draftPatch: { skills: "TypeScript, Node.js, SQL." }, readyForReview: false }
+    - purpose: onboarding
+      match: "rate limiter and an eval harness"
+      object: { reply: "Saved. Next: achievements.", draftPatch: { projects: "A rate limiter and an eval harness." }, readyForReview: false }
+    - purpose: onboarding
+      match: "agent platform used by three teams"
+      object: { reply: "Saved. Next: target roles.", draftPatch: { achievements: "Shipped an agent platform used by three teams." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Staff or AI-platform engineer roles"
+      object: { reply: "Saved. Next: location preferences.", draftPatch: { targetRoles: "Staff or AI-platform engineer roles." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Remote from India"
+      object: { reply: "Saved. Next: work authorization.", draftPatch: { locationPreferences: "Remote from India." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Indian citizen, no sponsorship"
+      object: { reply: "Saved. Next: employment preferences.", draftPatch: { workAuthorization: "Indian citizen, no sponsorship needed." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Full-time employment"
+      object: { reply: "Saved. Next: strengths and preferences.", draftPatch: { employmentPreferences: "Full-time employment." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Autonomy and ownership"
+      object: { reply: "Saved. Next: career goals.", draftPatch: { motivators: "Autonomy and ownership." }, readyForReview: false }
+    - purpose: onboarding
+      match: "Lead an AI platform team"
+      object: { reply: "Saved. Ready to review when you are.", draftPatch: { careerGoals: "Lead an AI platform team." }, readyForReview: false }
+    - purpose: onboarding
+      match: "skip"
+      object: { reply: "Understood, leaving optional fields empty.", draftPatch: {}, readyForReview: false }
+    - purpose: onboarding
+      match: "ready to review"
+      object: { reply: "Here is your profile for review.", draftPatch: {}, readyForReview: true }

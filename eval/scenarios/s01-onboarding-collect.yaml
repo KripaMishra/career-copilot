@@ -1,0 +1,55 @@
+schemaVersion: 1
+id: s01-onboarding-collect
+description: "S01: new owner completes required onboarding fields, skips optional ones, and reaches review without activation."
+kind: contract
+persona: P01
+fixture: new-owner
+stubs: [s01-model]
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/onboarding" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: text, text: "I am a senior backend engineer with eight years of experience." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: text, text: "Eight years of backend engineering." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t4, channel: telegram, input: { kind: text, text: "B.Tech in computer science." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t5, channel: telegram, input: { kind: text, text: "TypeScript, Node.js, and SQL." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t6, channel: telegram, input: { kind: text, text: "A rate limiter and an eval harness." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t7, channel: telegram, input: { kind: text, text: "Shipped an agent platform used by three teams." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t8, channel: telegram, input: { kind: text, text: "Staff or AI-platform engineer roles." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t9, channel: telegram, input: { kind: text, text: "Remote from India." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t10, channel: telegram, input: { kind: text, text: "Indian citizen, no sponsorship needed." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t11, channel: telegram, input: { kind: text, text: "Full-time employment." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t12, channel: telegram, input: { kind: text, text: "Autonomy and ownership." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t13, channel: telegram, input: { kind: text, text: "Lead an AI platform team." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t14, channel: telegram, input: { kind: text, text: "skip" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t15, channel: telegram, input: { kind: text, text: "I am ready to review." }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-DRAFT-PATCH-ONLY
+  - A-NO-ACTIVATION-BEFORE-CONFIRM
+  - A-PROFILE-ACTIVATED
+  - A-TOOLS-EXACT
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-AUTH-BEFORE-MODEL
+  - A-LOG-ALLOWLIST
+  - A-ISOLATED-FIXTURE
+  - A-NO-UNHANDLED-ERROR
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].status", op: eq, value: review }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 14 }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.currentStatus", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.experience", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.education", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.skills", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.projects", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.achievements", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.targetRoles", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.locationPreferences", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.workAuthorization", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.employmentPreferences", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.motivators", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.careerGoals", op: path }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.compensation", op: absent }
+  - { id: A-DRAFT-PATCH-ONLY, path: "state.onboarding[0].draft.exampleJob", op: absent }
+tools:
+  counts: { save-job: 0, job-status: 0, job-queue: 0 }
+limits: { maxTurns: 20, maxWallClockMs: 90000, maxModelCalls: 60 }

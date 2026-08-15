@@ -1,0 +1,9 @@
+schemaVersion: 1
+id: normal-job-page
+ownerId: career-owner-v0
+fetch:
+  - url: "https://linkedin.com/jobs/view/1"
+    dns: ["93.184.216.34"]
+    status: 200
+    contentType: "text/html"
+    body: "<html><body><h1>Senior Backend Engineer</h1><p>Acme Corp is hiring a backend engineer with TypeScript, Node.js, and SQL experience.</p></body></html>"

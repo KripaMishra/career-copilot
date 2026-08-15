@@ -46,8 +46,11 @@ function promptHasToolResult(prompt: unknown): boolean {
 }
 
 export function detectPurpose(prompt: string): ModelResponse['purpose'] {
-  if (/career onboarding profile|structured draft JSON|Missing required fields JSON/i.test(prompt)) return 'onboarding';
+  // analysis first: `^Job text:` is the most specific marker, and the broader
+  // onboarding regexes (e.g. "Career onboarding profile") legitimately appear
+  // inside analysis prompts via production profile text (buildOnboardingProfileText)
   if (/^Job text:/m.test(prompt) || /Owner profile:/m.test(prompt)) return 'analysis';
+  if (/career onboarding profile|structured draft JSON|Missing required fields JSON/i.test(prompt)) return 'onboarding';
   if (/update working memory|observations you made|observational memory|memory extraction/i.test(prompt)) return 'memory';
   return 'chat';
 }

@@ -1,0 +1,20 @@
+schemaVersion: 1
+id: s17-fetch-5xx
+ownerId: career-owner-v0
+fetch:
+  - url: "https://linkedin.com/jobs/view/1"
+    dns: ["93.184.216.34"]
+    status: 500
+    contentType: "text/html"
+    body: "<p>error</p>"
+model:
+  responses:
+    - purpose: chat
+      match: "Save this job now"
+      toolCalls:
+        - toolName: save-job
+          args:
+            url: "https://linkedin.com/jobs/view/1"
+            profileContext: "Senior backend/GenAI engineer."
+    - purpose: chat
+      text: "The job could not be saved safely."

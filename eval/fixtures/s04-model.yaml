@@ -1,0 +1,8 @@
+schemaVersion: 1
+id: s04-model
+ownerId: career-owner-v0
+model:
+  responses:
+    - purpose: onboarding
+      match: "CV engineer building image recognition"
+      object: { reply: "Saved.", draftPatch: { currentStatus: "CV engineer building image recognition and distributed file systems in Mumbai.", skills: "TypeScript" }, readyForReview: false }
