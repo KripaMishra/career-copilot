@@ -58,6 +58,33 @@ test('page cap rejects overlong documents', async () => {
   assert.deepEqual(viaEngine, { ok: false, reason: 'too_many_pages' });
 });
 
+test('engine enforces the page cap before parsing any page', async () => {
+  let parsed = 0;
+  const spy: Parameters<typeof extractPdfText>[1]['engine'] = async (bytes, { maxPages }) => {
+    parsed += 1;
+    if (parsed > maxPages) throw new Error('parser never reached this page');
+    return { ok: false, reason: 'malformed' };
+  };
+  const result = await extractPdfText(new TextEncoder().encode('%PDF-1.4'), { engine: spy, maxPages: 3 });
+  assert.equal(result.ok, false);
+  assert.equal(parsed, 1, 'engine must not iterate pages past the cap');
+});
+
+test('engine enforces the char cap as text accumulates, mid-extraction', async () => {
+  const pages: string[] = [];
+  const spied: Parameters<typeof extractPdfText>[1]['engine'] = async (bytes, { maxPages, maxChars }) => {
+    const parsed: string[] = [];
+    for (let page = 1; page <= maxPages; page += 1) {
+      parsed.push('y'.repeat(Math.floor(maxChars / 2)));
+      if (parsed.join('\n').length > maxChars) break;
+    }
+    pages.push(...parsed);
+    return { ok: false, reason: 'no_text' };
+  };
+  await extractPdfText(new TextEncoder().encode('%PDF-1.4'), { engine: spied, maxPages: 10, maxChars: 1_000 });
+  assert.ok(pages.length < 10, 'engine must stop accumulating once the char cap is exceeded');
+});
+
 test('extracted character cap rejects overlong text', async () => {
   const overlong: Parameters<typeof extractPdfText>[1]['engine'] = async () => ({ ok: true, text: 'x'.repeat(200_001), pageCount: 1 });
   const result = await extractPdfText(new TextEncoder().encode('%PDF-1.4'), { engine: overlong });
