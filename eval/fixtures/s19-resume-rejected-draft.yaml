@@ -1,0 +1,38 @@
+schemaVersion: 1
+id: s19-resume-rejected-draft
+description: "S19c: a model draftPatch that changes under local redaction is rejected at the write boundary; nothing persists and the draft version stays unchanged."
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+pii: true
+db:
+  onboarding:
+    - ownerId: career-owner-v0
+      conversationId: "telegram:2001"
+      status: collecting
+      version: 1
+      draft: {}
+documents:
+  - fileId: "doc-clean"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    fileSize: 1024
+    text: "Engineer with backend focus and eight years of experience."
+model:
+  responses:
+    - purpose: memory
+      text: "{}"
+    - purpose: onboarding
+      match: "Resume document processed safely"
+      object:
+        reply: "Resume received."
+        draftPatch:
+          currentStatus: "Engineer at IFSC SBIN0001234"
+        readyForReview: false
+canaries:
+  # Source-only: the raw IFSC is scripted into the model response, and the
+  # harness wires the same PII processors as production, so the raw value must
+  # never surface in model calls, memory, database rows, replies, logs, or
+  # traces — a raw hit anywhere fails the gate.
+  - { value: "SBIN0001234", sinks: [] }

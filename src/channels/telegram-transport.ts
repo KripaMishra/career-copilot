@@ -3,6 +3,66 @@ import type { TelegramUpdate } from './telegram-auth.ts';
 
 type TelegramResponse<T> = { ok: boolean; result: T };
 type Reply = (text: string) => Promise<void>;
+
+/** Injectable authenticated file download (spec D7): production uses the
+ * Telegram impl; tests inject fixtures — no live network. */
+export type TelegramFileDownload = (fileId: string, options?: { maxBytes?: number; signal?: AbortSignal }) => Promise<{ bytes: Uint8Array; byteSize: number }>;
+
+export class DownloadLimitExceededError extends Error { readonly byteSize: number; constructor(byteSize: number) { super('Telegram file download exceeds the byte cap.'); this.byteSize = byteSize; } }
+
+/** Authenticated Telegram file download (getFile → GET file path), bounded by
+ * maxBytes. Standalone so the runtime can use it before the polling transport
+ * exists; the transport reuses it. */
+export function createTelegramFileDownloader(token: string, logger?: AppLogger): TelegramFileDownload {
+  const log: AppLogger = (level, event, data) => { try { logger?.(level, event, data); } catch { /* logging cannot stop downloads */ } };
+  const call = async <T>(method: string, body: Record<string, unknown> = {}, signal: AbortSignal = AbortSignal.timeout(15_000)): Promise<T> => {
+    const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
+    if (!response.ok) throw Object.assign(new Error('Telegram API request failed.'), { status: response.status });
+    const result = await response.json() as TelegramResponse<T>; if (!result.ok) throw new Error('Telegram API request failed.'); return result.result;
+  };
+  return async (fileId, options = {}) => {
+    const maxBytes = options.maxBytes ?? 5 * 1024 * 1024;
+    const started = Date.now(); log('info', 'telegram.download.started', {});
+    try {
+      const meta = await call<{ file_path: string }>('getFile', { file_id: fileId }, options.signal ?? AbortSignal.timeout(15_000));
+      const url = `https://api.telegram.org/file/bot${token}/${meta.file_path}`;
+      const response = await fetch(url, { signal: options.signal ?? AbortSignal.timeout(30_000) });
+      if (!response.ok) throw Object.assign(new Error('Telegram file download failed.'), { status: response.status });
+      const declared = response.headers.get('content-length');
+      if (declared !== null && Number(declared) > maxBytes) throw new DownloadLimitExceededError(Number(declared));
+      // stream incrementally and abort as soon as the cap is exceeded, so a
+      // chunked/no-content-length response can never be buffered unboundedly
+      const reader = response.body?.getReader();
+      let buffer: Uint8Array;
+      if (!reader) {
+        const whole = new Uint8Array(await response.arrayBuffer());
+        if (whole.byteLength > maxBytes) throw new DownloadLimitExceededError(whole.byteLength);
+        buffer = whole;
+      } else {
+        const chunks: Uint8Array[] = [];
+        let received = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            received += value.byteLength;
+            if (received > maxBytes) { await reader.cancel().catch(() => {}); throw new DownloadLimitExceededError(received); }
+            chunks.push(value);
+          }
+        }
+        buffer = new Uint8Array(received);
+        let offset = 0;
+        for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
+      }
+      log('info', 'telegram.download.succeeded', { byteSize: buffer.byteLength, durationMs: Date.now() - started });
+      return { bytes: buffer, byteSize: buffer.byteLength };
+    } catch (error) {
+      log('error', 'telegram.download.failed', { durationMs: Date.now() - started, errorName: error instanceof Error ? error.name : 'UnknownError' });
+      throw error;
+    }
+  };
+}
+
 export function createTelegramPollingTransport(token: string, handle: (update: unknown, reply: Reply) => Promise<unknown>, logger?: AppLogger) {
   let stopped = false; let offset = 0; let pollController: AbortController | null = null;
   const log: AppLogger = (level, event, data) => { try { logger?.(level, event, data); } catch { /* logging cannot stop polling */ } };
@@ -11,6 +71,7 @@ export function createTelegramPollingTransport(token: string, handle: (update: u
     if (!response.ok) throw Object.assign(new Error('Telegram API request failed.'), { status: response.status });
     const result = await response.json() as TelegramResponse<T>; if (!result.ok) throw new Error('Telegram API request failed.'); return result.result;
   };
+  const downloadFile = createTelegramFileDownloader(token, logger);
   const sendMessage = async (chatId: string, text: string, data: Record<string, unknown> = {}) => {
     const started = Date.now(); const characters = Array.from(text); const chunkCount = Math.max(1, Math.ceil(characters.length / 4096));
     log('info', 'telegram.reply.started', { ...data, chunkCount });
@@ -45,5 +106,5 @@ export function createTelegramPollingTransport(token: string, handle: (update: u
     }
     log('info', 'telegram.poll.stopped');
   };
-  return { start, sendMessage, stop: () => { stopped = true; pollController?.abort(); } };
+  return { start, sendMessage, stop: () => { stopped = true; pollController?.abort(); }, downloadFile };
 }

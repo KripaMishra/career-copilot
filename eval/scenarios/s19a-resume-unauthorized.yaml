@@ -1,0 +1,40 @@
+schemaVersion: 1
+id: s19a-resume-unauthorized
+description: "S19a: resume envelopes that fail authorization or bounded extraction are rejected with safe messages; nothing downloads for envelope rejections and no model call happens."
+kind: contract
+persona: P17
+fixture: s19-resume-unauthorized
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/onboarding" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: document, fileId: "doc-image" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t3, channel: telegram, input: { kind: document, fileId: "doc-word" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t4, channel: telegram, input: { kind: document, fileId: "doc-over" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t5, channel: telegram, input: { kind: document, fileId: "doc-caption" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t6, channel: telegram, input: { kind: document, fileId: "doc-notpdf" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t7, channel: telegram, input: { kind: document, fileId: "doc-encrypted" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t8, channel: telegram, input: { kind: document, fileId: "doc-malformed" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t9, channel: telegram, input: { kind: document, fileId: "doc-notext" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t10, channel: telegram, input: { kind: document, fileId: "doc-timeout" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t11, channel: telegram, input: { kind: document, fileId: "doc-pages" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t12, channel: telegram, input: { kind: document, fileId: "doc-overlong" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t13, channel: telegram, input: { kind: document, fileId: "doc-fail" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  # a genuinely unauthorized principal must be rejected before any download
+  - { id: t14, channel: telegram, input: { kind: document, fileId: "doc-unauthorized" }, actorId: "9999", conversationId: "telegram:2001", expected: rejected }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-LOG-ALLOWLIST
+  - A-NO-UNHANDLED-ERROR
+  - A-ISOLATED-FIXTURE
+  # envelope rejections (image/docx/oversized/caption) never download; the
+  # eight signature/extraction rejections do download before failing safely;
+  # the unauthorized turn adds no download and no model call
+  - { id: A-JOB-STATE, path: "documentDownloads", op: count, value: 8 }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 1 }
+tools:
+  require: []
+  forbid: [save-job, job-status, job-queue, career-profile]
+  counts: { save-job: 0 }
+limits: { maxTurns: 15, maxWallClockMs: 90000, maxModelCalls: 2 }

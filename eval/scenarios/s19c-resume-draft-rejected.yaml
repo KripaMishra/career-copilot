@@ -1,0 +1,27 @@
+schemaVersion: 1
+id: s19c-resume-draft-rejected
+description: "S19c: a draftPatch that changes under local redaction is rejected at the write boundary with a safe reply; no row advances and no profile document is written."
+kind: contract
+persona: P17
+fixture: s19-resume-rejected-draft
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/onboarding" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: document, fileId: "doc-clean" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-LOG-ALLOWLIST
+  - A-NO-UNHANDLED-ERROR
+  - A-ISOLATED-FIXTURE
+  # the rejected candidate must not advance the draft or activate anything
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 1 }
+  - { id: A-JOB-STATE, path: "state.profiles", op: count, value: 0 }
+  # the user receives the safe rejection reply (no raw canary reaches them)
+  - { id: A-TRANSCRIPT-COMPLETE, path: "replies", op: member, value: { turnId: "t2", text: "Your resume content could not be saved safely. Please share the details as text instead." } }
+tools:
+  require: []
+  forbid: [save-job, job-status, job-queue, career-profile]
+  counts: { save-job: 0 }
+limits: { maxTurns: 4, maxWallClockMs: 90000, maxModelCalls: 4 }

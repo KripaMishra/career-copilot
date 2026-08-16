@@ -6,21 +6,24 @@ import { createCareerAgentKit } from '../agents/agent.ts';
 import { resolveRuntimeConfig } from '../config/runtime.ts';
 import { CareerStore } from '../storage/career-store.ts';
 import { createAgentResponder, createCareerCopilotRuntime, createOnboardingResponder } from '../services/career-runtime.ts';
-import { createTelegramPollingTransport } from '../channels/telegram-transport.ts';
+import { createPiiService } from '../services/pii.ts';
+import { createTelegramFileDownloader, createTelegramPollingTransport } from '../channels/telegram-transport.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
 
 const config = resolveRuntimeConfig({ requireDeployment: process.env.NODE_ENV === 'production' });
 const storageConfig = { id: 'mastra-storage', url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) };
-const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) });
+const pii = createPiiService(config.pii);
+const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) }, pii.enabled ? { piiRevalidator: { redactText: (text) => pii.redactText(text), redactDocument: (value) => pii.redactDocument(value) } } : {});
 await store.ready();
 const logger = createTerminalAppLogger();
+try { await pii.warmup(); } catch (error) { logger('error', 'pii.warmup.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }
 
-const career = createCareerAgentKit({ store, logger, memoryModel: config.memoryModel });
+const career = createCareerAgentKit({ store, logger, memoryModel: config.memoryModel, ...(pii.enabled ? { processors: { input: [pii.processor], output: [pii.processor] } } : {}) });
 export const agent = career.agent;
 export const careerTools = career.tools;
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });
 export const mastra = new Mastra({ agents: { agent }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
-export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent) });
+export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
 logger('info', 'runtime.ready', { status: 'ready' });
 export const telegramIngress = careerCopilotRuntime.handleTelegramUpdate;
 export const telegramTransport = createTelegramPollingTransport(config.telegram.botToken, telegramIngress, logger);

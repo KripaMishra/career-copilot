@@ -7,6 +7,25 @@ import { OnboardingDraftSchema, OnboardingStatusSchema, assertSafeOnboardingDraf
 
 export type LibsqlConnectionConfig = { url: string; authToken?: string };
 
+/** Redaction revalidation seam (D6): resume-derived candidates re-run local
+ * redaction at the write boundary; byte-for-byte equality is required before
+ * persistence. Wired from the composition root; inert when absent. */
+export type PiiRevalidator = {
+  redactText(text: string): Promise<string>;
+  redactDocument(value: unknown): Promise<unknown>;
+};
+
+export class ResumeRevalidationError extends Error {
+  constructor() { super('Resume-derived content changed under PII redaction and was rejected.'); }
+}
+
+async function revalidateResumeDerived(revalidator: PiiRevalidator | undefined, candidate: { kind: 'document'; value: unknown } | { kind: 'text'; value: string }): Promise<void> {
+  if (!revalidator) throw new ResumeRevalidationError();
+  const redacted = candidate.kind === 'document' ? await revalidator.redactDocument(candidate.value) : await revalidator.redactText(candidate.value);
+  const changed = candidate.kind === 'document' ? JSON.stringify(redacted) !== JSON.stringify(candidate.value) : redacted !== candidate.value;
+  if (changed) throw new ResumeRevalidationError();
+}
+
 function rowSafeResult(row: Row): SafeResult | null {
   if (!row.safe_result) return null;
   const parsed = JSON.parse(String(row.safe_result)) as Partial<SafeResult>;
@@ -30,7 +49,7 @@ function rowToJob(row: Row): Job {
 function rowToOnboarding(row: Row): OnboardingRecord {
   return {
     ownerId: String(row.owner_id), conversationId: String(row.conversation_id), status: OnboardingStatusSchema.parse(row.status),
-    draft: OnboardingDraftSchema.parse(JSON.parse(String(row.draft_json || '{}'))), version: Number(row.version), createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
+    draft: OnboardingDraftSchema.parse(JSON.parse(String(row.draft_json || '{}'))), version: Number(row.version), resumeDerived: Number(row.resume_derived ?? 0) === 1, createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
   };
 }
 
@@ -81,6 +100,7 @@ const createSchema: InStatement[] = [
     status TEXT NOT NULL CHECK (status IN ('collecting','review','completed','cancelled')),
     draft_json TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 1),
+    resume_derived INTEGER NOT NULL DEFAULT 0 CHECK (resume_derived IN (0,1)),
     created_at INTEGER NOT NULL,
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(owner_id, conversation_id)
@@ -109,10 +129,12 @@ export class CareerStore {
   readonly #ownsClient: boolean;
   readonly #url: string;
   readonly #clock: () => number;
+  readonly #piiRevalidator: PiiRevalidator | undefined;
   #ready: Promise<void>;
 
-  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number } = {}) {
+  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number; piiRevalidator?: PiiRevalidator } = {}) {
     this.#clock = options.clock ?? Date.now;
+    this.#piiRevalidator = options.piiRevalidator;
     if (typeof config === 'string') { const safe = validateDirectConnectionConfig({ url: config }); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
     else if ('execute' in config) { this.#url = ''; this.#client = config; this.#ownsClient = false; }
     else { const safe = validateDirectConnectionConfig(config); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
@@ -122,6 +144,15 @@ export class CareerStore {
   async init() {
     prepareLocalDatabaseFile(this.#url);
     await this.#client.batch(createSchema, 'write');
+    // migration for pre-lineage databases: resume-derived provenance column.
+    // Fresh databases already carry it in the CREATE TABLE, so the duplicate-
+    // column error is expected there and swallowed; any other failure surfaces.
+    try {
+      await this.#client.execute({ sql: 'ALTER TABLE career_onboarding ADD COLUMN resume_derived INTEGER NOT NULL DEFAULT 0' });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/duplicate column/i.test(message)) throw error;
+    }
     if (this.#url.startsWith('file:/')) { const filename = fileURLToPath(this.#url); if (existsSync(filename)) chmodSync(filename, 0o600); }
   }
   async ready() { await this.#ready; }
@@ -195,7 +226,17 @@ export class CareerStore {
     await this.#ready; const existing = await this.loadOnboarding(input.ownerId, input.conversationId);
     if (existing && ['collecting', 'review'].includes(existing.status) && !input.restart) return existing;
     const now = this.#clock();
-    await this.#client.execute({ sql: `INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,created_at,updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(owner_id, conversation_id) DO UPDATE SET status='collecting', draft_json='{}', version=career_onboarding.version+1, updated_at=excluded.updated_at`, args: [input.ownerId, input.conversationId, 'collecting', '{}', 1, now, now] });
+    await this.#client.execute({ sql: `INSERT INTO career_onboarding (owner_id,conversation_id,status,draft_json,version,resume_derived,created_at,updated_at) VALUES (?,?,?,?,?,0,?,?) ON CONFLICT(owner_id, conversation_id) DO UPDATE SET status='collecting', draft_json='{}', resume_derived=0, version=career_onboarding.version+1, updated_at=excluded.updated_at`, args: [input.ownerId, input.conversationId, 'collecting', '{}', 1, now, now] });
+    return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
+  }
+
+  /** Persist resume-derived provenance on the onboarding row (D6): once set,
+   * every subsequent draft/profile write for this flow re-runs local redaction
+   * at the write boundary — including ordinary review edits and confirmation. */
+  async markOnboardingResumeDerived(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
+    await this.#ready;
+    const updated = await this.#client.execute({ sql: "UPDATE career_onboarding SET resume_derived=1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN ('collecting','review')", args: [this.#clock(), input.ownerId, input.conversationId, input.expectedVersion] });
+    if (updated.rowsAffected !== 1) throw new Error('Onboarding draft version is stale.');
     return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
   async saveOnboardingDraft(input: { ownerId: string; conversationId: string; expectedVersion: number; draft: OnboardingDraft; status?: Extract<OnboardingStatus, 'collecting' | 'review'> }) {
@@ -204,6 +245,9 @@ export class CareerStore {
     assertSafeOnboardingDraft(input.draft);
     const draft = OnboardingDraftSchema.parse({ ...current.draft, ...input.draft });
     assertSafeOnboardingDraft(draft);
+    // D6: lineage is durable state, not a caller flag — once a flow is
+    // resume-derived, every write (incl. ordinary review edits) revalidates
+    if (current.resumeDerived) await revalidateResumeDerived(this.#piiRevalidator, { kind: 'document', value: draft });
     const status = input.status ?? 'collecting';
     if (status === 'review' && onboardingMissingFields(draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
     const updated = await this.#client.execute({ sql: 'UPDATE career_onboarding SET status=?, draft_json=?, version=version+1, updated_at=? WHERE owner_id=? AND conversation_id=? AND version=? AND status IN (\'collecting\',\'review\')', args: [status, JSON.stringify(draft), this.#clock(), input.ownerId, input.conversationId, input.expectedVersion] });
@@ -225,6 +269,9 @@ export class CareerStore {
       if (!current || current.version !== input.expectedVersion || current.status !== 'review') throw new Error('Onboarding draft version is stale.');
       if (onboardingMissingFields(current.draft).length > 0) throw new Error('Onboarding draft is missing required fields.');
       const content = buildOnboardingProfileText(current.draft); assertSafeProfileContent(content);
+      // D6: lineage is durable state — a resume-derived flow's confirmation
+      // revalidates even when the draft was edited through ordinary turns
+      if (current.resumeDerived) await revalidateResumeDerived(this.#piiRevalidator, { kind: 'document', value: content });
       // D6: the draft row is deleted inside the same transaction that activates
       // the profile document, so loadOnboarding returns null afterwards and the
       // next /onboarding starts clean. The version/status guard runs first.

@@ -7,10 +7,12 @@ export type TelegramRequest = {
   isEdited?: boolean; isBot?: boolean; requestId?: string; updateId?: number; messageId?: number;
 };
 type TelegramUser = { id: number; is_bot?: boolean };
+export type TelegramDocument = { file_id: string; file_unique_id: string; file_name?: string; mime_type?: string; file_size?: number };
 type TelegramMessage = {
   message_id: number; date: number; chat: { id: number; type: string }; from?: TelegramUser; text?: string;
   edit_date?: number; forward_origin?: unknown; forward_from?: unknown; forward_from_chat?: unknown;
   forward_date?: number; via_bot?: unknown; sender_chat?: unknown;
+  document?: TelegramDocument; caption?: string;
 };
 export type TelegramUpdate = {
   update_id: number; message?: TelegramMessage; edited_message?: TelegramMessage;
@@ -20,6 +22,16 @@ export type TelegramAuditWriter = { append(entry: Record<string, unknown>): Prom
 
 function isSafeNonNegativeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && (value as number) >= 0;
+}
+
+function isSafeDocument(value: unknown): value is TelegramDocument {
+  if (!value || typeof value !== 'object') return false;
+  const document = value as Record<string, unknown>;
+  return typeof document.file_id === 'string' && document.file_id.length > 0 && document.file_id.length <= 1024
+    && typeof document.file_unique_id === 'string' && document.file_unique_id.length > 0 && document.file_unique_id.length <= 1024
+    && (document.file_name === undefined || (typeof document.file_name === 'string' && document.file_name.length <= 1024))
+    && (document.mime_type === undefined || (typeof document.mime_type === 'string' && document.mime_type.length <= 200))
+    && (document.file_size === undefined || isSafeNonNegativeInteger(document.file_size));
 }
 
 /** Complete raw-envelope validation shared by every public Telegram intake path. */
@@ -44,7 +56,9 @@ export function assertRawTelegramUpdate(value: unknown): asserts value is Telegr
       || !isSafeNonNegativeInteger((from as Record<string, unknown>).id) || (from as Record<string, unknown>).id === 0
       || ((from as Record<string, unknown>).is_bot !== undefined && typeof (from as Record<string, unknown>).is_bot !== 'boolean')))
     || (row.text !== undefined && (typeof row.text !== 'string' || row.text.length > 4096
-      || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(row.text)))) {
+      || /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(row.text)))
+    || (row.document !== undefined && !isSafeDocument(row.document))
+    || (row.caption !== undefined && (typeof row.caption !== 'string' || row.caption.length > 1024))) {
     throw new Error('Invalid Telegram update.');
   }
 }
@@ -237,6 +251,25 @@ export function parseIntakeCommand(text: string | undefined): IntakeIntent | nul
   if (save) return { kind: 'save_job', url: save[1] };
   if (text && /^\/job(?:[ \t]+\S+)?$/.test(text)) return { kind: 'parked_job' };
   return null;
+}
+
+export const RESUME_MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Bounded PDF document-envelope authorization (spec rule 1–3): runs before any
+ * getFile/download. Accepts only Telegram document messages that declare PDF
+ * MIME type (`application/pdf`) AND a `.pdf` filename AND fit the download
+ * cap; anything else — including missing MIME/name fields — is rejected here.
+ * The `%PDF-` signature is verified on the downloaded bytes, not the envelope.
+ */
+export function authorizeResumeDocument(message: { document?: TelegramDocument; caption?: string }): { accepted: true; document: TelegramDocument } | { accepted: false; reason: 'not_a_document' | 'unsupported_mime' | 'unsupported_extension' | 'oversized' | 'caption_unsupported' } {
+  if (!message.document) return { accepted: false, reason: 'not_a_document' };
+  if (message.caption !== undefined) return { accepted: false, reason: 'caption_unsupported' };
+  const { document } = message;
+  if (document.mime_type !== 'application/pdf') return { accepted: false, reason: 'unsupported_mime' };
+  if (!document.file_name || !document.file_name.toLowerCase().endsWith('.pdf')) return { accepted: false, reason: 'unsupported_extension' };
+  if (document.file_size !== undefined && document.file_size > RESUME_MAX_DOWNLOAD_BYTES) return { accepted: false, reason: 'oversized' };
+  return { accepted: true, document };
 }
 export function deriveTelegramRequest(update: TelegramUpdate, options: { seenUpdateIds?: ReadonlySet<number> } = {}): TelegramRequest {
   const message = update.message ?? update.edited_message ?? update.channel_post ?? update.edited_channel_post;

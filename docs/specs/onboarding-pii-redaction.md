@@ -1,35 +1,34 @@
 # Onboarding PII Redaction and Layered Mastra Processor
 
-**Status:** Guided onboarding V1 implemented; resume ingestion follows the package benchmark
+**Status:** Guided onboarding V1 implemented; bounded resume/PDF ingestion integrated (tickets 05–08, [career-copilot #18](https://github.com/KripaMishra/career-copilot/issues/18))
 **Priority:** P0
 **Onboarding issue:** [career-copilot #10](https://github.com/KripaMishra/career-copilot/issues/10)
-**Package issue:** [mastra-pii #1](https://github.com/KripaMishra/mastra-pii/issues/1)
+**Package issue:** [mastra-pii #1](https://github.com/KripaMishra/mastra-pii/issues/1) (closed; consumed prerelease `@kripamishra/mastra-pii@0.2.0-alpha.5`)
 **Target app branch:** `feat/onboarding-v0`
 **Target app worktree:** `/home/kripa/Personal/projects/mastra-demo`
 **Package repository:** [KripaMishra/mastra-pii](https://github.com/KripaMishra/mastra-pii)
 **Local package checkout:** `/home/kripa/Personal/projects/mastra-pii`
-**Provisional npm package:** `@kripamishra/mastra-pii` (confirm npm scope before publishing)
+**npm package:** `@kripamishra/mastra-pii` (`0.2.0-alpha.5` reviewed and pinned)
 
 ## Objective
 
 Deliver two independently schedulable features:
 
 1. a guided Career Copilot `/onboarding` flow that collects structured career context without resume ingestion and can ship now;
-2. a reusable TypeScript package that extends Mastra PII processing with three independently configurable layers, then enables a later resume text/PDF ingestion phase.
+2. a reusable TypeScript package that extends Mastra PII processing, then enables a later resume text/PDF ingestion phase.
 
-The package benchmark is not a blocker for guided onboarding. Plain structured career text, including text headed “Resume,” is accepted after direct-identifier checks. Resume file/upload ingestion remains disabled until the reviewed local deterministic + NER layers can run before document content reaches the ordinary agent, memory, traces, or Turso profile storage.
+The package benchmark is not a blocker for guided onboarding. Plain structured career text, including text headed "Resume," is accepted after direct-identifier checks. Resume file/upload ingestion remains disabled until the reviewed local engine can run before document content reaches the ordinary agent, memory, traces, or Turso profile storage.
 
-The three package layers are:
+The shipped package is an adapter with two analyzers behind one interface:
 
-1. **deterministic:** OpenRedaction patterns, context checks, and validators;
-2. **NER:** a local ONNX PII token-classification model executed by Transformers.js;
-3. **model:** Mastra's existing `PIIDetector` using a caller-supplied Mastra model.
+1. **local deterministic engine:** a zero-dependency regex/checksum engine (default — no network, ~2 ms);
+2. **remote Presidio adapter:** a deployed Presidio container (spaCy NER + configurable Indian ad_hoc recognizers) that Career Copilot does **not** use.
 
-Presidio and Python are not part of this design.
+The original layered vision (OpenRedaction lite + Transformers.js ONNX NER + a Mastra model layer) was **not shipped**; those tracks moved to the package repository (see [Historical note](#historical-note)). Presidio mode stays off in Career Copilot: zero network egress for user PII.
 
 ## Why this shape
 
-Mastra already defines the processor lifecycle and provides model-backed PII detection. OpenRedaction supplies the mature TypeScript rule layer. Transformers.js supplies local NER without a service boundary. One package should compose them rather than reimplementing either dependency or creating an agent framework.
+Mastra already defines the processor lifecycle. The package composes the local deterministic engine (and optionally a remote Presidio analyzer) behind one interface instead of reimplementing either dependency or creating an agent framework.
 
 The package must work like any Mastra processor:
 
@@ -38,40 +37,29 @@ import { Agent } from '@mastra/core/agent';
 import { createLayeredPii } from '@kripamishra/mastra-pii';
 
 const pii = createLayeredPii({
-  strategy: 'redact',
-  layers: {
-    deterministic: { enabled: true, preset: 'gdpr' },
-    ner: {
-      enabled: true,
-      model: '/models/pii-ner',
-      allowRemoteModels: false,
-      threshold: 0.8,
-    },
-    model: {
-      enabled: true,
-      model: 'provider/model-id',
-      threshold: 0.6,
-    },
-  },
+  patterns: /* custom regex patterns from config */,
+  anonymize: { format: 'type' }, // [PAN_1]-style placeholders; no reversible map
+  // presidio deliberately absent: zero network egress for user PII
 });
 
 export const agent = new Agent({
   id: 'private-agent',
   name: 'Private Agent',
   model: 'provider/model-id',
-  inputProcessors: [pii.processor],
+  inputProcessors: [pii.processor],  // user input + every prompt
+  outputProcessors: [pii.processor], // assistant output
 });
 ```
 
-The same package must expose a local pre-agent API:
+The same package exposes a local pre-agent API:
 
 ```ts
-const result = await pii.redactText(rawResumeText, {
-  layers: ['deterministic', 'ner'],
-});
+const safe = await pii.redactText(rawResumeText); // → Promise<string>
+const safeDocument = await pii.redactDocument(structuredCandidate); // bounded plain JSON
+await pii.warmup(); // readiness; no-op for the local engine
 ```
 
-Career Copilot uses `redactText()` before calling `agent.generate()`. The model layer is defense-in-depth inside the Mastra processor; raw resumes must never depend on it because the installed Mastra `PIIDetector` allows content through when its internal detection model fails.
+Career Copilot uses `redactText()` before calling `agent.generate()`. The processor is defense-in-depth inside the Mastra loop; raw resumes must never depend on it. The local engine is regex/checksum-only: emails, PANs, Aadhaars, phones, cards, UPI, IFSC, tokens, and similar structured identifiers are caught, but **names/addresses are NER-only** (Presidio) and obfuscated formats (leet speak, spaced PANs, `[at]` emails) defeat every engine. Resume ingestion therefore redacts what the engine catches; person names/addresses in structured onboarding fields remain owner-confirmed via the existing review flow — no NER-equivalent recall is promised or tested.
 
 ## Non-goals
 
@@ -83,235 +71,135 @@ Career Copilot uses `redactText()` before calling `agent.generate()`. The model 
 - Claiming regulatory compliance based on one library or model.
 - Supporting OCR, scanned PDFs, DOCX, images, or arbitrary file URLs in V1.
 - Applying onboarding redaction indiscriminately to every normal conversation.
+- Local NER/model layers or the Mastra model layer: package-repo scope (Track A / Track C).
 
 ## Security invariants
 
 1. Authorization completes before text or files are downloaded, parsed, or inspected.
 2. Raw resume bytes and text remain process-memory-only and are discarded after redaction.
 3. Raw resume content never reaches the main agent, Mastra memory, working memory, traces, logs, metrics, errors, Turso, or reports.
-4. Deterministic and NER layer failures block onboarding ingestion by default.
-5. No layer logs or returns original values, OpenRedaction `original`, `redactionMap`, or detection `value` fields.
-6. Redaction is irreversible in V1. Use typed placeholders such as `<PERSON_1>`; do not hash direct identifiers.
-7. NER model files are pinned by revision and checksum. Production does not download models at request time.
+4. Local engine failures block resume ingestion by default (fail-closed; `fallback: 'strict'` semantics on the engine side).
+5. No layer logs or returns original values or reversible maps; public output contains only redacted text or the generic `[REDACTION_FAILED]` marker.
+6. Redaction is irreversible in V1. Use typed placeholders such as `[PAN_1]`; do not hash direct identifiers.
+7. The local engine is regex/checksum-only and requires no model files and no downloads; the remote Presidio adapter (spaCy NER) is never enabled in Career Copilot.
 8. PDF parsing is bounded by type, signature, byte size, page count, extracted character count, and timeout.
 9. Only confirmed, redacted onboarding context becomes an active profile document.
 10. Tests use synthetic canaries only.
 
 ## Package architecture
 
-Create a dedicated public repository with this minimal layout:
+The published package (`@kripamishra/mastra-pii`) is an adapter with two analyzers behind one interface:
 
 ```text
 mastra-pii/
 ├── src/
-│   ├── config.ts
-│   ├── deterministic.ts
-│   ├── ner.ts
-│   ├── merge.ts
-│   ├── redact.ts
-│   ├── processor.ts
-│   └── index.ts
-├── test/
-│   ├── deterministic.test.ts
-│   ├── ner.test.ts
-│   ├── merge.test.ts
-│   ├── processor.test.ts
-│   └── privacy-canary.test.ts
-├── fixtures/
-│   └── synthetic-resumes.json
-├── package.json
-├── tsconfig.json
-├── README.md
-├── LICENSE
-└── .github/workflows/release.yml
+│   ├── analyzer.ts          # Analyzer interface, local adapter, Presidio adapter, INDIAN_DEFAULTS
+│   ├── custom-pattern-worker.js  # terminable worker for bounded custom-regex execution
+│   ├── index.ts             # createLayeredPii, redactText/redactDocument/warmup/processor
+│   └── ...
+├── deploy/                  # Presidio container recipe (not used by Career Copilot)
+├── docs/evaluation/         # engine benchmark harnesses and corpora
+└── package.json
 ```
 
-Do not add a workspace, server, CLI, database, telemetry system, plugin registry, or provider abstraction in V1.
+Career Copilot consumes the published package as-is (Track B). No workspace, server, CLI, database, telemetry system, plugin registry, or provider abstraction is added in V1.
 
-### Public API
+### Public API (shipped)
+
+Verified against the published `dist/index.d.ts` of `0.2.0-alpha.5`:
 
 ```ts
-import type { PIIDetectorOptions } from '@mastra/core/processors';
+import type { Processor } from '@mastra/core/processors';
 
-type LayerName = 'deterministic' | 'ner' | 'model';
+/** Stable entity names emitted by placeholders. */
+type PiiEntity =
+  | 'address' | 'bank-account' | 'credit-card' | 'custom' | 'date-of-birth'
+  | 'email' | 'ip-address' | 'name' | 'passport' | 'phone' | 'ssn' | 'token'
+  | 'uuid' | 'medical-id' | 'aadhaar' | 'pan' | 'upi' | 'ifsc' | 'voter-id'
+  | 'driving-license' | 'vehicle';
 
-export type PiiEntityType =
-  | 'person'
-  | 'email'
-  | 'phone'
-  | 'address'
-  | 'date-of-birth'
-  | 'government-id'
-  | 'financial-id'
-  | 'account-id'
-  | 'credential'
-  | 'ip-address'
-  | 'uuid'
-  | 'personal-url'
-  | 'other';
+/** Alpha exposes one deterministic local layer; 'ner'/'model' throw LayerUnavailableError. */
+type PiiLayer = 'deterministic' | 'ner' | 'model';
 
-type ModelLayerOptions = Omit<
-  PIIDetectorOptions,
-  'strategy' | 'includeDetections' | 'lastMessageOnly'
->;
+type PiiPattern = {
+  regex: RegExp;
+  entity?: PiiEntity;
+  priority?: number;
+} & ({ name: string; type?: never } | { type: string; name?: never });
 
 type LayeredPiiConfig = {
-  strategy?: 'redact' | 'block';
-  lastMessageOnly?: boolean;
-  maxInputChars?: number;
-  layers: {
-    deterministic?: false | {
-      enabled: true;
-      preset?: 'gdpr' | 'hipaa' | 'ccpa';
-      confidenceThreshold?: number;
-      patterns?: string[];
-      whitelist?: string[];
-    };
-    ner?: false | {
-      enabled: true;
-      model: string;
-      revision?: string;
-      localModelPath?: string;
-      allowRemoteModels?: boolean;
-      threshold: number;
-      entityMap?: Record<string, PiiEntityType>;
-    };
-    model?: false | {
-      enabled: true;
-      options: ModelLayerOptions;
-    };
-  };
+  id?: string;
+  entities?: readonly PiiEntity[];        // restrict the emitted entity set
+  patterns?: readonly PiiPattern[];        // custom deterministic patterns
+  customPatterns?: readonly PiiPattern[];  // alias
+  layers?: readonly PiiLayer[];            // 'deterministic' only
+  analyzer?: Analyzer;                     // custom analyzer (mutually exclusive with presidio)
+  presidio?: PresidioAdapterConfig;        // remote Presidio container (NOT used by Career Copilot)
+  fallback?: 'local' | 'strict';           // analyzer outage: degrade to local, or fail closed
+  cacheSize?: number;                      // per-text LRU (0 disables; default 256)
+  anonymize?: { format?: 'type' | 'uniform'; uniformToken?: string };
 };
 
-type SafeDetection = {
-  type: PiiEntityType;
-  start: number;
-  end: number;
-  score: number;
-  source: 'deterministic' | 'ner';
-};
-
-type SafeRedactionResult = {
-  text: string;
-  detections: SafeDetection[];
-  counts: Partial<Record<PiiEntityType, number>>;
-  layersApplied: LayerName[];
-};
+type PiiProcessor = Processor<string> & Required<Pick<Processor<string>, 'processInput' | 'processLLMRequest' | 'processOutputResult'>>;
 
 type LayeredPii = {
-  processor: Processor;
-  redactText(text: string, options?: { layers?: Array<'deterministic' | 'ner'> }): Promise<SafeRedactionResult>;
-  warmup(): Promise<void>;
+  id: string;
+  warmup(): Promise<void>;                                       // readiness; no-op for local
+  redactText(text: string, options?: { layers?: readonly PiiLayer[] }): Promise<string>;
+  redactDocument(value: unknown): Promise<unknown>;              // bounded plain objects/arrays
+  processor: PiiProcessor;                                       // inputProcessors/outputProcessors
 };
 
-export function createLayeredPii(config: LayeredPiiConfig): LayeredPii;
+function createLayeredPii(config?: LayeredPiiConfig): LayeredPii;
+
+class LayerUnavailableError extends TypeError { readonly code: 'PII_LAYER_UNAVAILABLE'; }
 ```
 
-`redactText()` intentionally excludes the Mastra model layer. It is the fail-closed local trust-boundary API. The returned detections contain spans and categories but never matched values or reversible placeholders.
+Notes on the shipped surface:
 
-### Deterministic layer
+- `redactText()` returns the redacted **string only** — there is no detections/counts map.
+- `redactDocument()` redacts bounded plain objects and arrays (zod-validated JSON is within its contract); it throws on class instances, sparse arrays, and symbol keys.
+- `anonymize: { format: 'type' }` emits `[ENTITY_n]` placeholders, numbered in first-occurrence order, stable within one result; `format: 'uniform'` emits a fixed token.
+- Requesting `layers: ['ner' | 'model']` throws `LayerUnavailableError` (`PII_LAYER_UNAVAILABLE`) — the package documents this as its behavior for the layers it does not ship.
+- Custom patterns have a `name` (or dependency-compatible `type`), `RegExp`, optional `entity`, and optional non-negative `priority`; they run against strings in terminable local workers with time-bounded execution (timeout or worker failure returns `[REDACTION_FAILED]`).
+- Fail-closed by default: analyzer outage degrades to the local engine, or to `[REDACTION_FAILED]` under `fallback: 'strict'`. Detector values and raw matches never leave the package.
 
-Use `LiteOpenRedaction` from `@openredaction/core/lite` so OpenRedaction's optional NER, audit, learning, metrics, RBAC, and document features are not silently activated.
+### Local deterministic engine
 
-Required settings:
+The default engine is a pure regex/checksum implementation (~2 ms, no network, zero dependencies):
 
-- cache disabled;
-- debug disabled;
-- audit disabled;
-- placeholder mode;
-- bounded `maxInputSize` and `regexTimeout`;
-- only explicitly configured categories/patterns;
-- no restore API exposed.
+- built-in Indian recognizers (`INDIAN_DEFAULTS`): Aadhaar + Verhoeff checksum, PAN, UPI, IFSC, voter ID, card, phone, email, IP, bank account, DOB, vehicle, DL, passport, expiry, CVV, secrets;
+- custom `patterns` run in bounded worker processes with a 250 ms base + 1 ms/KB budget;
+- `entities` can restrict the emitted entity set.
 
-OpenRedaction returns `original`, `redactionMap`, and raw detection values. Consume the result inside one function, convert detections immediately to `SafeDetection`, and release every raw field. Never pass the dependency result to logs, traces, callers, snapshots, or thrown errors.
-
-### NER layer
-
-Use `@huggingface/transformers` with a token-classification ONNX model. The implementation must:
-
-- accept a configurable model and revision;
-- support a local model directory;
-- set `env.allowRemoteModels = false` in production;
-- support explicit local WASM paths where required;
-- initialize once and share the pipeline;
-- provide `warmup()` for startup readiness;
-- apply a configurable threshold;
-- map BIO/model labels into the package entity taxonomy;
-- combine subword tokens and preserve UTF-16 JavaScript string offsets;
-- chunk long text with overlap and deduplicate boundary detections;
-- throw a safe error on unavailable model, malformed output, or timeout.
-
-Do not select a permanent default model in code until candidates pass the frozen synthetic resume benchmark. Start by benchmarking ONNX token-classification candidates explicitly documented for Transformers.js, including `onnx-community/bert-small-pii-detection-ONNX`. Record model license, revision, model size, labels, precision/recall, cold start, latency, and memory before selection.
+**Limitations (carried into docs):** emails/PANs/passports/Aadhaars/phones/cards/UPI/IFSC/tokens are caught, but **names/addresses are NER-only** (Presidio) and obfuscated formats (leet speak, spaced PANs, `[at]` emails) defeat every engine. Resume ingestion redacts what the engine catches; person names/addresses in the resulting draft remain owner-confirmed via the existing structured review flow — no NER-equivalent recall is promised or tested.
 
 ### Entity policy
 
 V1 redacts direct identity while preserving career evidence.
 
-Redact by default:
+Redact by default (engine-detected): email, phone, Aadhaar, PAN, UPI, IFSC, credit/debit cards, bank accounts, passports, driving licenses, vehicle numbers, voter IDs, IP addresses, UUIDs, tokens/secrets, dates of birth.
 
-- person names;
-- email and phone;
-- street/postal addresses;
-- exact date of birth and age where identifying;
-- government, tax, financial, health, account, and credential identifiers;
-- personal usernames and profile URLs;
-- IP addresses, UUIDs, secrets, and tokens.
-
-Preserve by default:
-
-- employers and organizations;
-- role titles;
-- skills and technologies;
-- industries;
-- education qualifications and institutions;
-- employment date ranges;
-- city/region-level job preferences;
-- compensation and work-authorization facts;
-- accomplishments and portfolio descriptions without direct identifiers.
-
-Map dependency/model labels into `PiiEntityType` before applying policy. Organization, role, skill, institution, and career-date labels are excluded from the default redaction set even when a model detects them. Unknown labels map to `other` and block processing pending an explicit policy decision; do not silently preserve them. The entity map and preserve policy must be explicit and tested.
-
-### Merge and redaction
-
-Run deterministic and NER detection against the same original text. Normalize both into `SafeDetection`, then:
-
-1. reject invalid or out-of-bounds spans;
-2. sort by start, longer span, source priority, then score;
-3. resolve overlaps deterministically, preferring validated deterministic findings for structured identifiers and the longer span for contextual entities;
-4. apply replacements once from right to left;
-5. number placeholders by type in first-occurrence order.
-
-Never sequentially mutate text before all local spans are collected; doing so invalidates offsets.
-
-### Mastra model layer
-
-The package processor applies the local redacted messages first, then delegates to Mastra `PIIDetector` when the model layer is enabled. Accept `ModelLayerOptions` as installed `PIIDetectorOptions` minus `strategy`, `includeDetections`, and `lastMessageOnly`: the wrapper owns strategy/message selection and always forces detection-detail logging off. Delegate without copying Mastra prompts or schemas. Career Copilot must configure placeholder redaction; generic consumers retain Mastra's other redaction methods through `options`.
-
-Document this limitation prominently: the installed Mastra implementation catches detection-model errors and permits content. Therefore:
-
-- model-only configuration is allowed for general consumers but is not approved for Career Copilot resume ingestion;
-- Career Copilot requires deterministic and NER layers at the pre-agent boundary;
-- model-layer success must not be reported as proof that local layers ran.
+Preserve by default: employers and organizations, role titles, skills and technologies, industries, education qualifications and institutions, employment date ranges, city/region-level job preferences, compensation and work-authorization facts, accomplishments and portfolio descriptions without direct identifiers. Person names and street/postal addresses are **not** engine-detected (NER-only) and are preserved as-is by the local engine; onboarding keeps them out via the direct-identifier guard and the owner-confirmed review flow.
 
 ### Message transformation
 
-`processor.processInput()` must:
+`pii.processor` implements `processInput`, `processLLMRequest`, and `processOutputResult`:
 
-- preserve message IDs, roles, timestamps, metadata, and non-text parts;
-- transform text parts only;
-- process only the newest checked message when `lastMessageOnly` is true;
-- avoid rewriting prior already-sanitized history;
-- abort with a generic reason under `strategy: 'block'`;
-- never place raw detections in processor state or tracing metadata.
+- `processInput` redacts the initial Mastra input (messages + untagged system messages) and fails the containing message closed on malformed/unsupported structured data (`[REDACTION_FAILED]`);
+- `processLLMRequest` redacts the final model prompt before every LLM call, including tool continuations;
+- `processOutputResult` redacts the assistant output message;
+- tool arguments/results/errors/raw input/approval/title fields are redacted recursively; provider-generated structural identifiers (tool call ids, tool names, approval ids) are copied verbatim; only in-memory `Uint8Array`/`ArrayBuffer` media is copied as opaque binary data, while string/base64/URL/data-URL textual media is replaced with the fail-closed marker;
+- object keys are preserved verbatim; no raw detections ever enter processor state or tracing metadata.
 
 ## Package dependencies and publishing
 
-Provisional `package.json` policy:
+Shipped `package.json` policy (verified from the published tarball):
 
 ```json
 {
   "name": "@kripamishra/mastra-pii",
-  "version": "0.1.0",
+  "version": "0.2.0-alpha.5",
   "type": "module",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -321,19 +209,18 @@ Provisional `package.json` policy:
     }
   },
   "files": ["dist", "README.md", "LICENSE"],
-  "engines": { "node": ">=22" },
-  "dependencies": {
-    "@huggingface/transformers": "4.2.0",
-    "@openredaction/core": "1.1.5"
-  },
+  "engines": { "node": ">=22.13.0" },
+  "dependencies": {},
   "peerDependencies": {
-    "@mastra/core": "^1.52.1"
+    "@mastra/core": ">=1.57.0 <2"
   },
   "publishConfig": {
     "access": "public"
   }
 }
 ```
+
+Career Copilot pins `@kripamishra/mastra-pii@0.2.0-alpha.5` (exact — npm `latest` is a stale alpha.3) and `@mastra/core@1.59.0` (exact, inside the package's tested matrix).
 
 Publishing requirements:
 
@@ -350,7 +237,11 @@ Publishing requirements:
 11. release only from protected `v*` tags after a human approval environment;
 12. SemVer and a documented Mastra compatibility table.
 
-These dependency versions reflect the researched releases and must be re-verified immediately before implementation; upgrades require the same benchmark and privacy gates. Do not bundle an NER model in the npm tarball. Publish a model manifest with pinned Hugging Face repository, revision, file checksums, license, and expected labels. Production deployment fetches and verifies the model during image/build provisioning, not during a user request.
+Do not bundle an NER model in the npm tarball; the shipped package ships no model at all. Stable `0.1.0` publishing is Track C (package repository).
+
+## Historical note
+
+The original spec proposed a layered API (`createLayeredPii({ layers: { deterministic, ner, model } })`, OpenRedaction lite adapter, Transformers.js ONNX NER, model manifest, `@openredaction/core`/`@huggingface/transformers` deps). That vision was **not shipped**. The package pivoted to the adapter shape documented above; the deterministic + local NER benchmark track and the Mastra model-layer track moved to the package repository (mastra-pii eval-benchmark #24/#27, Track C). Career Copilot consumes the package as published; the spec sections above describe the shipped surface.
 
 ## Career Copilot onboarding architecture
 
@@ -366,9 +257,12 @@ flowchart LR
     Review --> Confirm[Explicit confirmation]
     Confirm --> Profile[(career_profile_documents\nnew active version)]
 
-    Resume[Future resume text/PDF] -. disabled until benchmarked .-> Extract[Bounded in-memory extraction]
-    Extract -. future integration .-> PII[mastra-pii redactText\ndeterministic + local NER]
-    PII -. sanitized text only .-> Runtime
+    Resume[Resume text/PDF] --> Auth2[Envelope auth: PDF MIME\n.pdf name, 5 MiB cap]
+    Auth2 --> Download[Bounded download\ninjectable boundary]
+    Download --> Extract[Bounded in-memory extraction\n50 pages / 200k chars / 10 s]
+    Extract --> PII[mastra-pii redactText\nlocal deterministic engine]
+    PII -. sanitized text + page count only .-> Runtime
+    PII -. byte-for-byte revalidation .-> Profile[(career_profile_documents\nand onboarding drafts)]
 ```
 
 ```mermaid
@@ -452,7 +346,7 @@ Add narrow `CareerStore` methods rather than a generic repository abstraction.
 
 The composition root injects a dedicated responder around the existing agent/model. The runtime supplies only current structured draft JSON, allowed field definitions, missing fields, state, and the current text. The responder schema contains exactly `reply`, `draftPatch`, and `readyForReview`; it has no tools or confirmation, authorization, activation, owner, chat, user, or memory fields.
 
-The runtime owns authorization and activation. Initial guided onboarding persists only strictly validated structured career fields from plain text and does not accept resume files/uploads. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun deterministic + NER `redactText()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
+The runtime owns authorization and activation. Initial guided onboarding persists only strictly validated structured career fields from plain text and does not accept resume files/uploads. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun local-engine `redactText()`/`redactDocument()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
 
 After completion, profile context must be available immediately. Do not depend on the unused startup `profileText` snapshot. The save path reads current owner-scoped profile text at request time.
 
@@ -493,44 +387,43 @@ Document that Telegram retains uploaded files outside this application's control
 
 ## Career Copilot file map
 
-Expected files for later resume/PII integration:
+Files for the resume/PII integration (shipped, tickets 05–08):
 
 ```text
-package.json                         consume package prerelease; add PDF parser
-.env.example                        local NER model path/revision and limits
-src/config/runtime.ts               validate PII readiness and ingestion limits
-src/channels/telegram-auth.ts       authorize bounded PDF document envelopes
-src/channels/telegram-transport.ts  injectable authenticated file download
-src/services/career-runtime.ts      pre-agent resume redaction
-src/mastra/index.ts                 register/configure package processor
+package.json                         pins @mastra/core 1.59.0; consumes @kripamishra/mastra-pii 0.2.0-alpha.5 exact; unpdf 1.8.1 exact
+.env.example                        PII_* entries (enabled, patterns, limits, readiness); no secrets
+src/config/runtime.ts               validates PII readiness and ingestion limits; invalid config fails startup
+src/services/pii.ts                 LayeredPii singleton: local engine, warmup, fail-closed redactText/redactDocument
+src/services/career-runtime.ts      pre-agent redactText() trust boundary; bounded resume ingestion; readiness gate
+src/channels/telegram-auth.ts       authorize bounded PDF document envelopes before getFile
+src/channels/telegram-transport.ts  injectable authenticated file download (5 MiB cap); test fake
+src/integrations/pdf-text.ts        pinned unpdf parser: 50 pages / 200k chars / 10 s caps; safe rejection paths
+src/storage/career-store.ts         resume-derived write revalidation (byte-for-byte equality) via piiRevalidator
+src/agents/agent.ts                 processor wired on inputProcessors/outputProcessors (defense-in-depth)
+src/mastra/index.ts                 register/configure package processor, PiiService, downloader
 src/observability.ts                preserve no-input/no-output trace policy
+eval/                               S19 resume scenarios, resume canaries, document plans, memory/trace sinks
 ```
 
-Create additional focused files only where they remove real coupling, for example `src/services/onboarding.ts` and `src/integrations/pdf-text.ts`. Do not turn the change into a general workflow framework.
+Create additional focused files only where they remove real coupling, for example `src/services/pii.ts` and `src/integrations/pdf-text.ts`. Do not turn the change into a general workflow framework.
 
 ## Implementation sequence
 
-### Track A — Package deterministic + local NER benchmark
+### Track A — Package deterministic + local NER benchmark — PACKAGE-REPO SCOPE (moved)
 
-- Implement config validation, safe result types, OpenRedaction lite adapter, local NER, span normalization, merge/redaction, and Mastra processor transformation in `KripaMishra/mastra-pii`.
-- Build the frozen synthetic resume corpus and benchmark at least two Transformers.js-compatible ONNX PII models.
-- Select and pin one model only after per-entity release gates pass.
-- Publish a reviewed prerelease with deterministic + NER local layers.
+The deterministic + NER benchmark track moved to the package repository (mastra-pii eval-benchmark #24/#27). The shipped package is the adapter (local deterministic engine + optional remote Presidio) described in [Package architecture](#package-architecture). Local NER/model layers remain package-repo scope.
 
-### Track B — Resume ingestion integration
+### Track B — Resume ingestion integration (DONE — tickets 05–08)
 
-- Consume the reviewed package prerelease in Career Copilot.
-- Add bounded resume text/PDF ingestion and ephemeral metadata handling.
-- Keep resume ingestion disabled unless both local layers warm successfully and pass readiness checks.
-- Revalidate every resume-derived draft/profile candidate before Turso writes.
-- Prove raw canaries never enter agent calls, Mastra memory, Turso, traces, logs, or replies.
+- Consume the reviewed package prerelease in Career Copilot. ✔
+- Add bounded resume text/PDF ingestion and ephemeral metadata handling. ✔
+- Keep resume ingestion disabled unless the local engine warms successfully and passes readiness checks. ✔
+- Revalidate every resume-derived draft/profile candidate before Turso writes. ✔
+- Prove raw canaries never enter agent calls, Mastra memory, Turso, traces, logs, or replies. ✔
 
-### Track C — Mastra model layer
+### Track C — Mastra model layer — PACKAGE-REPO SCOPE (not shipped)
 
-- Wrap the installed `PIIDetector` without copying internals.
-- Verify independent deterministic-only, NER-only, model-only, and layered configurations.
-- Document fail-open behavior of the Mastra model layer.
-- Publish `0.1.0` after compatibility and privacy review.
+The Mastra `PIIDetector` model layer was not shipped. `ner`/`model` layer requests throw `LayerUnavailableError`. Wrapping the installed `PIIDetector`, independent layer configurations, and stable `0.1.0` publishing remain package-repo scope.
 
 ## Worktree handoff
 
@@ -549,23 +442,18 @@ Create a package feature branch/worktree from `main` when package implementation
 
 ## Required tests
 
-### Package
+### Package (package-repo scope)
 
-- each layer enabled independently;
-- all layer combinations;
-- no enabled layers rejected;
 - invalid config rejected before processing;
-- deterministic email, phone, government ID, financial ID, token, and address canaries;
-- NER person/address/date spans, BIO joins, Unicode, multiline, repeated values, and chunk boundaries;
-- deterministic/NER overlap resolution;
+- deterministic email, phone, government ID, financial ID, token, Aadhaar, PAN, UPI, IFSC, and card canaries;
 - placeholder stability within one result and no reversible map;
-- maximum size and regex/model timeout;
-- local-model-only production mode;
-- missing/corrupt model fails closed;
-- text-part-only Mastra message transformation;
-- message metadata preservation;
-- model-layer delegation and documented model failure behavior;
+- custom-pattern worker bounds (timeout / worker failure → `[REDACTION_FAILED]`);
+- maximum size and regex timeout;
+- text-part-only Mastra message transformation and metadata preservation;
+- fail-closed behavior on analyzer outage (`fallback: 'strict'`) and on `ner`/`model` layer requests (`LayerUnavailableError`);
 - assertions that logs/errors/results contain none of the synthetic raw canaries.
+
+NER-specific rows (person/address/date spans, BIO joins, overlap resolution, model-layer delegation) apply to the unshipped NER/model tracks — package-repo scope.
 
 ### Career Copilot guided onboarding
 
@@ -615,26 +503,29 @@ Any high-risk canary leak blocks release.
 
 ## Acceptance criteria
 
-- [ ] One public npm package exposes one Mastra-compatible layered processor and one local `redactText()` API.
-- [ ] Deterministic, NER, and Mastra model layers can each be disabled, enabled alone, or layered.
-- [ ] OpenRedaction is used only for deterministic detection; its raw values and reversible map never escape the adapter.
-- [ ] Local NER makes no inference API call and makes no runtime model download in production.
+- [x] One public npm package exposes one Mastra-compatible processor and one local `redactText()` API (`createLayeredPii` → `redactText`/`redactDocument`/`warmup`/`processor`; consumed at `0.2.0-alpha.5`).
+- [~] Deterministic, NER, and Mastra model layers can each be disabled, enabled alone, or layered. — Shipped package: `deterministic` only; `ner`/`model` requests throw `LayerUnavailableError`. NER/model layering is package-repo scope (Track A/C).
+- [x] The local engine never returns or logs raw matches or reversible maps; redaction is irreversible in V1 (typed `[ENTITY_n]` placeholders, no restore API).
+- [x] The local engine makes no inference API call and makes no runtime model download; the remote Presidio adapter (the only NER path) is never enabled in Career Copilot.
 - [x] Guided `/onboarding` ships independently with plain structured career text enabled and resume file ingestion disabled.
 - [x] Onboarding asks for all required career context, then requires review and runtime-observed explicit confirmation.
 - [x] Active onboarding uses durable structured state plus owner/conversation-scoped Mastra memory.
 - [x] Only confirmed structured context becomes an active Turso profile document.
-- [ ] A later integration enables bounded resume file/PDF ingestion only after deterministic + NER readiness succeeds.
-- [ ] Every resume-derived draft/profile write is revalidated by both local layers.
-- [ ] Synthetic canary tests prove raw PII never reaches the main agent, memory, traces, logs, Turso, reports, or user replies.
-- [ ] Existing Career Copilot behavior and tests remain green.
-- [ ] Package prerelease and application integration are reviewed independently before stable release.
+- [x] Bounded resume file/PDF ingestion is enabled only after local-engine readiness succeeds (config valid + `warmup()`; otherwise fail-closed disabled).
+- [x] Every resume-derived draft/profile write is revalidated by the local engine (`redactDocument` for structured candidates, `redactText` for extracted text); candidates that change under redaction are rejected (byte-for-byte equality required).
+- [x] Synthetic canary tests prove raw PII never reaches the main agent, memory, traces, logs, Turso, reports, or user replies (S19 eval scenarios + unit suite; zero `redactionHits` across every scanned sink).
+- [x] Existing Career Copilot behavior and tests remain green (S01–S18 unchanged; full build/test/eval green).
+- [x] Package prerelease and application integration are reviewed independently before stable release. — Release gate of ticket 09; completed by the independent review of the 05–08 changeset (round 1 FAIL → fixes → round 2 PASS).
 
 ## Primary references
 
 - Mastra processors: https://mastra.ai/docs/agents/processors
-- Mastra PIIDetector: https://mastra.ai/reference/processors/pii-detector
-- OpenRedaction: https://github.com/sam247/openredaction
-- Transformers.js Node inference: https://huggingface.co/docs/transformers.js/en/tutorials/node
-- Transformers.js local models: https://huggingface.co/docs/transformers.js/en/custom_usage
+- Package repository: https://github.com/KripaMishra/mastra-pii (Track A/C: local NER benchmark, Presidio adapter, model layer)
 - npm peer dependencies: https://docs.npmjs.com/cli/v11/configuring-npm/package-json/#peerdependencies
 - npm trusted publishing: https://docs.npmjs.com/trusted-publishers
+
+Historical (unshipped vision, see the historical note): Mastra PIIDetector
+(https://mastra.ai/reference/processors/pii-detector), OpenRedaction
+(https://github.com/sam247/openredaction), Transformers.js
+(https://huggingface.co/docs/transformers.js/en/tutorials/node and
+https://huggingface.co/docs/transformers.js/en/custom_usage).

@@ -1,0 +1,42 @@
+schemaVersion: 1
+id: s19-resume-authorized
+description: "S19b: an authorized resume PDF is extracted in-memory, redacted before the responder, and its raw canaries never reach model calls, memory, onboarding rows, traces, logs, or replies."
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+pii: true
+db:
+  onboarding:
+    - ownerId: career-owner-v0
+      conversationId: "telegram:2001"
+      status: collecting
+      version: 1
+      draft: {}
+documents:
+  - fileId: "resume-file-id-canary"
+    fileUniqueId: "resume-file-unique-id-canary"
+    fileName: "resume-file-name-canary.pdf"
+    mimeType: "application/pdf"
+    fileSize: 2048
+    text: "Engineer. Email resume-owner@example.test, phone 98765 43210, PAN ABCDE1234F, Aadhaar 7316 7253 5875, IFSC SBIN0001234."
+model:
+  responses:
+    - purpose: memory
+      text: "{}"
+    - purpose: onboarding
+      match: "Resume document processed safely: 1 page"
+      object:
+        reply: "Resume received. What is your current role/status?"
+        draftPatch:
+          currentStatus: "Engineer with backend focus."
+        readyForReview: false
+canaries:
+  - { value: "resume-owner@example.test", sinks: [] }
+  - { value: "PAN ABCDE1234F", sinks: [] }
+  - { value: "98765 43210", sinks: [] }
+  - { value: "Aadhaar 7316 7253 5875", sinks: [] }
+  - { value: "SBIN0001234", sinks: [] }
+  - { value: "resume-file-id-canary", sinks: [] }
+  - { value: "resume-file-unique-id-canary", sinks: [] }
+  - { value: "resume-file-name-canary.pdf", sinks: [] }

@@ -74,7 +74,7 @@ export function buildOnboardingProfileText(draft: OnboardingDraft) {
   return ['# Career onboarding profile', ...onboardingFields.filter((field) => parsed[field.key]?.trim()).map((field) => `${field.label}: ${parsed[field.key]}`)].join('\n');
 }
 
-export type OnboardingRecord = { ownerId: string; conversationId: string; status: OnboardingStatus; draft: OnboardingDraft; version: number; createdAt: number; updatedAt: number };
+export type OnboardingRecord = { ownerId: string; conversationId: string; status: OnboardingStatus; draft: OnboardingDraft; version: number; resumeDerived: boolean; createdAt: number; updatedAt: number };
 
 export function onboardingFieldFromLabel(label: string): OnboardingField | null {
   const normalized = label.toLowerCase().replace(/[^a-z]/g, '');

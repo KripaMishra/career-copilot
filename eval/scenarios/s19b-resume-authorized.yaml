@@ -1,0 +1,26 @@
+schemaVersion: 1
+id: s19b-resume-authorized
+description: "S19b: an authorized resume PDF is extracted in-memory and redacted before the responder; raw canaries never reach model calls, memory tables, onboarding rows, traces, logs, or replies."
+kind: contract
+persona: P17
+fixture: s19-resume-authorized
+turns:
+  - { id: t1, channel: telegram, input: { kind: text, text: "/onboarding" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+  - { id: t2, channel: telegram, input: { kind: document, fileId: "resume-file-id-canary" }, actorId: "1001", conversationId: "telegram:2001", expected: accepted }
+assertions:
+  - A-ONBOARDING-STATE
+  - A-TRANSCRIPT-COMPLETE
+  - A-BUDGET
+  - A-CANARY-CONTAINED
+  - A-LOG-ALLOWLIST
+  - A-NO-UNHANDLED-ERROR
+  - A-ISOLATED-FIXTURE
+  - A-TOOLS-EXACT
+  - { id: A-JOB-STATE, path: "documentDownloads", op: count, value: 1 }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].version", op: eq, value: 2 }
+  - { id: A-ONBOARDING-STATE, path: "state.onboarding[0].draft.currentStatus", op: eq, value: "Engineer with backend focus." }
+tools:
+  require: []
+  forbid: [save-job, job-status, job-queue, career-profile]
+  counts: { save-job: 0 }
+limits: { maxTurns: 4, maxWallClockMs: 90000, maxModelCalls: 4 }

@@ -89,6 +89,25 @@ const notificationPlanSchema = z.strictObject({
   deliver: z.enum(['ok', 'fail-first']).default('ok'),
 });
 
+const documentPlanSchema = z.strictObject({
+  fileId: z.string().min(1).max(500),
+  fileUniqueId: z.string().min(1).max(500).optional(),
+  fileName: z.string().min(1).max(1024).default('resume.pdf'),
+  mimeType: z.string().max(200).default('application/pdf'),
+  fileSize: z.number().int().nonnegative().default(0),
+  caption: z.string().max(1024).optional(),
+  /** Text generated into a real text-based PDF (bounded). */
+  text: z.string().max(10_000).optional(),
+  /** Multi-page variant; each entry becomes one page. */
+  pages: z.array(z.string().max(2000)).max(60).optional(),
+  /** Force a download failure for the file id. */
+  downloadFail: z.boolean().default(false),
+  /** Extraction rejects with this reason (engine-level). */
+  extractFail: z.enum(['not_pdf', 'encrypted', 'malformed', 'no_text', 'too_many_pages', 'overlong', 'timeout']).optional(),
+  /** Envelope declares a size above the 5 MiB download cap. */
+  oversized: z.boolean().default(false),
+});
+
 export const modelPurposeSchema = z.enum(['onboarding', 'analysis', 'chat', 'memory']);
 
 const modelUsageSchema = z.strictObject({
@@ -117,7 +136,10 @@ export const canarySinkSchema = z.enum(['all', 'model', 'reply', 'trace', 'log',
 
 const canarySchema = z.strictObject({
   value: z.string().min(1).max(500),
-  sinks: z.array(canarySinkSchema).min(1),
+  // sinks is an ALLOWLIST: an empty array makes the canary source-only —
+  // forbidden in every runtime sink (model, reply, trace, log, database,
+  // report, judge). Used for resume-input canaries the pipeline must never leak.
+  sinks: z.array(canarySinkSchema),
 });
 
 const EMPTY_DB = { onboarding: [], profiles: [], jobs: [], reports: [] } as const;
@@ -133,6 +155,10 @@ export const fixtureSchema = z.strictObject({
   db: dbSchema.default(EMPTY_DB),
   fetch: z.array(fetchPlanSchema).default([]),
   notifications: z.array(notificationPlanSchema).default([]),
+  // resume document download/extraction plan (S19); presence enables the
+  // runtime's PII ingestion wiring for this scenario
+  documents: z.array(documentPlanSchema).default([]),
+  pii: z.boolean().default(false),
   // inert default: a memory no-op is only consumable by memory extraction
   // (serve() never matches it for chat/onboarding/analysis purposes), so a
   // fixture that declares no model plan cannot pollute the scripted queue
@@ -147,6 +173,7 @@ export type ModelPlan = z.infer<typeof modelPlanSchema>;
 export type Canary = z.infer<typeof canarySchema>;
 export type CanarySink = z.infer<typeof canarySinkSchema>;
 export type NotificationPlan = z.infer<typeof notificationPlanSchema>;
+export type DocumentPlan = z.infer<typeof documentPlanSchema>;
 export type JobRow = z.infer<typeof jobRowSchema>;
 
 export const ALL_SINKS: CanarySink[] = ['all', 'model', 'reply', 'trace', 'log', 'database', 'report', 'judge'];
