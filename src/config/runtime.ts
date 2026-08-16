@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { PII_ENTITY_NAMES } from '@kripamishra/mastra-pii';
 
 export type PiiPatternConfig = { name: string; regex: RegExp; entity?: string };
-export type PiiRuntimeConfig = { enabled: boolean; patterns: ReadonlyArray<PiiPatternConfig>; anonymizeFormat: 'type' | 'uniform'; maxInputChars: number; readiness: boolean };
+export type PiiRuntimeConfig = { enabled: boolean; patterns: ReadonlyArray<PiiPatternConfig>; anonymizeFormat: 'type' | 'uniform'; maxInputChars: number; readiness: boolean; presidio?: { url: string } };
 export type RuntimeConfig = { dataDir: string; databaseUrl: string; databaseAuthToken?: string; memoryModel: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> }; pii: PiiRuntimeConfig };
 type Input = { env?: Record<string, string | undefined>; dataDir?: string; databaseUrl?: string; databaseAuthToken?: string; requireDeployment?: boolean; pii?: Partial<PiiRuntimeConfig> };
 function ids(value: string | undefined, name: string, deployment: boolean) {
@@ -59,6 +59,7 @@ const piiConfigSchema = z.object({
   anonymizeFormat: z.enum(['type', 'uniform']).default('type'),
   maxInputChars: z.number().int().min(0).max(1_000_000).default(200_000),
   readiness: z.boolean().default(true),
+  presidio: z.object({ url: z.string().trim().min(1).max(2048) }).strict().optional(),
 }).strict();
 
 function strictBoolean(value: string | undefined, name: string, fallback: boolean): boolean {
@@ -79,12 +80,14 @@ function parsePiiPatterns(value: string | undefined) {
 
 export function resolvePiiConfig(env: Record<string, string | undefined>, override?: Partial<PiiRuntimeConfig>): PiiRuntimeConfig {
   const maxInputChars = env.PII_MAX_INPUT_CHARS?.trim() ? Number(env.PII_MAX_INPUT_CHARS) : undefined;
+  const presidioUrl = env.PII_PRESIDIO_URL?.trim();
   const base = {
     enabled: strictBoolean(env.PII_ENABLED, 'PII_ENABLED', false),
     patterns: parsePiiPatterns(env.PII_PATTERNS),
     anonymizeFormat: env.PII_ANONYMIZE_FORMAT?.trim() as 'type' | 'uniform' | undefined,
     maxInputChars,
     readiness: strictBoolean(env.PII_READINESS, 'PII_READINESS', true),
+    ...(presidioUrl ? { presidio: { url: presidioUrl } } : {}),
   };
   const parsed = piiConfigSchema.safeParse({ ...base, ...override });
   if (!parsed.success) throw new Error(`Invalid PII configuration: ${parsed.error.issues.map((issue) => issue.path.join('.') || 'config').join(', ')}`);
@@ -93,5 +96,5 @@ export function resolvePiiConfig(env: Record<string, string | undefined>, overri
     try { regex = new RegExp(pattern.regex); } catch { throw new Error(`PII pattern "${pattern.name}" has an invalid regular expression.`); }
     return { name: pattern.name, regex, ...(pattern.entity ? { entity: pattern.entity } : {}) };
   });
-  return { enabled: parsed.data.enabled, patterns: compiled, anonymizeFormat: parsed.data.anonymizeFormat, maxInputChars: parsed.data.maxInputChars, readiness: parsed.data.readiness };
+  return { enabled: parsed.data.enabled, patterns: compiled, anonymizeFormat: parsed.data.anonymizeFormat, maxInputChars: parsed.data.maxInputChars, readiness: parsed.data.readiness, ...(parsed.data.presidio ? { presidio: parsed.data.presidio } : {}) };
 }

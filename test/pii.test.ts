@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -37,6 +38,52 @@ test('PII config: disabled by default, PII_* env parses, invalid config fails st
   assert.throws(() => resolveRuntimeConfig({ env: { PII_ENABLED: 'true', PII_PATTERNS: JSON.stringify([{ name: 'x', regex: 'a', entity: 'not-an-entity' }]) } }), /Invalid PII configuration/);
   assert.throws(() => resolveRuntimeConfig({ env: { PII_ENABLED: 'true', PII_PATTERNS: JSON.stringify([{ name: 'x', regex: '(unclosed' }]) } }), /invalid regular expression/);
   assert.throws(() => resolveRuntimeConfig({ env: { PII_MAX_INPUT_CHARS: 'abc' } }), /Invalid PII configuration/);
+});
+
+test('PII config: PII_PRESIDIO_URL is supplied at init when present, omitted otherwise', () => {
+  const withPresidio = resolveRuntimeConfig({ env: { PII_ENABLED: 'true', PII_PRESIDIO_URL: 'http://localhost:3000' } });
+  assert.equal(withPresidio.pii.presidio?.url, 'http://localhost:3000');
+  const withoutPresidio = resolveRuntimeConfig({ env: { PII_ENABLED: 'true' } });
+  assert.equal(withoutPresidio.pii.presidio, undefined);
+  const blank = resolveRuntimeConfig({ env: { PII_PRESIDIO_URL: '   ' } });
+  assert.equal(blank.pii.presidio, undefined);
+});
+
+test('PII service: presidio URL is supplied to the package at init (remote adapter), local engine otherwise', async () => {
+  const hits: string[] = [];
+  const server = createServer((req, res) => {
+    hits.push(req.url ?? '');
+    if (req.url === '/health') { res.writeHead(200, { 'content-type': 'text/plain' }); res.end('ok'); return; }
+    if (req.url === '/analyze') {
+      let body = '';
+      req.on('data', (chunk) => (body += chunk));
+      req.on('end', () => {
+        const { text } = JSON.parse(body);
+        const start = text.indexOf('Kripa Mishra');
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(start >= 0 ? [{ entity_type: 'PERSON', start, end: start + 'Kripa Mishra'.length, score: 0.85 }] : []));
+      });
+      return;
+    }
+    res.writeHead(404); res.end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const remote = createPiiService({ ...piiConfig(), presidio: { url } });
+    await remote.warmup();
+    assert.equal(remote.ready, true);
+    const out = await remote.redactText('My name is Kripa Mishra, email resume-owner@example.test.');
+    assert.ok(!out.includes('Kripa Mishra'), out);
+    assert.ok(out.includes('[NAME'), out);
+    assert.ok(hits.includes('/health') && hits.includes('/analyze'), hits.join(','));
+
+    const local = createPiiService(piiConfig());
+    await local.warmup();
+    assert.equal(await local.redactText('My name is Kripa Mishra.'), 'My name is Kripa Mishra.');
+  } finally {
+    await new Promise<void>((resolve) => server.close(resolve));
+  }
 });
 
 test('PII env booleans are strict: invalid values fail startup instead of coercing', () => {

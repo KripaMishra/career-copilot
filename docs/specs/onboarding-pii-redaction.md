@@ -22,9 +22,9 @@ The package benchmark is not a blocker for guided onboarding. Plain structured c
 The shipped package is an adapter with two analyzers behind one interface:
 
 1. **local deterministic engine:** a zero-dependency regex/checksum engine (default — no network, ~2 ms);
-2. **remote Presidio adapter:** a deployed Presidio container (spaCy NER + configurable Indian ad_hoc recognizers) that Career Copilot does **not** use.
+2. **remote Presidio adapter:** a deployed Presidio container (spaCy NER + configurable Indian ad_hoc recognizers) that Career Copilot uses only when `PII_PRESIDIO_URL` is configured.
 
-The original layered vision (OpenRedaction lite + Transformers.js ONNX NER + a Mastra model layer) was **not shipped**; those tracks moved to the package repository (see [Historical note](#historical-note)). Presidio mode stays off in Career Copilot: zero network egress for user PII.
+The original layered vision (OpenRedaction lite + Transformers.js ONNX NER + a Mastra model layer) was **not shipped**; those tracks moved to the package repository (see [Historical note](#historical-note)). Presidio is opt-in in Career Copilot: without `PII_PRESIDIO_URL` the runtime keeps zero network egress for user PII.
 
 ## Why this shape
 
@@ -39,7 +39,8 @@ import { createLayeredPii } from '@kripamishra/mastra-pii';
 const pii = createLayeredPii({
   patterns: /* custom regex patterns from config */,
   anonymize: { format: 'type' }, // [PAN_1]-style placeholders; no reversible map
-  // presidio deliberately absent: zero network egress for user PII
+  // presidio supplied only when PII_PRESIDIO_URL is configured (NER path);
+  // otherwise the local deterministic engine is used (zero network egress)
 });
 
 export const agent = new Agent({
@@ -81,7 +82,7 @@ Career Copilot uses `redactText()` before calling `agent.generate()`. The proces
 4. Local engine failures block resume ingestion by default (fail-closed; `fallback: 'strict'` semantics on the engine side).
 5. No layer logs or returns original values or reversible maps; public output contains only redacted text or the generic `[REDACTION_FAILED]` marker.
 6. Redaction is irreversible in V1. Use typed placeholders such as `[PAN_1]`; do not hash direct identifiers.
-7. The local engine is regex/checksum-only and requires no model files and no downloads; the remote Presidio adapter (spaCy NER) is never enabled in Career Copilot.
+7. The local engine is regex/checksum-only and requires no model files and no downloads; the remote Presidio adapter (spaCy NER) is used only when `PII_PRESIDIO_URL` is configured.
 8. PDF parsing is bounded by type, signature, byte size, page count, extracted character count, and timeout.
 9. Only confirmed, redacted onboarding context becomes an active profile document.
 10. Tests use synthetic canaries only.
@@ -97,7 +98,7 @@ mastra-pii/
 │   ├── custom-pattern-worker.js  # terminable worker for bounded custom-regex execution
 │   ├── index.ts             # createLayeredPii, redactText/redactDocument/warmup/processor
 │   └── ...
-├── deploy/                  # Presidio container recipe (not used by Career Copilot)
+├── deploy/                  # Presidio container recipe (opt-in via PII_PRESIDIO_URL)
 ├── docs/evaluation/         # engine benchmark harnesses and corpora
 └── package.json
 ```
@@ -134,7 +135,7 @@ type LayeredPiiConfig = {
   customPatterns?: readonly PiiPattern[];  // alias
   layers?: readonly PiiLayer[];            // 'deterministic' only
   analyzer?: Analyzer;                     // custom analyzer (mutually exclusive with presidio)
-  presidio?: PresidioAdapterConfig;        // remote Presidio container (NOT used by Career Copilot)
+  presidio?: PresidioAdapterConfig;        // remote Presidio container (opt-in via PII_PRESIDIO_URL)
   fallback?: 'local' | 'strict';           // analyzer outage: degrade to local, or fail closed
   cacheSize?: number;                      // per-text LRU (0 disables; default 256)
   anonymize?: { format?: 'type' | 'uniform'; uniformToken?: string };
@@ -172,7 +173,7 @@ The default engine is a pure regex/checksum implementation (~2 ms, no network, z
 - custom `patterns` run in bounded worker processes with a 250 ms base + 1 ms/KB budget;
 - `entities` can restrict the emitted entity set.
 
-**Limitations (carried into docs):** emails/PANs/passports/Aadhaars/phones/cards/UPI/IFSC/tokens are caught, but **names/addresses are NER-only** (Presidio) and obfuscated formats (leet speak, spaced PANs, `[at]` emails) defeat every engine. Resume ingestion redacts what the engine catches; person names/addresses in the resulting draft remain owner-confirmed via the existing structured review flow — no NER-equivalent recall is promised or tested.
+**Limitations (carried into docs):** emails/PANs/passports/Aadhaars/phones/cards/UPI/IFSC/tokens are caught, but **names/addresses are NER-only** (Presidio, opt-in via `PII_PRESIDIO_URL`; with the local engine only they are not caught) and obfuscated formats (leet speak, spaced PANs, `[at]` emails) defeat every engine. Resume ingestion redacts what the analyzer catches; person names/addresses in the resulting draft remain owner-confirmed via the existing structured review flow — no NER-equivalent recall is promised or tested.
 
 ### Entity policy
 
@@ -506,7 +507,7 @@ Any high-risk canary leak blocks release.
 - [x] One public npm package exposes one Mastra-compatible processor and one local `redactText()` API (`createLayeredPii` → `redactText`/`redactDocument`/`warmup`/`processor`; consumed at `0.2.0-alpha.5`).
 - [~] Deterministic, NER, and Mastra model layers can each be disabled, enabled alone, or layered. — Shipped package: `deterministic` only; `ner`/`model` requests throw `LayerUnavailableError`. NER/model layering is package-repo scope (Track A/C).
 - [x] The local engine never returns or logs raw matches or reversible maps; redaction is irreversible in V1 (typed `[ENTITY_n]` placeholders, no restore API).
-- [x] The local engine makes no inference API call and makes no runtime model download; the remote Presidio adapter (the only NER path) is never enabled in Career Copilot.
+- [x] The local engine makes no inference API call and makes no runtime model download; the remote Presidio adapter (the only NER path) is used only when `PII_PRESIDIO_URL` is explicitly configured, and a down analyzer fails closed (readiness never flips).
 - [x] Guided `/onboarding` ships independently with plain structured career text enabled and resume file ingestion disabled.
 - [x] Onboarding asks for all required career context, then requires review and runtime-observed explicit confirmation.
 - [x] Active onboarding uses durable structured state plus owner/conversation-scoped Mastra memory.

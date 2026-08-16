@@ -2,11 +2,15 @@ import { createLayeredPii, type PiiProcessor } from '@kripamishra/mastra-pii';
 import type { PiiRuntimeConfig } from '../config/runtime.ts';
 
 /**
- * PII redaction service: owns the LayeredPii singleton in local deterministic
- * mode (zero network egress) and the fail-closed readiness gate.
+ * PII redaction service: owns the LayeredPii singleton and the fail-closed
+ * readiness gate.
  *
+ * - Analyzer: the local deterministic engine by default (zero network egress);
+ *   when a Presidio URL is configured, it is supplied to the package's remote
+ *   Presidio adapter at init (spaCy NER + Indian ad_hoc recognizers).
  * - `ready` flips only after `warmup()` resolves; until then (and while
- *   disabled) every redaction call fails closed.
+ *   disabled) every redaction call fails closed. With a Presidio URL this
+ *   means a down analyzer keeps ingestion disabled.
  * - `redactText`/`redactDocument` are the pre-agent trust-boundary functions;
  *   the ingestion surfaces gate on `ready` before calling them.
  * - `processor` is the defense-in-depth Mastra processor wired on the agent's
@@ -23,7 +27,7 @@ export type PiiService = {
 };
 
 export function createPiiService(config: PiiRuntimeConfig): PiiService {
-  const pii = createLayeredPii({ patterns: [...config.patterns], anonymize: { format: config.anonymizeFormat } });
+  const pii = createLayeredPii({ patterns: [...config.patterns], anonymize: { format: config.anonymizeFormat }, ...(config.presidio ? { presidio: config.presidio } : {}) });
   let warmed = false;
   const unavailable = (): never => { throw new Error('PII redaction is unavailable.'); };
   return {
