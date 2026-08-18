@@ -278,6 +278,23 @@ test('telegram downloader aborts at the byte cap on chunked responses without co
   }
 });
 
+test('telegram downloader rejects a response without a body instead of buffering it whole', async () => {
+  const { createTelegramFileDownloader } = await import('../src/channels/telegram-transport.ts');
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async (url: string | URL | Request, init?: RequestInit) => {
+      if (String(url).includes('/getFile')) {
+        return new Response(JSON.stringify({ ok: true, result: { file_path: 'docs/resume.pdf' } }), { headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(null); // bodyless: must reject, not fall back to arrayBuffer()
+    };
+    const downloader = createTelegramFileDownloader('token');
+    await assert.rejects(() => downloader('file-3', { maxBytes: 5 * 1024 * 1024 }), /no body/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('telegram downloader accepts a bounded chunked response at or under the cap', async () => {
   const { createTelegramFileDownloader } = await import('../src/channels/telegram-transport.ts');
   const originalFetch = globalThis.fetch;

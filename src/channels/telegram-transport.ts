@@ -31,29 +31,25 @@ export function createTelegramFileDownloader(token: string, logger?: AppLogger):
       const declared = response.headers.get('content-length');
       if (declared !== null && Number(declared) > maxBytes) throw new DownloadLimitExceededError(Number(declared));
       // stream incrementally and abort as soon as the cap is exceeded, so a
-      // chunked/no-content-length response can never be buffered unboundedly
+      // chunked/no-content-length response can never be buffered unboundedly.
+      // A bodyless response is rejected rather than buffered whole via
+      // arrayBuffer(), which would bypass the maxBytes memory bound.
       const reader = response.body?.getReader();
-      let buffer: Uint8Array;
-      if (!reader) {
-        const whole = new Uint8Array(await response.arrayBuffer());
-        if (whole.byteLength > maxBytes) throw new DownloadLimitExceededError(whole.byteLength);
-        buffer = whole;
-      } else {
-        const chunks: Uint8Array[] = [];
-        let received = 0;
-        for (;;) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          if (value) {
-            received += value.byteLength;
-            if (received > maxBytes) { await reader.cancel().catch(() => {}); throw new DownloadLimitExceededError(received); }
-            chunks.push(value);
-          }
+      if (!reader) throw new Error('Telegram file download failed: response has no body.');
+      const chunks: Uint8Array[] = [];
+      let received = 0;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          received += value.byteLength;
+          if (received > maxBytes) { await reader.cancel().catch(() => {}); throw new DownloadLimitExceededError(received); }
+          chunks.push(value);
         }
-        buffer = new Uint8Array(received);
-        let offset = 0;
-        for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
       }
+      const buffer = new Uint8Array(received);
+      let offset = 0;
+      for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength; }
       log('info', 'telegram.download.succeeded', { byteSize: buffer.byteLength, durationMs: Date.now() - started });
       return { bytes: buffer, byteSize: buffer.byteLength };
     } catch (error) {
