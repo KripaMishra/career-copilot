@@ -24,7 +24,7 @@ assertions:
   - A-NO-UNHANDLED-ERROR
   - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
   - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
-  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job content could not be fetched safely." }
+  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job fetch failed (unsafe-link): the link points to a private network address." }
   - { id: A-REPORT-BEFORE-SUCCESS, path: "state.reports", op: count, value: 0 }
   - { id: A-NOTIFY-AFTER-COMPLETE, path: "state.notifications", op: count, value: 0 }
 tools:

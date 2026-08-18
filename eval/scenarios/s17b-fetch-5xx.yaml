@@ -23,7 +23,7 @@ assertions:
   - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
   - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
   - { id: A-JOB-STATE, path: "state.jobs[0].attempts", op: eq, value: 1 }
-  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job content could not be fetched safely." }
+  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job fetch failed (site-down): the site is having server problems right now (HTTP 500). Try again later." }
   - { id: A-JOB-STATE, path: "fetch", op: count, value: 3 }
 tools:
   require: [save-job]
