@@ -26,3 +26,4 @@ assertions:
 tools:
   counts: { save-job: 0 }
 limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 10 }
+rubrics: [recovery_quality, truthfulness, task_completion]

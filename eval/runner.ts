@@ -11,11 +11,12 @@ import { extractPdfText } from '../src/integrations/pdf-text.ts';
 import { LibSQLStore } from '@mastra/libsql';
 import { acquireJobText } from '../src/tools/web-fetch-tool.ts';
 import { evaluateAssertions, type RunContext, type ToolCallRecord, type LifecycleRecord, type LogRecord } from './assertions.ts';
-import type { DocumentPlan, Fixture, Scenario, Turn } from './schemas/index.ts';
+import type { DocumentPlan, Fixture, Scenario, Turn, Canary } from './schemas/index.ts';
 import { resolveLimits } from './schemas/index.ts';
 import type { RunResult, TranscriptEvent, AssertionResult } from './schemas/run.ts';
 import { parseRunResult } from './schemas/run.ts';
-import { createScriptedModel, asModelConfig, type ScriptedModelLedger } from './fakes/model.ts';
+import { createScriptedModel, asModelConfig, type ScriptedModelLedger, type ScriptedModel, type ScriptedModelCall } from './fakes/model.ts';
+import type { LiveModel } from './live-model.ts';
 import { createFetchFake, type FetchLedger } from './fakes/fetch.ts';
 import { createCollectingLogger } from './fakes/logger.ts';
 import { makePdf, textPdf } from './fakes/pdf.ts';
@@ -28,6 +29,17 @@ export type RunnerManifest = {
   lockfileHash: string;
   clock: string;
   model: string | null;
+  // quality-lane provenance (#13d); absent on contract-only runs
+  provider?: string | null;
+  apiBase?: string | null;
+  revision?: string | null;
+  judgeModel?: string | null;
+  judgeProvider?: string | null;
+  judgeApiBase?: string | null;
+  judgeRevision?: string | null;
+  pricingTableVersion?: string | null;
+  retry?: { maxAttempts: number; backoffMs: number } | null;
+  allowUnmetered?: boolean;
 };
 
 export type RunOptions = {
@@ -38,7 +50,50 @@ export type RunOptions = {
   keepArtifacts: boolean;
   corpusHash: string;
   runId: string;
+  /** quality lane (#13d): a real SUT model replaces the scripted fake; the
+   * fixture model plan is ignored. Every call is recorded in the ledger. */
+  liveModel?: LiveModel;
+  /** per-run limit override (quality lane applies the 120s/20-call defaults) */
+  limits?: Limits;
 };
+
+/** Local (never-committed) quality-replay extras the judge payload is built from. */
+export type QualityReplayData = {
+  replies: { turnId: string; text: string }[];
+  modelCalls: ScriptedModelCall[];
+  stateSummary: {
+    onboarding: { conversationId: string; status: string; version: number }[];
+    profiles: { name: string; version: number; active: boolean }[];
+    jobs: { jobId: string; status: string; safeError: string | null; summary: string | null }[];
+  };
+};
+
+export type DetailedRun = { result: RunResult; qualityData: QualityReplayData };
+
+const EMPTY_QUALITY_DATA: QualityReplayData = { replies: [], modelCalls: [], stateSummary: { onboarding: [], profiles: [], jobs: [] } };
+
+/** Stub-merge semantics shared by the runner and the quality lane (#13d): the
+ * judge must see the SAME fixture surface the replay actually ran against
+ * (e.g. job pages declared in stubs), not just the base fixture. */
+export function mergeFixture(fixture: Fixture, stubs: Fixture[]): { fixture: Fixture; canaries: Canary[] } {
+  const mergedFixture: Fixture = {
+    ...fixture,
+    db: {
+      onboarding: [...fixture.db.onboarding, ...stubs.flatMap((stub) => stub.db.onboarding)],
+      profiles: [...fixture.db.profiles, ...stubs.flatMap((stub) => stub.db.profiles)],
+      jobs: [...fixture.db.jobs, ...stubs.flatMap((stub) => stub.db.jobs)],
+      reports: [...fixture.db.reports, ...stubs.flatMap((stub) => stub.db.reports)],
+    },
+    fetch: [...fixture.fetch, ...stubs.flatMap((stub) => stub.fetch)],
+    users: [...fixture.users, ...stubs.flatMap((stub) => stub.users)],
+    chats: [...fixture.chats, ...stubs.flatMap((stub) => stub.chats)],
+    notifications: [...fixture.notifications, ...stubs.flatMap((stub) => stub.notifications)],
+    documents: [...fixture.documents, ...stubs.flatMap((stub) => stub.documents)],
+    pii: fixture.pii || stubs.some((stub) => stub.pii),
+    model: { responses: [...fixture.model.responses, ...stubs.flatMap((stub) => stub.model.responses)] },
+  };
+  return { fixture: mergedFixture, canaries: [...fixture.canaries, ...stubs.flatMap((stub) => stub.canaries)] };
+}
 
 const FALLBACK_CLOCK_MS = Date.parse('2026-01-01T00:00:00Z');
 /** bounded wait for an aborted turn to settle before the runner snapshots state and cleans the sandbox */
@@ -103,8 +158,12 @@ function rawUpdateFor(turn: Turn, sequence: number, documents: DocumentPlan[] = 
 }
 
 export async function runScenario(options: RunOptions): Promise<RunResult> {
+  return (await runScenarioDetailed(options)).result;
+}
+
+export async function runScenarioDetailed(options: RunOptions): Promise<DetailedRun> {
   const { scenario, fixture, manifest, keepArtifacts, corpusHash, runId } = options;
-  const limits = resolveLimits(scenario.limits);
+  const limits = options.limits ?? resolveLimits(scenario.limits);
   const startedAt = Date.now();
   const clockMs = epochMs(fixture.clock);
   const clock = () => clockMs;
@@ -126,7 +185,9 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   };
   const logLedger: LogRecord[] = [];
   const allLogs: LogRecord[] = [];
-  const modelLedger: ScriptedModelLedger = { calls: [] };
+  // a live model brings its own ledger (shared with the caller so budgets and
+  // metering read the same calls); the scripted fake records into a fresh one
+  const modelLedger: ScriptedModelLedger = options.liveModel?.ledger ?? { calls: [] };
   const fetchLedger: FetchLedger = { calls: [] };
   const replyLedger: { text: string; delivered: boolean; turnId: string | null; atMs: number }[] = [];
   const notifications: { jobId: string; delivered: boolean; atMs: number; attempt: number }[] = [];
@@ -135,23 +196,9 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   const lifecycle: LifecycleRecord[] = [];
   const logger = createCollectingLogger(logLedger);
 
-  const mergedFixture: Fixture = {
-    ...fixture,
-    db: {
-      onboarding: [...fixture.db.onboarding, ...options.stubs.flatMap((stub) => stub.db.onboarding)],
-      profiles: [...fixture.db.profiles, ...options.stubs.flatMap((stub) => stub.db.profiles)],
-      jobs: [...fixture.db.jobs, ...options.stubs.flatMap((stub) => stub.db.jobs)],
-      reports: [...fixture.db.reports, ...options.stubs.flatMap((stub) => stub.db.reports)],
-    },
-    fetch: [...fixture.fetch, ...options.stubs.flatMap((stub) => stub.fetch)],
-    users: [...fixture.users, ...options.stubs.flatMap((stub) => stub.users)],
-    chats: [...fixture.chats, ...options.stubs.flatMap((stub) => stub.chats)],
-    notifications: [...fixture.notifications, ...options.stubs.flatMap((stub) => stub.notifications)],
-    documents: [...fixture.documents, ...options.stubs.flatMap((stub) => stub.documents)],
-    pii: fixture.pii || options.stubs.some((stub) => stub.pii),
-    model: { responses: [...fixture.model.responses, ...options.stubs.flatMap((stub) => stub.model.responses)] },
-  };
-  const canaries = [...fixture.canaries, ...options.stubs.flatMap((stub) => stub.canaries)];
+  const merged = mergeFixture(fixture, options.stubs);
+  const mergedFixture = merged.fixture;
+  const canaries = merged.canaries;
 
   let status: RunResult['status'] = 'passed';
   let incompleteReason: string | null = null;
@@ -190,7 +237,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       seeder.close();
     }
 
-    const scripted = createScriptedModel(mergedFixture.model, clock, modelLedger);
+    const model: ScriptedModel = options.liveModel ?? createScriptedModel(mergedFixture.model, clock, modelLedger);
     const fetchFake = createFetchFake(mergedFixture.fetch, fetchLedger);
     // cancellation seam: the active turn's AbortSignal propagates into the SUT's
     // fetch (acquireJobText), so a timed-out turn is aborted, not just abandoned
@@ -229,8 +276,8 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     };
     const kit = createCareerAgentKit({
       store,
-      model: asModelConfig(scripted),
-      memoryModel: asModelConfig(scripted),
+      model: asModelConfig(model),
+      memoryModel: asModelConfig(model),
       storage: memoryStorage,
       uuid,
       acquire,
@@ -557,6 +604,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       modelCalls: modelCalls.length,
       inputTokens: modelCalls.length > 0 && modelCalls.every((call) => call.inputTokens !== null) ? modelCalls.reduce((sum, call) => sum + (call.inputTokens ?? 0), 0) : null,
       outputTokens: modelCalls.length > 0 && modelCalls.every((call) => call.outputTokens !== null) ? modelCalls.reduce((sum, call) => sum + (call.outputTokens ?? 0), 0) : null,
+      estimatedCostUsd: modelCalls.length > 0 && modelCalls.every((call) => typeof call.costUsd === 'number') ? modelCalls.reduce((sum, call) => sum + (call.costUsd ?? 0), 0) : null,
       peakRssBytes: Math.round(process.memoryUsage().rss / 1024) * 1024,
       transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8'),
     };
@@ -599,38 +647,52 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     // the true final status and the reason (consumers need the transcript alone)
     emit('lifecycle', null, { event: 'run.completed', status, ...(incompleteReason ? { reason: incompleteReason } : {}) });
 
-    return parseRunResult({
-      runSchemaVersion: 1,
-      runId,
-      scenarioId: scenario.id,
-      fixtureId: fixture.id,
-      status,
-      corpusHash,
-      manifest,
-      transcript: { complete: transcriptComplete, events },
-      state,
-      assertions: assertionResults,
-      metrics,
-      redaction: { canariesFound: hits.map((hit) => hit.canary), sinksScanned: [...new Set(scanned)], rawArtifactPath: keepArtifacts ? dir : null },
-    });
+    return {
+      result: parseRunResult({
+        runSchemaVersion: 1,
+        runId,
+        scenarioId: scenario.id,
+        fixtureId: fixture.id,
+        status,
+        corpusHash,
+        manifest,
+        transcript: { complete: transcriptComplete, events },
+        state,
+        assertions: assertionResults,
+        metrics,
+        redaction: { canariesFound: hits.map((hit) => hit.canary), sinksScanned: [...new Set(scanned)], rawArtifactPath: keepArtifacts ? dir : null },
+      }),
+      qualityData: {
+        replies: replyLedger.map((reply) => ({ turnId: reply.turnId ?? 'unknown', text: reply.text })),
+        modelCalls: modelLedger.calls,
+        stateSummary: {
+          onboarding: onboardingRows.map((row) => ({ conversationId: row.conversationId, status: row.status, version: row.version })),
+          profiles: profiles.map((profile) => ({ name: profile.name, version: profile.version, active: profile.active })),
+          jobs: jobs.map((job) => ({ jobId: job.jobId, status: job.status, safeError: job.safeError ?? null, summary: job.safeResult?.summary ?? null })),
+        },
+      },
+    };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     failures.push({ kind: 'unhandled', message });
     events.push({ sequence: ++sequence, turnId: null, type: 'error', atMs: atMs(), payload: { message } });
-    return parseRunResult({
-      runSchemaVersion: 1,
-      runId,
-      scenarioId: scenario.id,
-      fixtureId: fixture.id,
-      status: 'incomplete',
-      corpusHash,
-      manifest,
-      transcript: { complete: false, events },
-      state: { onboarding: [], profiles: [], jobs: [], reports: [], notifications: [] },
-      assertions: [],
-      metrics: { durationMs: Date.now() - startedAt, ttFirstResponseMs: null, modelCalls: modelLedger.calls.length, inputTokens: null, outputTokens: null, peakRssBytes: null, transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8') },
-      redaction: { canariesFound: [], sinksScanned: [], rawArtifactPath: keepArtifacts ? dir : null },
-    });
+    return {
+      result: parseRunResult({
+        runSchemaVersion: 1,
+        runId,
+        scenarioId: scenario.id,
+        fixtureId: fixture.id,
+        status: 'incomplete',
+        corpusHash,
+        manifest,
+        transcript: { complete: false, events },
+        state: { onboarding: [], profiles: [], jobs: [], reports: [], notifications: [] },
+        assertions: [],
+        metrics: { durationMs: Date.now() - startedAt, ttFirstResponseMs: null, modelCalls: modelLedger.calls.length, inputTokens: null, outputTokens: null, estimatedCostUsd: null, peakRssBytes: null, transcriptBytes: Buffer.byteLength(JSON.stringify(events), 'utf8') },
+        redaction: { canariesFound: [], sinksScanned: [], rawArtifactPath: keepArtifacts ? dir : null },
+      }),
+      qualityData: EMPTY_QUALITY_DATA,
+    };
   } finally {
     if (store) {
       try { await store.close(); } catch { /* best effort */ }

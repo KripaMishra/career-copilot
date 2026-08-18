@@ -28,3 +28,4 @@ tools:
   require: [save-job]
   counts: { save-job: 1 }
 limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 10 }
+rubrics: [truthfulness, recovery_quality, conversational_quality]

@@ -1,14 +1,14 @@
 # Career Copilot Evaluation Harness (`eval/`)
 
 Implementation of issue #13: contracts/seams (`#13a`), hermetic runner (`#13b`),
-and the S01–S18 contract scenario corpus (`#13c`, 24 scenario files). The quality
-lane (`#13d`) and compare/pin (`#13e`) land separately; this README documents
-what exists and the exact contract for what comes next.
+the S01–S18 contract scenario corpus (`#13c`), and the manual quality lane
+(`#13d`). Compare/pin (`#13e`) and CI wiring (`#13f`) land separately.
 
 ## Commands
 
 ```text
 npm run eval:test -- [--scenario ID ...] [--keep-artifacts]
+npm run eval:quality -- [--scenario ID ...] [--allow-unmetered] [--keep-artifacts]
 ```
 
 - `--scenario ID` (repeatable): target specific live scenarios; the exclusion
@@ -22,6 +22,77 @@ npm run eval:test -- [--scenario ID ...] [--keep-artifacts]
 
 Contract runs are keyless and network-free: no live model, no Telegram, no
 Google, no real fetch. Any provider/network call outside the fakes fails the run.
+
+## Quality lane (`#13d`, `eval:quality`)
+
+`eval:quality` is the manual, credentialed, cross-family judge lane. Per
+scenario, in strict order:
+
+1. **Contract gate** — the scripted-model replay; deterministic assertions must
+   pass. A failure means the scenario's quality is `failed` with no judge (no
+   quality run rescues a deterministic failure).
+2. **Quality replay** — the same turns, the same fixture adapters, but the REAL
+   SUT model (`CAREER_COPILOT_MODEL`, default `opencode-go/deepseek-v4-flash`;
+   key `OPENCODE_API_KEY`, base `https://opencode.ai/zen/go/v1`, overridable
+   per provider via `EVAL_API_BASE_<PROVIDER>`). Its deterministic assertions
+   are evaluated again; any failure blocks judging.
+3. **Judge** — a cross-family model scores the scenario's declared `rubrics:`
+   from a redacted transcript + evidence ledger (never tool events,
+   identities, lifecycle, persistence internals, or canaries). Judge family
+   must differ from the SUT family: `EVAL_JUDGE_MODEL`, default
+   `google/gemini-3-flash-preview` (key `GOOGLE_GENERATIVE_AI_API_KEY`, base
+   Google's OpenAI-compatible endpoint). One structured call plus a single
+   fixed retry; invalid output after the retry is `incomplete`. The judge
+   boundary is deny-all for canaries: every configured canary (and user turn
+   text) is redacted from the payload and the judge's responses are scanned —
+   any hit fails the scenario `incomplete` and nothing contaminated is
+   persisted. The cross-family gate fails the run before any live call when
+   the SUT and judge families match (opencode / opencode-go are one family).
+
+Which scenarios are quality-eligible: any scenario declaring `rubrics:`
+(S01–S12, S14–S18 per the issue matrix; s13 and s19a–c stay contract-only).
+Failure-injection scenarios (e.g. s17c) will fail their own quality replay —
+their deterministic gates require scripted failure injection a real model
+cannot reproduce; that is the documented, expected outcome.
+
+### Budgets and metering
+
+- Per scenario: 120 s wall clock, 20 SUT calls, 30k in / 8k out SUT tokens,
+  2 judge calls, 20k in / 4k out judge tokens, USD 0.50. Exceeding any budget
+  terminates the scenario as `incomplete`.
+- Full run: 30 min, 500 live calls, 1M tokens, USD 20 (cumulative).
+- Every live call records provider, model id, API base, revision, usage,
+  latency, retries, and cost. Cost comes from the versioned pricing table
+  (`eval/pricing.ts`); it is EMPTY by default — supply real prices via
+  `EVAL_PRICING` JSON (`{"modelId": {"inputPerMTok": .., "outputPerMTok": ..}}`,
+  table version `env`).
+- Missing usage or cost on any live call is **unmetered** → `incomplete`
+  unless `--allow-unmetered`; unmetered runs complete but can never be pinned
+  (`#13e`). Failed live calls are ledgered too (attempts always count toward
+  the call budgets).
+- Evidence for judging comes from the SAME merged fixture the replay ran
+  against (stub-provided job pages included); the aggregate result row carries
+  the real gate/replay transcript/state/assertions/redaction plus a
+  `quality.metering` block with combined SUT/judge usage and cost.
+
+### Local artifacts
+
+`eval/artifacts/<runId>.json` (gitignored, mode 0600) keeps the redacted
+judge payload, raw judge responses, the redacted transcript, and per-call
+metering for triage. `eval/results/quality-*.json` holds the redacted
+aggregate. Raw transcripts never leave the machine.
+
+### Rubrics
+
+Ten rubrics (`eval/rubrics.ts`): `task_completion`, `tool_selection`,
+`grounding`, `privacy_safety`, `truthfulness`, `memory_use`,
+`onboarding_discipline`, `job_analysis_quality`, `conversational_quality`,
+`recovery_quality`. The scenario's `rubrics:` list is the authoritative
+applicability manifest — the judge may never return N/A. Every score needs at
+least one resolvable evidence reference (claim ids / `profile:active` /
+`job_page:N` / `state:final` from the evidence ledger); a non-3 score needs a
+rationale distinguishing it from 3; a critical failure forces score 1 and
+fails the scenario. Deterministic critical failures override all scores.
 
 ## Scenario corpus (S01–S18)
 
@@ -54,6 +125,11 @@ supported" host message (S17b/S17g), with a focused regression test in
 | `eval/fakes/` | Scripted model (raw V3 `MastraLanguageModel`), fetch/DNS fake, collecting logger. |
 | `eval/runner.ts` | Hermetic per-scenario runner: temp dir 0700, fresh libSQL DB + memory store, fixed clock/IDs, scripted turns, ledgers, state projection, redaction scan, cleanup. |
 | `eval/status.ts` | passed/failed/incomplete/skipped semantics and run aggregation. |
+| `eval/rubrics.ts` | The 10 quality rubrics with scoring/critical-failure manifests. |
+| `eval/live-model.ts` | Harness-owned OpenAI-compatible live model (raw v3 shape) for quality replay + judge, with usage/identity/retry/cost capture. |
+| `eval/pricing.ts` | Versioned pricing table (empty by default; `EVAL_PRICING` env). |
+| `eval/judge.ts` | Redacted judge payload builder, evidence ledger, canary fail-closed scan, judge call + fixed retry + validation. |
+| `eval/quality-cli.ts` | `eval:quality` entry point (gate → real replay → judge; budgets, metering, artifacts). |
 | `eval/cli.ts` | `eval:test` entry point. |
 
 ## Scenario format
@@ -83,6 +159,7 @@ tools:                             # optional A-TOOLS-EXACT expectations
   forbid: []
   counts: { save-job: 0 }
 limits: { maxTurns: 2, maxWallClockMs: 30000, maxModelCalls: 4 }
+rubrics: [onboarding_discipline, conversational_quality]  # optional (#13d): declared rubrics make the scenario quality-eligible
 ```
 
 Value operators: `eq` (deep equality), `member` (array contains), `count`

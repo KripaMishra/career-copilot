@@ -36,3 +36,4 @@ tools:
   forbid: [web_fetch]
   counts: { save-job: 1 }
 limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 20 }
+rubrics: [recovery_quality, truthfulness, task_completion]

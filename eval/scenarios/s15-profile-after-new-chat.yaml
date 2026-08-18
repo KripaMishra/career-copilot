@@ -34,3 +34,4 @@ tools:
   forbid: [web_fetch]
   counts: { save-job: 2, career-profile: 1 }
 limits: { maxTurns: 5, maxWallClockMs: 90000, maxModelCalls: 30 }
+rubrics: [memory_use, grounding, conversational_quality]
