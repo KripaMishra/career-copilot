@@ -24,3 +24,4 @@ src/mastra/public/
 # Evaluation harness artifacts (issue #13): raw transcripts and run results stay local
 eval/results/
 eval/artifacts/
+.commandcode/
