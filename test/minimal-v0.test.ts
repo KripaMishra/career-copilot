@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { CareerStore } from '../src/storage/career-store.ts';
 import { acquireJobText, normalizeResponseStatus, validateJobUrl } from '../src/tools/web-fetch-tool.ts';
+import { assertJobUrl, assertSameJobSite, jobSiteFor } from '../src/tools/job-url.ts';
 import { readProfile, writeAtomicReport } from '../src/integrations/local-files.ts';
 import { parseCommand, createCareerCopilotRuntime } from '../src/services/career-runtime.ts';
 import { assertOperationalDatabaseUrl, resolveDatabaseConfig, resolveRuntimeConfig } from '../src/config/runtime.ts';
@@ -85,9 +86,9 @@ test('Career Copilot exposes protected tools only to authenticated ingress', asy
   const dir = await mkdtemp(path.join(tmpdir(), 'career-agent-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
   const agent = createCareerAgent({ store });
   assert.ok(await agent.getMemory());
-  assert.deepEqual(Object.keys(await agent.listTools()), []);
+  assert.deepEqual(Object.keys(await agent.listTools()).sort(), ['task_check', 'task_complete', 'task_update', 'task_write']);
   const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
-  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['career-profile', 'job-queue', 'job-status', 'save-job']);
+  assert.deepEqual(Object.keys(await agent.listTools({ requestContext })).sort(), ['career-profile', 'job-queue', 'job-status', 'onboarding-status', 'save-job', 'task_check', 'task_complete', 'task_update', 'task_write']);
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -109,10 +110,22 @@ test('career-profile returns the owner canonical profile only', async () => {
   const { tools } = createCareerAgentKit({ store });
   const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
   const result = await tools['career-profile'].execute?.({}, { requestContext } as never);
-  assert.ok(result && typeof result === 'object' && 'profile' in result);
+  assert.ok(result && typeof result === 'object' && 'profile' in result && 'found' in result);
+  assert.equal((result as { found: boolean }).found, true);
   const profile = (result as { profile: string }).profile;
   assert.match(profile, /Experienced GenAI engineer/);
   assert.doesNotMatch(profile, /OTHER OWNER SECRET PROFILE/);
+  await store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('onboarding-status reports the trusted owner conversation state', async () => {
+  const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-onboarding-status-tool-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });
+  const { tools } = createCareerAgentKit({ store });
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  const result = await tools['onboarding-status'].execute?.({}, { requestContext } as never);
+  assert.deepEqual(result, { found: true, status: 'collecting', version: 1, missingFields: ['currentStatus', 'experience', 'education', 'skills', 'projects', 'achievements', 'targetRoles', 'locationPreferences', 'workAuthorization', 'employmentPreferences', 'motivators', 'careerGoals'], profileFound: false });
   await store.close(); await rm(dir, { recursive: true, force: true });
 });
 
@@ -159,6 +172,10 @@ test('commands are deterministic and owner-only', async () => {
   assert.deepEqual(parseCommand('/save https://linkedin.com/jobs/1'), { kind: 'save', url: 'https://linkedin.com/jobs/1' });
   assert.deepEqual(parseCommand('/job job-1'), { kind: 'job', jobId: 'job-1' });
   assert.deepEqual(parseCommand('/queue'), { kind: 'queue' });
+  assert.equal(parseCommand('/save'), null);
+  assert.equal(parseCommand('/save   '), null);
+  assert.equal(parseCommand('/job extra another'), null);
+  assert.equal(parseCommand('/reset unknown'), null);
   assert.equal(parseCommand('save this job'), null);
   assert.throws(() => createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), respond: async () => 'unused' }), /explicit store or databaseUrl/);
   const dir = await mkdtemp(path.join(tmpdir(), 'career-command-runtime-')); const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), databaseUrl: `file:${path.join(dir, 'jobs.db')}`, respond: async () => 'unused' });
@@ -372,9 +389,22 @@ test('transient agent failure does not poison runtime replay state', async () =>
   await assert.rejects(() => runtime.handleTelegramUpdate(update)); const retried = await runtime.handleTelegramUpdate(update); assert.equal(retried.outcome, 'accepted'); assert.equal(calls, 2); runtime.close(); await rm(dir, { recursive: true, force: true });
 });
 
+test('Telegram registers visible command menu before polling', async () => {
+  const { TELEGRAM_COMMANDS } = await import('../src/channels/telegram-transport.ts');
+  const originalFetch = globalThis.fetch; const calls: Array<{ method: string; body: Record<string, unknown> }> = []; let transport!: ReturnType<typeof createTelegramPollingTransport>;
+  globalThis.fetch = async (input, init) => { calls.push({ method: String(input).split('/').at(-1) ?? '', body: JSON.parse(String(init?.body)) }); transport.stop(); return new Response(JSON.stringify({ ok: true, result: [] }), { headers: { 'content-type': 'application/json' } }); };
+  try { transport = createTelegramPollingTransport('bot-token', async () => {}); await transport.start(); assert.equal(calls[0].method, 'setMyCommands'); assert.deepEqual(calls[0].body, { commands: TELEGRAM_COMMANDS }); assert.equal(calls.length, 1); } finally { transport?.stop(); globalThis.fetch = originalFetch; }
+});
+
+test('Telegram command registration failure does not prevent polling', async () => {
+  const originalFetch = globalThis.fetch; const methods: string[] = []; let transport!: ReturnType<typeof createTelegramPollingTransport>;
+  globalThis.fetch = async (input) => { const method = String(input).split('/').at(-1) ?? ''; methods.push(method); if (method === 'setMyCommands') return new Response('failed', { status: 500 }); transport.stop(); return new Response(JSON.stringify({ ok: true, result: [] }), { headers: { 'content-type': 'application/json' } }); };
+  try { transport = createTelegramPollingTransport('bot-token', async () => {}); await transport.start(); assert.deepEqual(methods, ['setMyCommands', 'getUpdates']); } finally { transport?.stop(); globalThis.fetch = originalFetch; }
+});
+
 test('Telegram polling advances offset only after durable handling', async () => {
   const originalFetch = globalThis.fetch; const offsets: number[] = []; let handled = 0; let transport!: ReturnType<typeof createTelegramPollingTransport>;
-  globalThis.fetch = async (_input, init) => { const body = JSON.parse(String(init?.body)); offsets.push(body.offset); return new Response(JSON.stringify({ ok: true, result: [{ update_id: 60, message: { message_id: 60, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/queue' } }] }), { headers: { 'content-type': 'application/json' } }); };
+  globalThis.fetch = async (_input, init) => { const body = JSON.parse(String(init?.body)); if (body.offset !== undefined) offsets.push(body.offset); return new Response(JSON.stringify({ ok: true, result: [{ update_id: 60, message: { message_id: 60, date: 1, chat: { id: 2, type: 'private' }, from: { id: 1 }, text: '/queue' } }] }), { headers: { 'content-type': 'application/json' } }); };
   try { transport = createTelegramPollingTransport('bot-token', async () => { handled++; if (handled === 1) throw new Error('database busy'); transport.stop(); }); await transport.start(); assert.deepEqual(offsets.slice(0, 2), [0, 0]); } finally { transport?.stop(); globalThis.fetch = originalFetch; }
 });
 
@@ -384,14 +414,19 @@ test('Telegram polling reports transport failures', async () => {
   try {
     const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level: string, event: string) => { events.push(event); });
     setTimeout(() => transport.stop(), 20); await transport.start();
-    assert.deepEqual(events, ['telegram.poll.started', 'telegram.poll.failed', 'telegram.poll.stopped']);
+    assert.deepEqual(events, ['telegram.commands.registration.failed', 'telegram.poll.started', 'telegram.poll.failed', 'telegram.poll.stopped']);
   } finally { globalThis.fetch = originalFetch; }
 });
 
 test('Telegram stop aborts an in-flight long poll without false failure log', async () => {
   const originalFetch = globalThis.fetch; let signal: AbortSignal | undefined; const events: string[] = [];
-  globalThis.fetch = async (_input, init) => new Promise<Response>((_resolve, reject) => { signal = init?.signal ?? undefined; signal?.addEventListener('abort', () => reject(signal?.reason), { once: true }); setTimeout(() => reject(new Error('late timeout')), 30); });
-  try { const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level, event) => { events.push(event); }); const started = transport.start(); await new Promise((resolve) => setImmediate(resolve)); transport.stop(); await started; assert.equal(signal?.aborted, true); assert.deepEqual(events, ['telegram.poll.started', 'telegram.poll.stopped']); } finally { globalThis.fetch = originalFetch; }
+  let calls = 0;
+  globalThis.fetch = async (_input, init) => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({ ok: true, result: true }), { headers: { 'content-type': 'application/json' } });
+    return new Promise<Response>((_resolve, reject) => { signal = init?.signal ?? undefined; signal?.addEventListener('abort', () => reject(signal?.reason), { once: true }); setTimeout(() => reject(new Error('late timeout')), 30); });
+  };
+  try { const transport = createTelegramPollingTransport('bot-token', async () => {}, (_level, event) => { events.push(event); }); const started = transport.start(); await new Promise((resolve) => setImmediate(resolve)); transport.stop(); await started; assert.equal(signal?.aborted, true); assert.deepEqual(events, ['telegram.commands.registered', 'telegram.poll.started', 'telegram.poll.stopped']); } finally { globalThis.fetch = originalFetch; }
 });
 
 test('Telegram transport can deliver a recovery message before polling', async () => {
@@ -454,17 +489,49 @@ test('analysis rejects blank title and company fields', () => {
   assert.equal(AnalysisSchema.safeParse({ ...base, title: '   ' }).success, false); assert.equal(AnalysisSchema.safeParse({ ...base, company: '' }).success, false);
 });
 
-test('safeErrorMessage classifies every fetch failure without leaking internals', () => {
-  // regression: HTTP-status fetch failures and the host-policy message used to
-  // fall through to the generic category (the regexes said "unsupported" and had
-  // no "fetch" alternative) — surfaced by eval scenarios S17b/S17g
-  const fetchSafe = 'Job content could not be fetched safely.';
-  assert.equal(safeErrorMessage(new Error('Job fetch failed (500).')), fetchSafe);
-  assert.equal(safeErrorMessage(new Error('Job fetch failed (429).')), fetchSafe);
-  assert.equal(safeErrorMessage(new Error('Job URL host is not supported.')), fetchSafe);
-  assert.equal(safeErrorMessage(new Error('Job URL redirected to another site.')), fetchSafe);
-  assert.equal(safeErrorMessage(new Error('Job URL resolves to a private or reserved address.')), fetchSafe);
-  assert.equal(safeErrorMessage(new Error('something else')), 'Job processing failed; use /job for recovery.');
+test('safeErrorMessage classifies every fetch failure with a type and a plain-language cause', () => {
+  // regression: fetch failures used to collapse into one generic string, so the
+  // agent could not tell the user what failed or why (foundit.in 403 case)
+  assert.equal(safeErrorMessage(Object.assign(new Error('Job fetch failed (403).'), { status: 403 })), 'Job fetch failed (blocked): the site blocked automatic access (HTTP 403), usually bot protection. Try pasting the job text instead.');
+  assert.equal(safeErrorMessage(new Error('Job fetch failed (500).')), 'Job fetch failed (site-down): the site is having server problems right now (HTTP 500). Try again later.');
+  assert.equal(safeErrorMessage(new Error('Job fetch failed (429).')), 'Job fetch failed (rate-limited): the site is limiting requests right now (HTTP 429). Try again in a minute.');
+  assert.equal(safeErrorMessage(new Error('Job URL host is not supported.')), 'Job fetch failed (unsupported-site): only job links from supported job sites can be saved. Try pasting the job text instead.');
+  assert.equal(safeErrorMessage(new Error('Job URL redirected to another site.')), 'Job fetch failed (bad-redirect): the page redirected to another site.');
+  assert.equal(safeErrorMessage(new Error('Job URL resolves to a private or reserved address.')), 'Job fetch failed (unsafe-link): the link points to a private network address.');
+  assert.equal(safeErrorMessage(new Error('Job fetch timed out.')), 'Job fetch failed (slow): the site did not respond in time.');
+  assert.equal(safeErrorMessage(Object.assign(new Error('x'), { code: 'ECONNRESET' })), 'Job fetch failed (connection): the connection to the site was dropped.');
+  assert.equal(safeErrorMessage(new Error('provider secret=do-not-store')), 'Job processing failed (processing): something went wrong while preparing the job.');
+});
+
+test('save-job pre-enqueue host rejection reaches the agent as a friendly type+cause message', async () => {
+  // regression: unsupported-site URLs (e.g. usajobs.gov) were rejected by assertJobUrl
+  // inside the agent tool before enqueue, throwing the raw internal message straight
+  // to the user transcript instead of the safe-explainable one
+  const [{ createCareerAgentKit }, { createCareerToolContext }] = await Promise.all([import('../src/agents/agent.ts'), import('../src/tools/career-context.ts')]);
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-unsupported-host-')); const store = new CareerStore(`file:${path.join(dir, 'jobs.db')}`);
+  const { tools } = createCareerAgentKit({ store });
+  const requestContext = createCareerToolContext({ ownerId: 'owner', actorId: 'telegram:1', conversationId: 'telegram:2', requestId: 'telegram:3' });
+  await assert.rejects(() => (tools['save-job'].execute ?? (async () => {}))({ url: 'https://usajobs.gov/job/880181200', profileContext: 'Experienced GenAI engineer.' }, { requestContext } as never), /Job fetch failed \(unsupported-site\): only job links from supported job sites can be saved. Try pasting the job text instead\./);
+  assert.equal((await store.list()).length, 0, 'no job may be created for an unsupported host');
+  await store.close(); await rm(dir, { recursive: true, force: true });
+});
+
+test('CAREER_COPILOT_ALLOW_ALL_JOB_SITES relaxes the host allowlist but keeps every other guard', async () => {
+  const prev = process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES;
+  process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = 'true';
+  try {
+    assert.equal(jobSiteFor('www.usajobs.gov'), 'usajobs.gov');
+    // https-only, credential/port/fragment, and local/metadata blocks still enforced
+    assert.throws(() => assertJobUrl('http://usajobs.gov/job/1'));
+    assert.throws(() => assertJobUrl('https://metadata.google.internal/job/1'));
+    assert.throws(() => assertJobUrl('https://localhost/job/1'));
+    // redirects must stay on the same site (www→bare ok, cross-host rejected)
+    assert.equal(assertSameJobSite(new URL('https://www.usajobs.gov/job/1'), 'https://usajobs.gov/job/1').href, 'https://usajobs.gov/job/1');
+    assert.throws(() => assertSameJobSite(new URL('https://usajobs.gov/job/1'), 'https://evil.example.com/job'));
+    // full acquisition path accepts a previously-unsupported host
+    const result = await acquireJobText('https://www.usajobs.gov/job/1', { fetch: async () => new Response('job text', { headers: { 'content-type': 'text/plain' } }), resolve: async () => ['93.184.216.34'] });
+    assert.equal(result.text, 'job text');
+  } finally { if (prev === undefined) delete process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES; else process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = prev; }
 });
 
 test('Mastra registrations live in the mandated entrypoint', async () => {

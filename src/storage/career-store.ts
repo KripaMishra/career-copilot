@@ -3,7 +3,7 @@ import { chmodSync, closeSync, existsSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { createClient, type Client, type InStatement, type Row } from '@libsql/client';
 import { JobInputSchema, JobStatusSchema, SafeResultSchema, safeErrorMessage, type Job, type JobInput, type JobStatus, type SafeResult } from '../contracts/v0.ts';
-import { OnboardingDraftSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus } from '../contracts/onboarding.ts';
+import { OnboardingDraftSchema, OnboardingStatusProjectionSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus, type OnboardingStatusProjection } from '../contracts/onboarding.ts';
 
 export type LibsqlConnectionConfig = { url: string; authToken?: string };
 
@@ -291,6 +291,42 @@ export class CareerStore {
   async profileText(ownerId: string) {
     await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT name, content FROM career_profile_documents WHERE owner_id=? AND active=1 ORDER BY name', args: [ownerId] })).rows;
     return rows.map((row) => { const name = safeDocumentName(String(row.name)); const content = String(row.content); assertSafeProfileContent(content); return `${name}:\n${content}`; }).join('\n').slice(0, 100_000);
+  }
+  async onboardingStatus(ownerId: string, conversationId: string): Promise<OnboardingStatusProjection> {
+    await this.#ready;
+    const row = (await this.#client.execute({ sql: 'SELECT status, version, draft_json FROM career_onboarding WHERE owner_id=? AND conversation_id=?', args: [ownerId, conversationId] })).rows[0];
+    const profile = (await this.#client.execute({ sql: 'SELECT 1 FROM career_profile_documents WHERE owner_id=? AND active=1 LIMIT 1', args: [ownerId] })).rows.length > 0;
+    const projection = row
+      ? { found: true, status: OnboardingStatusSchema.parse(row.status), version: Number(row.version), missingFields: onboardingMissingFields(OnboardingDraftSchema.parse(JSON.parse(String(row.draft_json || '{}')))), profileFound: profile }
+      : { found: false, status: null, version: null, missingFields: [], profileFound: profile };
+    return OnboardingStatusProjectionSchema.parse(projection);
+  }
+  async resetOnboarding(ownerId: string, conversationId: string) {
+    await this.#ready;
+    const result = await this.#client.execute({ sql: "DELETE FROM career_onboarding WHERE owner_id=? AND conversation_id=?", args: [ownerId, conversationId] });
+    return { onboardingRows: Number(result.rowsAffected ?? 0) };
+  }
+  async resetProfile(ownerId: string) {
+    await this.#ready;
+    const transaction = await this.#client.transaction('write'); let committed = false;
+    try {
+      const profiles = await transaction.execute({ sql: 'DELETE FROM career_profile_documents WHERE owner_id=?', args: [ownerId] });
+      const onboarding = await transaction.execute({ sql: 'DELETE FROM career_onboarding WHERE owner_id=?', args: [ownerId] });
+      await transaction.commit(); committed = true;
+      return { profileDocuments: Number(profiles.rowsAffected ?? 0), onboardingRows: Number(onboarding.rowsAffected ?? 0) };
+    } finally { if (!committed) try { await transaction.rollback(); } catch { /* rollback best effort */ } transaction.close(); }
+  }
+  async resetAll(ownerId: string) {
+    await this.#ready;
+    const transaction = await this.#client.transaction('write'); let committed = false;
+    try {
+      const reports = await transaction.execute({ sql: 'DELETE FROM career_reports WHERE owner_id=?', args: [ownerId] });
+      const jobs = await transaction.execute({ sql: 'DELETE FROM career_jobs WHERE owner_id=?', args: [ownerId] });
+      const profiles = await transaction.execute({ sql: 'DELETE FROM career_profile_documents WHERE owner_id=?', args: [ownerId] });
+      const onboarding = await transaction.execute({ sql: 'DELETE FROM career_onboarding WHERE owner_id=?', args: [ownerId] });
+      await transaction.commit(); committed = true;
+      return { reports: Number(reports.rowsAffected ?? 0), jobs: Number(jobs.rowsAffected ?? 0), profileDocuments: Number(profiles.rowsAffected ?? 0), onboardingRows: Number(onboarding.rowsAffected ?? 0) };
+    } finally { if (!committed) try { await transaction.rollback(); } catch { /* rollback best effort */ } transaction.close(); }
   }
   async listProfileDocuments(ownerId: string) {
     await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT * FROM career_profile_documents WHERE owner_id=? ORDER BY created_at, document_id', args: [ownerId] })).rows;

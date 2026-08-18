@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { CareerStore } from '../src/storage/career-store.ts';
-import { createCareerCopilotRuntime, createOnboardingResponder, handleOnboardingTurn, injectCommand, parseCommand, type OnboardingResponder } from '../src/services/career-runtime.ts';
+import { createCareerCopilotRuntime, createOnboardingResponder, commandWorkflow, handleOnboardingTurn, injectCommand, parseCommand, type OnboardingResponder } from '../src/services/career-runtime.ts';
 import { OnboardingDraftSchema, buildOnboardingProfileText, onboardingMissingFields } from '../src/contracts/onboarding.ts';
 import { executeSaveJob } from '../src/tools/save-job-tool.ts';
 
@@ -47,6 +47,60 @@ function sequentialOnboarder(): OnboardingResponder {
   return async ({ text, missingFields }) => ({ reply: `Saved. ${missingFields[1] ? `Next: ${missingFields[1]}` : 'Ready to review.'}`, draftPatch: missingFields[0] ? { [missingFields[0]]: text } : {}, readyForReview: missingFields.length <= 1 });
 }
 
+test('slash commands compile into stable structured workflows', () => {
+  assert.deepEqual(parseCommand('/onboarding status'), { kind: 'onboarding', action: 'status' });
+  assert.deepEqual(parseCommand('/reset onboarding'), { kind: 'reset', scope: 'onboarding' });
+  assert.deepEqual(parseCommand('/reset profile'), { kind: 'reset', scope: 'profile' });
+  assert.deepEqual(parseCommand('/reset all'), { kind: 'reset', scope: 'all' });
+  assert.deepEqual(parseCommand('/onboarding_status'), { kind: 'onboarding', action: 'status' });
+  assert.deepEqual(parseCommand('/reset_all'), { kind: 'reset', scope: 'all' });
+  assert.equal(commandWorkflow(parseCommand('/save https://linkedin.com/jobs/1'))?.id, 'save_job');
+  assert.equal(commandWorkflow(parseCommand('/queue'))?.tasks.at(-1)?.id, 'report_result');
+  assert.equal(commandWorkflow(parseCommand('/reset all'))?.tasks.at(-2)?.id, 'delete_owner_data');
+  assert.match(injectCommand('/save https://linkedin.com/jobs/1'), /task_write/);
+  assert.match(injectCommand('/queue'), /job_queue/);
+});
+
+test('malformed slash commands return usage without invoking the model', async () => withStore(async (store) => {
+  let normalCalls = 0;
+  const runtime = createCareerCopilotRuntime({ ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store, respond: async () => { normalCalls++; return 'unexpected'; } });
+  const replies: string[] = [];
+  for (const [id, text] of [[704, '/save'], [705, '/save   '], [706, '/job extra another'], [707, '/reset unknown']] as const) {
+    await runtime.handleTelegramUpdate(update(id, text), (reply) => { replies.push(reply); return Promise.resolve(); });
+  }
+  assert.equal(normalCalls, 0);
+  assert.match(replies[0], /usage.*\/save <url>/i);
+  assert.match(replies[1], /usage.*\/save <url>/i);
+  assert.match(replies[2], /usage.*\/job/i);
+  assert.match(replies[3], /unknown.*reset|usage/i);
+  await runtime.close();
+}));
+
+test('onboarding status and reset commands bypass model turns', async () => withStore(async (store) => {
+  let normalCalls = 0;
+  let onboardingCalls = 0;
+  const runtime = createCareerCopilotRuntime({
+    ownerId: 'owner',
+    allowedUserIds: new Set(['1']),
+    privateChatIds: new Set(['2']),
+    store,
+    onboard: async () => { onboardingCalls++; return { reply: 'unexpected', draftPatch: {}, readyForReview: false }; },
+    respond: async () => { normalCalls++; return 'unexpected'; },
+  });
+  const replies: string[] = [];
+  await runtime.handleTelegramUpdate(update(700, '/onboarding status'), (text) => { replies.push(text); return Promise.resolve(); });
+  await runtime.handleTelegramUpdate(update(701, '/reset onboarding'), (text) => { replies.push(text); return Promise.resolve(); });
+  await runtime.handleTelegramUpdate(update(702, '/reset profile'), (text) => { replies.push(text); return Promise.resolve(); });
+  await runtime.handleTelegramUpdate(update(703, '/reset all'), (text) => { replies.push(text); return Promise.resolve(); });
+  assert.match(replies[0], /no active onboarding|no confirmed profile/i);
+  assert.match(replies[1], /onboarding draft/i);
+  assert.match(replies[2], /profile reset/i);
+  assert.match(replies[3], /complete reset/i);
+  assert.equal(normalCalls, 0);
+  assert.equal(onboardingCalls, 0);
+  await runtime.close();
+}));
+
 test('onboarding command parsing and channel-neutral handler use dedicated routing', async () => withStore(async (store) => {
   assert.deepEqual(parseCommand('/onboarding'), { kind: 'onboarding', action: 'start' });
   assert.deepEqual(parseCommand('/onboarding restart'), { kind: 'onboarding', action: 'restart' });
@@ -65,6 +119,33 @@ test('onboarding draft validation is strict structured career data without raw r
   assert.throws(() => OnboardingDraftSchema.parse({ ...draft, rawResume: 'Nope' }), /Unrecognized key|unrecognized/i);
   assert.match(buildOnboardingProfileText(OnboardingDraftSchema.parse(draft)), /Target roles: Staff product engineer/);
 });
+
+test('reset operations are owner-scoped, idempotent, and preserve data outside their scope', async () => withStore(async (store) => {
+  await store.saveProfileDocument({ ownerId: 'owner', name: 'profile.md', content: 'Owner profile' });
+  await store.saveProfileDocument({ ownerId: 'other', name: 'profile.md', content: 'Other profile' });
+  const ownerOnboarding = await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });
+  await store.saveOnboardingDraft({ ownerId: 'owner', conversationId: 'telegram:2', expectedVersion: ownerOnboarding.version, draft: { currentStatus: draft.currentStatus } });
+  const otherOnboarding = await store.startOnboarding({ ownerId: 'other', conversationId: 'telegram:3', restart: true });
+  await store.saveOnboardingDraft({ ownerId: 'other', conversationId: 'telegram:3', expectedVersion: otherOnboarding.version, draft: { currentStatus: 'Other role' } });
+  const ownerJob = { jobId: 'owner-reset-job', userId: 'telegram:1', ownerId: 'owner', chatId: 'telegram:2', transportEventId: 'owner-reset-event', originalUrl: 'https://linkedin.com/jobs/owner-reset', canonicalUrl: 'https://linkedin.com/jobs/owner-reset' };
+  await store.enqueue(ownerJob); await store.markRunning(ownerJob.jobId, 'run-owner-reset'); await store.completeWithReport({ ownerId: 'owner', jobId: ownerJob.jobId, content: '# Owner report', summary: 'owner result' });
+  const otherJob = { jobId: 'other-reset-job', userId: 'telegram:3', ownerId: 'other', chatId: 'telegram:3', transportEventId: 'other-reset-event', originalUrl: 'https://linkedin.com/jobs/other-reset', canonicalUrl: 'https://linkedin.com/jobs/other-reset' };
+  await store.enqueue(otherJob);
+  const profileReset = await store.resetProfile('owner');
+  assert.deepEqual(profileReset, { profileDocuments: 1, onboardingRows: 1 });
+  assert.equal(await store.profileText('owner'), '');
+  assert.equal(await store.loadOnboarding('owner', 'telegram:2'), null);
+  assert.equal((await store.get(ownerJob.jobId))?.status, 'succeeded');
+  assert.equal((await store.getReport(ownerJob.jobId, 'owner'))?.content, '# Owner report');
+  assert.match(await store.profileText('other'), /Other profile/);
+  assert.equal((await store.loadOnboarding('other', 'telegram:3'))?.draft.currentStatus, 'Other role');
+  assert.equal((await store.get(otherJob.jobId))?.status, 'queued');
+  assert.deepEqual(await store.resetAll('owner'), { reports: 1, jobs: 1, profileDocuments: 0, onboardingRows: 0 });
+  assert.equal(await store.get(ownerJob.jobId), null);
+  assert.equal(await store.getReport(ownerJob.jobId, 'owner'), null);
+  assert.equal((await store.get(otherJob.jobId))?.status, 'queued');
+  assert.deepEqual(await store.resetAll('owner'), { reports: 0, jobs: 0, profileDocuments: 0, onboardingRows: 0 });
+}));
 
 test('onboarding store is owner and conversation scoped with optimistic versions and cancellation clearing content', async () => withStore(async (store) => {
   const started = await store.startOnboarding({ ownerId: 'owner', conversationId: 'telegram:2', restart: true });

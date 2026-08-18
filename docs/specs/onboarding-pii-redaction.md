@@ -298,6 +298,18 @@ stateDiagram-v2
 
 Normal `/save`, `/job`, and `/queue` behavior remains unchanged outside active onboarding; during active onboarding those commands are held until the owner finishes or cancels onboarding.
 
+Recognized Telegram slash commands compile to stable ordered workflow checklists. Agent-driven commands receive the checklist and use Mastra Task Tools (`task_write`, `task_update`, `task_complete`, and `task_check`) in thread-scoped memory. Task completion is bookkeeping and never replaces runtime/store authority. `/onboarding status`, `/reset onboarding`, `/reset profile`, and `/reset all` are deterministic runtime commands: they read or mutate CareerStore state directly and do not invoke the model or Task Tools.
+
+The status/reset commands have these boundaries:
+
+- `/onboarding status` reports collecting, review awaiting exact `confirm`, confirmed-profile active, or no active profile state for the authenticated owner/conversation;
+- `/reset onboarding` clears only the current conversation's draft;
+- `/reset profile` clears the owner's profile documents and onboarding drafts while preserving jobs/reports;
+- `/reset all` transactionally clears the owner's onboarding, profile, jobs, and reports;
+- `/onboarding restart` remains draft-only and preserves the active profile and jobs.
+
+An empty `career-profile` result means no active persisted profile was found. It does not identify an authentication, profile-page, or reauthentication problem. There is no durable pending-save state: Task Tool workflow state is not a job record, and an unexecuted URL must not be described as recorded or queued.
+
 ### Required onboarding information
 
 Collect only information needed for career assistance:
