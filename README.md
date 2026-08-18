@@ -33,7 +33,7 @@ Implemented:
 
 Not implemented:
 
-- resume file/upload, PDF, image, DOCX, URL, or arbitrary file ingestion during onboarding until `mastra-pii` is benchmarked and integrated; plain structured career text is accepted;
+- arbitrary file ingestion during onboarding beyond bounded text-based PDF resumes (see the PII integration bullet below); image, DOCX, and other document types are rejected; plain structured career text is always accepted;
 - job discovery, scheduling, CSV import, or browser-assisted applications;
 - automatic applications or mutation of job sites;
 - multiple owners, multiple runtime instances, or distributed coordination;
@@ -568,7 +568,7 @@ These are planned changes, not current behavior. Each item requires a written co
 ### P0 — Resume privacy boundary
 
 - [x] **Add guided `/onboarding` ([spec](docs/specs/onboarding-pii-redaction.md), [#10](https://github.com/KripaMishra/career-copilot/issues/10)).** Collects structured career context one question at a time with owner/conversation-scoped Mastra memory, requires owner review and runtime-observed explicit confirmation, then activates the versioned profile. Resume file/upload ingestion remains intentionally unavailable in this first phase; plain structured career text is accepted.
-- [ ] **Integrate the separately published layered Mastra PII processor for resume ingestion ([package](https://github.com/KripaMishra/mastra-pii), [package issue #1](https://github.com/KripaMishra/mastra-pii/issues/1)).** After OpenRedaction deterministic checks and local Transformers.js NER are benchmarked, consume a reviewed prerelease and enable bounded text/PDF resume ingestion before the ordinary agent path; Mastra `PIIDetector` remains defense-in-depth.
+- [x] **Integrate the separately published Mastra PII package for resume ingestion ([package](https://github.com/KripaMishra/mastra-pii), [tracking issue #18](https://github.com/KripaMishra/career-copilot/issues/18)).** Consumes the reviewed prerelease `@kripamishra/mastra-pii@0.2.0-alpha.5` (exact pin); the analyzer is the local deterministic engine by default (zero network egress) or the package's remote Presidio adapter when `PII_PRESIDIO_URL` is configured (supplied at init; fail-closed if unreachable). Enables bounded text/PDF resume ingestion before the ordinary agent path (envelope auth, 5 MiB download cap, 50 pages / 200k chars / 10 s extraction bounds, immediate `redactText()`, byte-for-byte write revalidation). The package processor (`inputProcessors`/`outputProcessors`) is wired as defense-in-depth; ingestion is fail-closed until the analyzer warms and config validates. Names/addresses are NER-only (local engine: not caught; with Presidio configured: caught) and remain owner-confirmed via the structured review flow.
 
 ### P1 — Conversation and memory
 

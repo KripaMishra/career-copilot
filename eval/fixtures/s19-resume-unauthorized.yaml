@@ -1,0 +1,75 @@
+schemaVersion: 1
+id: s19-resume-unauthorized
+description: "S19a: resume envelopes that fail authorization or bounded extraction are rejected with safe messages before any download or model use."
+ownerId: career-owner-v0
+users: ["1001"]
+chats: ["2001"]
+clock: "2026-01-01T00:00:00Z"
+pii: true
+db:
+  onboarding:
+    - ownerId: career-owner-v0
+      conversationId: "telegram:2001"
+      status: collecting
+      version: 1
+      draft: {}
+documents:
+  - fileId: "doc-unauthorized"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+  - fileId: "doc-image"
+    fileName: "scan.png"
+    mimeType: "image/png"
+  - fileId: "doc-word"
+    fileName: "resume.docx"
+    mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+  - fileId: "doc-over"
+    fileName: "huge.pdf"
+    mimeType: "application/pdf"
+    oversized: true
+  - fileId: "doc-caption"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    caption: "here is my resume"
+    text: "Engineer."
+  - fileId: "doc-notpdf"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: not_pdf
+  - fileId: "doc-encrypted"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: encrypted
+  - fileId: "doc-malformed"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: malformed
+  - fileId: "doc-notext"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: no_text
+  - fileId: "doc-timeout"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: timeout
+  - fileId: "doc-pages"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: too_many_pages
+  - fileId: "doc-overlong"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    extractFail: overlong
+  - fileId: "doc-fail"
+    fileName: "resume.pdf"
+    mimeType: "application/pdf"
+    text: "Engineer."
+    downloadFail: true

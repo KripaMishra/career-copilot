@@ -6,16 +6,19 @@ import { createClient } from '@libsql/client';
 import { createCareerAgentKit } from '../src/agents/agent.ts';
 import { createAgentResponder, createCareerCopilotRuntime, createOnboardingResponder } from '../src/services/career-runtime.ts';
 import { CareerStore } from '../src/storage/career-store.ts';
+import { createPiiService } from '../src/services/pii.ts';
+import { extractPdfText } from '../src/integrations/pdf-text.ts';
 import { LibSQLStore } from '@mastra/libsql';
 import { acquireJobText } from '../src/tools/web-fetch-tool.ts';
 import { evaluateAssertions, type RunContext, type ToolCallRecord, type LifecycleRecord, type LogRecord } from './assertions.ts';
-import type { Fixture, Scenario, Turn } from './schemas/index.ts';
+import type { DocumentPlan, Fixture, Scenario, Turn } from './schemas/index.ts';
 import { resolveLimits } from './schemas/index.ts';
 import type { RunResult, TranscriptEvent, AssertionResult } from './schemas/run.ts';
 import { parseRunResult } from './schemas/run.ts';
 import { createScriptedModel, asModelConfig, type ScriptedModelLedger } from './fakes/model.ts';
 import { createFetchFake, type FetchLedger } from './fakes/fetch.ts';
 import { createCollectingLogger } from './fakes/logger.ts';
+import { makePdf, textPdf } from './fakes/pdf.ts';
 import { scanTargets, type ScanTarget } from './redaction.ts';
 
 export type RunnerManifest = {
@@ -63,7 +66,7 @@ function epochMs(iso: string): number {
   return Number.isFinite(parsed) ? parsed : FALLBACK_CLOCK_MS;
 }
 
-function rawUpdateFor(turn: Turn, sequence: number): unknown {
+function rawUpdateFor(turn: Turn, sequence: number, documents: DocumentPlan[] = []): unknown {
   const chatId = turn.conversationId.replace(/^telegram:/, '');
   const userId = turn.actorId;
   const text = turn.input.kind === 'text' ? turn.input.text : undefined;
@@ -72,13 +75,16 @@ function rawUpdateFor(turn: Turn, sequence: number): unknown {
   // envelope variants only change the chat type or bot flag
   const chat = { id: Number(chatId), type: 'private' as string };
   const from = { id: Number(userId) };
+  const document = turn.input.kind === 'document' ? documents.find((plan) => plan.fileId === turn.input.fileId) : undefined;
   const message: Record<string, unknown> = {
     message_id: 1 + sequence,
     date: 1,
     chat,
     from,
     ...(text !== undefined ? { text } : {}),
-    ...(turn.input.kind === 'non_text' ? { document: { file_name: 'resume.pdf' } } : {}),
+    ...(turn.input.kind === 'non_text' ? { document: { file_id: 'eval-non-text-file', file_unique_id: 'eval-non-text-unique', file_name: 'resume.pdf' } } : {}),
+    ...(document ? { document: { file_id: document.fileId, file_unique_id: document.fileUniqueId ?? `eval-${document.fileId}`, file_name: document.fileName, mime_type: document.mimeType, file_size: document.oversized ? 6 * 1024 * 1024 : document.fileSize } } : {}),
+    ...(document?.caption !== undefined ? { caption: document.caption } : {}),
   };
   switch (turn.envelope) {
     case 'malformed':
@@ -141,6 +147,8 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
     users: [...fixture.users, ...options.stubs.flatMap((stub) => stub.users)],
     chats: [...fixture.chats, ...options.stubs.flatMap((stub) => stub.chats)],
     notifications: [...fixture.notifications, ...options.stubs.flatMap((stub) => stub.notifications)],
+    documents: [...fixture.documents, ...options.stubs.flatMap((stub) => stub.documents)],
+    pii: fixture.pii || options.stubs.some((stub) => stub.pii),
     model: { responses: [...fixture.model.responses, ...options.stubs.flatMap((stub) => stub.model.responses)] },
   };
   const canaries = [...fixture.canaries, ...options.stubs.flatMap((stub) => stub.canaries)];
@@ -154,7 +162,10 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
   let modelCallsAtTurnStart = 0;
 
   try {
-    store = new CareerStore(`file:${dbFile}`, { clock });
+    const piiEnabled = mergedFixture.pii || mergedFixture.documents.length > 0;
+    const pii = piiEnabled ? createPiiService({ enabled: true, patterns: [], anonymizeFormat: 'type', maxInputChars: 0, readiness: true }) : null;
+    if (pii) await pii.warmup();
+    store = new CareerStore(`file:${dbFile}`, { clock, ...(pii ? { piiRevalidator: { redactText: (text) => pii.redactText(text), redactDocument: (value) => pii.redactDocument(value) } } : {}) });
     await store.ready();
     // fixture rows are seeded directly into the harness's own sandbox DB; the
     // store's public surface has no legacy import path (start-afresh, D1/D7)
@@ -224,7 +235,36 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       uuid,
       acquire,
       logger,
+      // S19: the harness wires the same defense-in-depth processors as
+      // production, so the gate proves the pipeline (prompt redaction,
+      // output redaction, memory persistence) rather than a processor-less
+      // approximation. S01–S18 declare no pii and keep the legacy kit shape.
+      ...(pii ? { processors: { input: [pii.processor], output: [pii.processor] } } : {}),
     });
+    // resume document ingestion seam (S19): a fake download serves the
+    // fixture's document plan (real generated PDF bytes), and a bounded
+    // extract dispatches the plan's forced rejections. PII wiring exists only
+    // when the fixture declares documents/pii — S01–S18 keep the exact legacy
+    // runtime shape.
+    const downloadLedger: string[] = [];
+    const downloadFile = async (fileId: string) => {
+      const plan = mergedFixture.documents.find((candidate) => candidate.fileId === fileId);
+      downloadLedger.push(fileId);
+      if (!plan) throw new Error('No document plan for file id.');
+      if (plan.downloadFail) throw Object.assign(new Error('Telegram file download failed.'), { status: 500 });
+      if (plan.oversized) throw new Error('Telegram file download exceeds the byte cap.');
+      if (plan.extractFail === 'not_pdf') return { bytes: new TextEncoder().encode('PK\x03\x04 not a pdf'), byteSize: 13 };
+      if (plan.extractFail !== undefined) return { bytes: new TextEncoder().encode(`EVAL_EXTRACT_FAIL:${plan.extractFail}`), byteSize: 1 };
+      const bytes = plan.pages ? makePdf(plan.pages) : textPdf(plan.text ?? '');
+      return { bytes, byteSize: bytes.byteLength };
+    };
+    const extract = async (bytes: Uint8Array) => {
+      const prefix = new TextDecoder().decode(bytes.subarray(0, 64));
+      const forced = /^EVAL_EXTRACT_FAIL:(\w+)/.exec(prefix)?.[1];
+      if (forced === 'timeout') return extractPdfText(bytes, { engine: async () => new Promise(() => { /* hangs; the deadline aborts */ }), deadlineMs: 50 });
+      if (forced && ['encrypted', 'malformed', 'no_text', 'too_many_pages', 'overlong', 'not_pdf'].includes(forced)) return { ok: false as const, reason: forced as 'encrypted' | 'malformed' | 'no_text' | 'too_many_pages' | 'overlong' | 'not_pdf' };
+      return extractPdfText(bytes);
+    };
     const runtime = createCareerCopilotRuntime({
       ownerId: fixture.ownerId,
       allowedUserIds: new Set(mergedFixture.users),
@@ -233,6 +273,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       logger,
       respond: createAgentResponder(kit.agent, fixture.ownerId, logger),
       onboard: createOnboardingResponder(kit.agent),
+      ...(pii ? { pii, downloadFile, extract } : {}),
     });
 
     const isLifecycleEvent = (event: string) => event.startsWith('job.') || event.startsWith('onboarding.') || event.startsWith('recovery.') || event.startsWith('telegram.update.') || event === 'command.received' || event === 'agent.turn.started' || event === 'agent.turn.succeeded' || event === 'agent.turn.failed';
@@ -308,7 +349,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       const turnStarted = Date.now();
       let outcome: { turnId: string; expected: Turn['expected']; actual: 'accepted' | 'rejected'; deliveryFailed?: boolean; error: Error | null; durationMs: number };
       try {
-        const raw = rawUpdateFor(turn, sequence);
+        const raw = rawUpdateFor(turn, sequence, mergedFixture.documents);
         const rawUpdateId = (raw as { update_id?: unknown }).update_id;
         currentUpdateId = typeof rawUpdateId === 'number' ? String(rawUpdateId) : null;
         const turnPromise = runtime.handleTelegramUpdate(raw, deliver);
@@ -472,15 +513,41 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
       return { id: `turn.${outcome.turnId}.outcome`, status: passed ? 'passed' : 'failed', evidence: `expected ${outcome.expected}, got ${outcome.actual}${terminal ? '' : ', no terminal reply'}` };
     });
 
-    // sink-aware redaction scan
+    // sink-aware redaction scan. The model-call ledger records what the
+    // scripted model emitted raw; with PII wired, the production pipeline
+    // redacts both the prompt (processLLMRequest — the ledger's promptText is
+    // already post-processor) and the assistant output (processOutputResult —
+    // applied here to the ledger's outputText via the same engine), so the
+    // model sink reflects the agent-visible surface.
+    let modelCallTarget: unknown = modelLedger.calls;
+    if (pii) {
+      modelCallTarget = await Promise.all(modelLedger.calls.map(async (call) => ({ ...call, outputText: await pii.redactText(call.outputText) })));
+    }
     const targets: ScanTarget[] = [
       { name: 'replies', sink: 'reply', value: replyLedger.map((reply) => reply.text) },
       { name: 'logs', sink: 'log', value: allLogs },
       { name: 'database', sink: 'database', value: { onboarding: onboardingRows, profiles, jobs, reports } },
       { name: 'reports', sink: 'report', value: reportContents },
-      { name: 'model-calls', sink: 'model', value: modelLedger.calls },
+      { name: 'model-calls', sink: 'model', value: modelCallTarget },
       { name: 'notifications', sink: 'reply', value: notifications },
+      { name: 'transcript', sink: 'trace', value: events },
     ];
+    // Mastra memory tables (message history + observational memory rows) are
+    // scanned as database sinks from the harness's memory storage file.
+    const memoryDbFile = path.join(dir, 'memory.db');
+    try {
+      const memoryClient = createClient({ url: `file:${memoryDbFile}` });
+      try {
+        for (const table of ['mastra_messages', 'mastra_observational_memory', 'mastra_threads', 'mastra_thread_state']) {
+          try {
+            const rows = await memoryClient.execute(`SELECT * FROM ${table}`);
+            targets.push({ name: `memory:${table}`, sink: 'database', value: rows.rows });
+          } catch { /* table may not exist for this scenario */ }
+        }
+      } finally {
+        memoryClient.close();
+      }
+    } catch { /* memory storage file may not exist */ }
     const { hits, scanned } = scanTargets(targets, canaries);
 
     const modelCalls = modelLedger.calls;
@@ -512,6 +579,7 @@ export async function runScenario(options: RunOptions): Promise<RunResult> {
         notifications,
         failures,
         fetch: fetchLedger.calls,
+        documentDownloads: downloadLedger,
       },
       metrics,
       redactionHits: hits,

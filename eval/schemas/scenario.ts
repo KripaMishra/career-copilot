@@ -15,10 +15,13 @@ export const personaIdSchema = z.enum([
 export const channelSchema = z.enum(['telegram']);
 
 export const turnInputSchema = z.strictObject({
-  kind: z.enum(['text', 'non_text']),
+  kind: z.enum(['text', 'non_text', 'document']),
   text: z.string().max(10_000).optional(),
-}).refine((input) => input.kind === 'text' ? typeof input.text === 'string' : input.text === undefined, {
-  message: 'text turns require text; non_text turns must not carry text',
+  fileId: z.string().min(1).max(500).optional(),
+}).refine((input) => input.kind === 'text' ? typeof input.text === 'string' && input.fileId === undefined
+  : input.kind === 'document' ? typeof input.fileId === 'string' && input.text === undefined
+  : input.text === undefined && input.fileId === undefined, {
+  message: 'text turns require text; document turns require fileId; non_text turns must not carry either',
 });
 
 export const turnSchema = z.strictObject({

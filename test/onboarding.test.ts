@@ -408,7 +408,7 @@ test('telegram non-text files are rejected outside onboarding and get a generic 
   assert.equal((await runtime.handleTelegramUpdate(update(99, undefined, { document: { file_id: 'file', file_name: 'resume.pdf' } }), async () => {})).outcome, 'rejected');
   assert.equal(await store.loadOnboarding('owner', 'telegram:2'), null);
   await runtime.handleTelegramUpdate(update(300, '/onboarding'), async (text) => { replies.push(text); });
-  const active = await runtime.handleTelegramUpdate(update(301, undefined, { document: { file_id: 'secret-file', file_name: 'private-resume.pdf', file_size: 12345 } }), async (text) => { replies.push(text); });
+  const active = await runtime.handleTelegramUpdate(update(301, undefined, { document: { file_id: 'secret-file', file_unique_id: 'secret-unique', file_name: 'private-resume.pdf', file_size: 12345 } }), async (text) => { replies.push(text); });
   assert.equal(active.outcome, 'accepted');
   assert.match(replies.at(-1) ?? '', /^Resume, URL, and file ingestion are unavailable in V1\./);
   const location = await runtime.handleTelegramUpdate(update(302, undefined, { location: { latitude: 12.3, longitude: 45.6 } }), async (text) => { replies.push(text); });

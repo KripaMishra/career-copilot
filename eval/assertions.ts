@@ -27,6 +27,7 @@ export type Ledgers = {
   notifications: NotificationRecord[];
   failures: FailureRecord[];
   fetch: FetchLedgerRecord[];
+  documentDownloads: string[];
 };
 
 export type RunContext = {
@@ -112,6 +113,7 @@ function contextView(ctx: RunContext): Record<string, unknown> {
     notifications: ctx.ledgers.notifications,
     logs: ctx.ledgers.logs,
     fetch: ctx.ledgers.fetch,
+    documentDownloads: ctx.ledgers.documentDownloads,
     redactionHits: ctx.redactionHits,
     transcriptComplete: ctx.transcriptComplete,
   };

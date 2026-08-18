@@ -1,9 +1,13 @@
 import { chmodSync, existsSync, mkdirSync, realpathSync } from 'node:fs';
 import { resolve, join, isAbsolute, relative, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { z } from 'zod';
+import { PII_ENTITY_NAMES } from '@kripamishra/mastra-pii';
 
-export type RuntimeConfig = { dataDir: string; databaseUrl: string; databaseAuthToken?: string; memoryModel: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> } };
-type Input = { env?: Record<string, string | undefined>; dataDir?: string; databaseUrl?: string; databaseAuthToken?: string; requireDeployment?: boolean };
+export type PiiPatternConfig = { name: string; regex: RegExp; entity?: string };
+export type PiiRuntimeConfig = { enabled: boolean; patterns: ReadonlyArray<PiiPatternConfig>; anonymizeFormat: 'type' | 'uniform'; maxInputChars: number; readiness: boolean; presidio?: { url: string } };
+export type RuntimeConfig = { dataDir: string; databaseUrl: string; databaseAuthToken?: string; memoryModel: string; owner: { resourceId: string; enabled: boolean }; telegram: { botToken: string; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string> }; pii: PiiRuntimeConfig };
+type Input = { env?: Record<string, string | undefined>; dataDir?: string; databaseUrl?: string; databaseAuthToken?: string; requireDeployment?: boolean; pii?: Partial<PiiRuntimeConfig> };
 function ids(value: string | undefined, name: string, deployment: boolean) {
   if (!value?.trim()) { if (deployment) throw new Error(`${name} is required.`); return new Set<string>(); }
   const values = value.split(',').map((item) => item.trim());
@@ -44,5 +48,53 @@ export function resolveRuntimeConfig(input: Input = {}): RuntimeConfig {
   const privateChatIds = ids(env.CAREER_COPILOT_PRIVATE_CHAT_IDS, 'CAREER_COPILOT_PRIVATE_CHAT_IDS', requiredDeployment);
   const mainModel = env.CAREER_COPILOT_MODEL?.trim() || 'opencode-go/deepseek-v4-flash';
   const memoryModel = env.CAREER_COPILOT_MEMORY_MODEL?.trim() || mainModel;
-  return { dataDir, databaseUrl: database.url, ...(database.authToken ? { databaseAuthToken: database.authToken } : {}), memoryModel, owner: { resourceId: ownerId, enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false' }, telegram: { botToken: requiredDeployment ? required(env, 'TELEGRAM_BOT_TOKEN') : (env.TELEGRAM_BOT_TOKEN ?? ''), allowedUserIds, privateChatIds } };
+  return { dataDir, databaseUrl: database.url, ...(database.authToken ? { databaseAuthToken: database.authToken } : {}), memoryModel, owner: { resourceId: ownerId, enabled: env.CAREER_COPILOT_OWNER_ENABLED !== 'false' }, telegram: { botToken: requiredDeployment ? required(env, 'TELEGRAM_BOT_TOKEN') : (env.TELEGRAM_BOT_TOKEN ?? ''), allowedUserIds, privateChatIds }, pii: resolvePiiConfig(env, input.pii) };
+}
+
+const piiEntityAllowlist = PII_ENTITY_NAMES as readonly [string, ...string[]];
+const piiPatternInputSchema = z.object({ name: z.string().trim().min(1).max(120), regex: z.string().trim().min(1).max(500), entity: z.enum(piiEntityAllowlist).optional() }).strict();
+const piiConfigSchema = z.object({
+  enabled: z.boolean(),
+  patterns: z.array(piiPatternInputSchema).max(50).default([]),
+  anonymizeFormat: z.enum(['type', 'uniform']).default('type'),
+  maxInputChars: z.number().int().min(0).max(1_000_000).default(200_000),
+  readiness: z.boolean().default(true),
+  presidio: z.object({ url: z.string().trim().min(1).max(2048) }).strict().optional(),
+}).strict();
+
+function strictBoolean(value: string | undefined, name: string, fallback: boolean): boolean {
+  if (value === undefined || value.trim() === '') return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (normalized === 'true') return true;
+  if (normalized === 'false') return false;
+  throw new Error(`${name} must be true or false.`);
+}
+
+function parsePiiPatterns(value: string | undefined) {
+  if (!value?.trim()) return [];
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error('PII_PATTERNS must be a JSON array of { name, regex, entity? } entries.'); }
+  if (!Array.isArray(parsed)) throw new Error('PII_PATTERNS must be a JSON array of { name, regex, entity? } entries.');
+  return parsed;
+}
+
+export function resolvePiiConfig(env: Record<string, string | undefined>, override?: Partial<PiiRuntimeConfig>): PiiRuntimeConfig {
+  const maxInputChars = env.PII_MAX_INPUT_CHARS?.trim() ? Number(env.PII_MAX_INPUT_CHARS) : undefined;
+  const presidioUrl = env.PII_PRESIDIO_URL?.trim();
+  const base = {
+    enabled: strictBoolean(env.PII_ENABLED, 'PII_ENABLED', false),
+    patterns: parsePiiPatterns(env.PII_PATTERNS),
+    anonymizeFormat: env.PII_ANONYMIZE_FORMAT?.trim() as 'type' | 'uniform' | undefined,
+    maxInputChars,
+    readiness: strictBoolean(env.PII_READINESS, 'PII_READINESS', true),
+    ...(presidioUrl ? { presidio: { url: presidioUrl } } : {}),
+  };
+  const parsed = piiConfigSchema.safeParse({ ...base, ...override });
+  if (!parsed.success) throw new Error(`Invalid PII configuration: ${parsed.error.issues.map((issue) => issue.path.join('.') || 'config').join(', ')}`);
+  const compiled = parsed.data.patterns.map((pattern) => {
+    let regex: RegExp;
+    try { regex = new RegExp(pattern.regex); } catch { throw new Error(`PII pattern "${pattern.name}" has an invalid regular expression.`); }
+    return { name: pattern.name, regex, ...(pattern.entity ? { entity: pattern.entity } : {}) };
+  });
+  return { enabled: parsed.data.enabled, patterns: compiled, anonymizeFormat: parsed.data.anonymizeFormat, maxInputChars: parsed.data.maxInputChars, readiness: parsed.data.readiness, ...(parsed.data.presidio ? { presidio: parsed.data.presidio } : {}) };
 }

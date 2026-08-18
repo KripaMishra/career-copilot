@@ -1,15 +1,112 @@
 import { createCareerToolContext } from '../tools/career-context.ts';
-import { assertRawTelegramUpdate, deriveTelegramRequest, type PrincipalInput } from '../channels/telegram-auth.ts';
-import { CareerStore } from '../storage/career-store.ts';
+import { assertRawTelegramUpdate, authorizeResumeDocument, deriveTelegramRequest, RESUME_MAX_DOWNLOAD_BYTES, type PrincipalInput, type TelegramDocument } from '../channels/telegram-auth.ts';
+import { DownloadLimitExceededError, type TelegramFileDownload } from '../channels/telegram-transport.ts';
+import { CareerStore, ResumeRevalidationError } from '../storage/career-store.ts';
 import type { Job } from '../contracts/v0.ts';
 import { OnboardingDecisionSchema, assertSafeOnboardingDraft, isDirectIdentifierOnboardingInput, isUnavailableOnboardingInput, nextOnboardingQuestion, onboardingFieldFromLabel, onboardingFields, onboardingMissingFields, onboardingReviewText, requiredOnboardingComplete, type OnboardingDecision, type OnboardingDraft, type OnboardingStatus } from '../contracts/onboarding.ts';
 import type { AppLogger } from '../observability.ts';
+import { extractPdfText, type PdfRejectionReason } from '../integrations/pdf-text.ts';
+import type { PiiService } from './pii.ts';
 
 export type Command = { kind: 'save'; url: string } | { kind: 'job'; jobId?: string } | { kind: 'queue' } | { kind: 'onboarding'; action: 'start' | 'restart' | 'cancel' };
 const unavailableOnboardingReply = 'Resume, URL, and file ingestion are unavailable in V1. Please answer the current structured question instead.';
 const longOnboardingReply = 'That onboarding answer is too long (maximum 4000 characters). Please shorten it and try again.';
 const onboardingModelRetryReply = 'I could not safely process that onboarding reply. Please try again with a short text answer.';
 const directIdentifierOnboardingReply = 'That looks like direct personal identifier or credential information, which onboarding cannot accept. Please share only career-relevant facts.';
+const redactionFailedReply = 'Your document could not be processed safely. Please try again or share the information as text.';
+const resumeUnavailableReply = 'Resume document ingestion is currently unavailable. Please answer the structured questions or share your details as text.';
+const resumeNoOnboardingReply = 'Start /onboarding first, then send your resume PDF.';
+function resumeRejectionReply(reason: PdfRejectionReason | 'download_failed'): string {
+  switch (reason) {
+    case 'not_a_document': return 'That message is not a supported document.';
+    case 'unsupported_mime': return 'Only text-based PDF documents are accepted.';
+    case 'unsupported_extension': return 'Only .pdf documents are accepted.';
+    case 'oversized': return 'That document is too large (maximum 5 MiB).';
+    case 'caption_unsupported': return 'Documents with captions are not accepted. Please send the PDF without a caption.';
+    case 'download_failed': return 'The document could not be downloaded safely. Please try again.';
+    case 'not_pdf': return 'That file is not a valid PDF.';
+    case 'encrypted': return 'Encrypted PDFs cannot be processed safely.';
+    case 'malformed': return 'That PDF is malformed and could not be read.';
+    case 'no_text': return 'That PDF contains no extractable text (scanned or image-only PDFs are not supported).';
+    case 'too_many_pages': return 'That PDF has too many pages (maximum 50).';
+    case 'overlong': return 'That PDF has too much text (maximum 200,000 characters).';
+    case 'timeout': return 'The PDF could not be processed in time. Please try a smaller document.';
+  }
+}
+
+/**
+ * Pre-agent redaction trust boundary: raw extracted resume text goes through
+ * the local engine before anything else sees it. Fails closed — while PII is
+ * disabled or un-warmed, or when redaction itself throws, nothing raw
+ * proceeds; callers surface a safe message instead.
+ */
+export async function redactTextForIngestion(pii: PiiService, text: string, logger?: AppLogger): Promise<string> {
+  if (!pii.enabled || !pii.ready) { try { logger?.('warn', 'pii.redaction.unavailable', {}); } catch { /* logging cannot break ingestion */ } throw new Error(redactionFailedReply); }
+  try { return await pii.redactText(text); }
+  catch (error) {
+    try { logger?.('warn', 'pii.redaction.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); } catch { /* logging cannot break ingestion */ }
+    throw new Error(redactionFailedReply);
+  }
+}
+
+export type ResumeDocumentInput = {
+  store: CareerStore; ownerId: string; conversationId: string; requestId: string;
+  document: TelegramDocument; pii: PiiService; onboard?: OnboardingResponder;
+  download?: TelegramFileDownload; extract?: typeof extractPdfText; logger?: AppLogger; caption?: string;
+};
+
+/** Download → bounded extraction → redaction, isolated in one scope (spec rule
+ * 11): raw bytes and the extraction object are unreachable once it resolves;
+ * only sanitized text and page count survive into the onboarding turn. */
+async function extractAndRedactResume(input: ResumeDocumentInput, log: AppLogger): Promise<{ sanitized: string; pageCount: number } | { rejected: string }> {
+  let bytes: Uint8Array;
+  try {
+    const downloaded = await (input.download ?? (async () => { throw new Error('No download transport configured.'); }))(input.document.file_id, { maxBytes: RESUME_MAX_DOWNLOAD_BYTES });
+    bytes = downloaded.bytes;
+  } catch (error) {
+    log('warn', 'resume.download.failed', { errorName: error instanceof DownloadLimitExceededError ? 'DownloadLimitExceeded' : (error instanceof Error ? error.name : 'UnknownError') });
+    return { rejected: resumeRejectionReply(error instanceof DownloadLimitExceededError ? 'oversized' : 'download_failed') };
+  }
+  const extraction = await (input.extract ?? extractPdfText)(bytes);
+  if (!extraction.ok) { log('warn', 'resume.extraction.rejected', { reason: extraction.reason }); return { rejected: resumeRejectionReply(extraction.reason) }; }
+  try {
+    const sanitized = await redactTextForIngestion(input.pii, extraction.text, log);
+    return { sanitized, pageCount: extraction.pageCount };
+  } catch (error) {
+    log('warn', 'pii.redaction.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' });
+    return { rejected: redactionFailedReply };
+  }
+}
+
+/**
+ * Bounded resume document ingestion (spec rules 1–12): authorize the envelope
+ * before any download, cap the download, verify the signature and extract
+ * in-memory under page/char/deadline caps, redact immediately, release the raw
+ * bytes, and inject only sanitized text plus page count into the onboarding
+ * turn. Every rejection — including redaction failure — is exactly one safe
+ * terminal reply; raw bytes and ephemeral Telegram metadata never reach the
+ * agent, memory, or persistence.
+ */
+export async function handleResumeDocument(input: ResumeDocumentInput): Promise<string> {
+  const log: AppLogger = (level, event, data) => { try { input.logger?.(level, event, data); } catch { /* logging cannot break ingestion */ } };
+  if (!input.pii.enabled || !input.pii.ready) { log('warn', 'resume.ingestion.disabled', { reason: 'not_ready' }); return resumeUnavailableReply; }
+  const authorized = authorizeResumeDocument({ document: input.document, ...(input.caption !== undefined ? { caption: input.caption } : {}) });
+  if (!authorized.accepted) { log('warn', 'resume.document.rejected', { reason: authorized.reason }); return resumeRejectionReply(authorized.reason); }
+  const onboarding = await input.store.loadOnboarding(input.ownerId, input.conversationId);
+  if (!onboarding || (onboarding.status !== 'collecting' && onboarding.status !== 'review')) { log('warn', 'resume.ingestion.disabled', { reason: 'no_onboarding' }); return resumeNoOnboardingReply; }
+  const prepared = await extractAndRedactResume(input, log);
+  if ('rejected' in prepared) return prepared.rejected;
+  // D6: persist resume-derived lineage on the onboarding row so every later
+  // write (ordinary review edits, confirmation) revalidates at the boundary
+  try {
+    await input.store.markOnboardingResumeDerived({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: onboarding.version });
+  } catch {
+    log('warn', 'resume.ingestion.disabled', { reason: 'no_onboarding' });
+    return resumeNoOnboardingReply;
+  }
+  const turnText = `${prepared.sanitized}\n\n[Resume document processed safely: ${prepared.pageCount} page(s) extracted.]`;
+  return handleOnboardingTurn({ store: input.store, ownerId: input.ownerId, conversationId: input.conversationId, documentText: turnText, documentPageCount: prepared.pageCount, onboard: input.onboard, logger: log });
+}
 export function parseCommand(text: string | undefined): Command | null {
   if (!text) return null; const trimmed = text.trim();
   const onboarding = trimmed.match(/^\/onboarding(?:[ \t]+(restart|cancel|start))?$/i); if (onboarding) return { kind: 'onboarding', action: onboarding[1]?.toLowerCase() === 'restart' ? 'restart' : onboarding[1]?.toLowerCase() === 'cancel' ? 'cancel' : 'start' };
@@ -48,42 +145,61 @@ async function applyOnboardingDecision(input: { store: CareerStore; ownerId: str
   try { assertSafeOnboardingDraft(parsed.draftPatch); } catch { input.logger('warn', 'onboarding.input.blocked', { reason: 'direct_identifier', status: state.status }); return directIdentifierOnboardingReply; }
   const patch = parsed.draftPatch; const fieldKeys = Object.keys(patch); const merged = { ...state.draft, ...patch };
   const reviewReady = parsed.readyForReview && requiredOnboardingComplete(merged);
-  if (state.status === 'review') {
-    if (fieldKeys.length === 0) return parsed.reply;
-    const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: patch, status: 'review' });
-    input.logger('info', 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
-    return `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}`;
+  try {
+    if (state.status === 'review') {
+      if (fieldKeys.length === 0) return parsed.reply;
+      const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: patch, status: 'review' });
+      input.logger('info', 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
+      return `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}`;
+    }
+    if (fieldKeys.length === 0) {
+      if (!reviewReady) return parsed.reply;
+      const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: {}, status: 'review' });
+      input.logger('info', 'onboarding.review.ready', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
+      return `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}`;
+    }
+    const status = reviewReady ? 'review' : 'collecting';
+    const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: patch, status });
+    input.logger('info', status === 'review' ? 'onboarding.review.ready' : 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
+    return status === 'review' ? `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}` : parsed.reply;
+  } catch (error) {
+    if (error instanceof ResumeRevalidationError) { input.logger('warn', 'onboarding.input.blocked', { reason: 'resume_revalidation', status: state.status }); return 'Your resume content could not be saved safely. Please share the details as text instead.'; }
+    throw error;
   }
-  if (fieldKeys.length === 0) {
-    if (!reviewReady) return parsed.reply;
-    const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: {}, status: 'review' });
-    input.logger('info', 'onboarding.review.ready', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
-    return `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}`;
-  }
-  const status = reviewReady ? 'review' : 'collecting';
-  const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: patch, status });
-  input.logger('info', status === 'review' ? 'onboarding.review.ready' : 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys, missingFields: onboardingMissingFields(saved.draft) });
-  return status === 'review' ? `${parsed.reply}\n\n${onboardingReviewText(saved.draft)}` : parsed.reply;
 }
 
-export async function handleOnboardingTurn(input: { store: CareerStore; ownerId: string; conversationId: string; text?: string; nonTextInput?: boolean; onboard?: OnboardingResponder; logger?: AppLogger }) {
+export async function handleOnboardingTurn(input: { store: CareerStore; ownerId: string; conversationId: string; text?: string; nonTextInput?: boolean; onboard?: OnboardingResponder; logger?: AppLogger; documentText?: string; documentPageCount?: number }) {
   const log: AppLogger = (level, event, data) => { try { input.logger?.(level, event, data); } catch { /* logging cannot break work */ } };
+  const documentTurn = input.documentText !== undefined;
   const command = parseCommand(input.text);
   if (command?.kind === 'onboarding') {
     if (command.action === 'cancel') { const state = await input.store.loadOnboarding(input.ownerId, input.conversationId); if (!state || !['collecting', 'review'].includes(state.status)) return 'No active onboarding to cancel.'; await input.store.cancelOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.cancelled', { status: 'cancelled', version: state.version + 1 }); return 'Onboarding cancelled and draft content cleared. Send /onboarding to start again.'; }
     const state = await input.store.startOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, restart: command.action === 'restart' }); log('info', 'onboarding.started', { status: state.status, version: state.version }); return onboardingReply(state);
   }
   const state = await input.store.loadOnboarding(input.ownerId, input.conversationId); if (!state || (state.status !== 'collecting' && state.status !== 'review')) return null;
-  if (input.nonTextInput) { log('warn', 'onboarding.input.blocked', { reason: 'non_text', status: state.status }); return unavailableOnboardingReply; }
-  const trimmed = input.text?.trim(); if (!trimmed) return null;
-  if (/^\/?cancel$/i.test(trimmed)) { await input.store.cancelOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.cancelled', { status: 'cancelled', version: state.version + 1 }); return 'Onboarding cancelled and draft content cleared. Send /onboarding to start again.'; }
-  if (trimmed.startsWith('/')) { log('warn', 'onboarding.input.blocked', { reason: 'command', status: state.status }); return 'Please finish or cancel onboarding before using commands.'; }
-  if (trimmed.length > 4000) { log('warn', 'onboarding.input.blocked', { reason: 'overlength', status: state.status }); return longOnboardingReply; }
-  if (isUnavailableOnboardingInput(trimmed)) { log('warn', 'onboarding.input.blocked', { reason: 'unavailable_input', status: state.status }); return unavailableOnboardingReply; }
+  if (input.nonTextInput && !documentTurn) { log('warn', 'onboarding.input.blocked', { reason: 'non_text', status: state.status }); return unavailableOnboardingReply; }
+  const trimmed = (documentTurn ? input.documentText : input.text)?.trim(); if (!trimmed) return null;
+  if (!documentTurn) {
+    if (/^\/?cancel$/i.test(trimmed)) { await input.store.cancelOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.cancelled', { status: 'cancelled', version: state.version + 1 }); return 'Onboarding cancelled and draft content cleared. Send /onboarding to start again.'; }
+    if (trimmed.startsWith('/')) { log('warn', 'onboarding.input.blocked', { reason: 'command', status: state.status }); return 'Please finish or cancel onboarding before using commands.'; }
+    if (trimmed.length > 4000) { log('warn', 'onboarding.input.blocked', { reason: 'overlength', status: state.status }); return longOnboardingReply; }
+    if (isUnavailableOnboardingInput(trimmed)) { log('warn', 'onboarding.input.blocked', { reason: 'unavailable_input', status: state.status }); return unavailableOnboardingReply; }
+  }
   if (isDirectIdentifierOnboardingInput(trimmed)) { log('warn', 'onboarding.input.blocked', { reason: 'direct_identifier', status: state.status }); return directIdentifierOnboardingReply; }
   if (state.status === 'review') {
-    if (/^confirm$/i.test(trimmed)) { await input.store.completeOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version }); log('info', 'onboarding.completed', { status: 'completed', version: state.version }); return 'Onboarding complete. Your confirmed profile is active now.'; }
-    const edit = trimmed.match(/^edit\s+([^:]+):\s*(.+)$/i); if (edit) { const key = onboardingFieldFromLabel(edit[1]); if (!key) return `Unknown field. Edit one of: ${onboardingFields.map((field) => field.key).join(', ')}.`; const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: { [key]: edit[2].trim() }, status: 'review' }); log('info', 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys: [key] }); return onboardingReviewText(saved.draft); }
+    if (/^confirm$/i.test(trimmed)) {
+      try {
+        await input.store.completeOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version });
+        log('info', 'onboarding.completed', { status: 'completed', version: state.version });
+        return 'Onboarding complete. Your confirmed profile is active now.';
+      } catch (error) {
+        if (error instanceof ResumeRevalidationError) { log('warn', 'onboarding.input.blocked', { reason: 'resume_revalidation', status: state.status }); return 'Your resume content could not be saved safely. Please share the details as text instead.'; }
+        throw error;
+      }
+    }
+    if (!documentTurn) {
+      const edit = trimmed.match(/^edit\s+([^:]+):\s*(.+)$/i); if (edit) { const key = onboardingFieldFromLabel(edit[1]); if (!key) return `Unknown field. Edit one of: ${onboardingFields.map((field) => field.key).join(', ')}.`; try { const saved = await input.store.saveOnboardingDraft({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version, draft: { [key]: edit[2].trim() }, status: 'review' }); log('info', 'onboarding.draft.saved', { status: saved.status, version: saved.version, fieldKeys: [key] }); return onboardingReviewText(saved.draft); } catch (error) { if (error instanceof ResumeRevalidationError) { log('warn', 'onboarding.input.blocked', { reason: 'resume_revalidation', status: state.status }); return 'Your resume content could not be saved safely. Please share the details as text instead.'; } throw error; } }
+    }
   }
   const decision = await runOnboardingResponder({ onboard: input.onboard, ownerId: input.ownerId, conversationId: input.conversationId, draft: state.draft, status: state.status, text: trimmed, logger: (level, event, data) => log(level, event, { version: state.version, ...data }) });
   return typeof decision === 'string' ? decision : applyOnboardingDecision({ store: input.store, ownerId: input.ownerId, conversationId: input.conversationId, logger: log }, state, decision);
@@ -104,7 +220,7 @@ export function createAgentResponder(agent: { generate: (text: string, options: 
   };
 }
 
-export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; logger?: AppLogger };
+export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; pii?: PiiService; downloadFile?: TelegramFileDownload; extract?: typeof extractPdfText; logger?: AppLogger };
 export type TelegramResult = { outcome: 'rejected'; reason: string } | { outcome: 'accepted'; command: string };
 type RecoveryReply = (text: string, chatId?: string) => Promise<void>;
 type CachedTelegramReply = { text: string; result: TelegramResult; updateId: number; requestId: string; notifyJobId?: string };
@@ -134,9 +250,18 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
     if (!authorized(request.userId, request.chatId, request.isPrivateChat) || request.isBot || request.isEdited || request.isForwarded) { log('warn', 'telegram.update.rejected', { updateId: raw.update_id, reason: 'unauthorized' }); return { outcome: 'rejected', reason: 'unauthorized' }; }
     const transportEventId = String(raw.update_id); const scoped = (id: string) => `telegram:${id}`; const conversationId = scoped(request.chatId); const hasText = Boolean(message?.text?.trim());
     const nonTextInput = Boolean(message && !hasText);
+    const resumeDocument = message?.document && !hasText ? message.document : undefined;
     return enqueueTurn(async () => {
       const cached = cachedReplies.get(raw.update_id); if (cached) return sendCachedReply(cached, reply);
       if (seenUpdates.has(raw.update_id)) { log('warn', 'telegram.update.rejected', { updateId: raw.update_id, reason: 'replayed_update' }); return { outcome: 'rejected', reason: 'replayed_update' }; }
+      if (resumeDocument && options.pii?.enabled && options.pii.ready) {
+        const response = await handleResumeDocument({ store, ownerId: options.ownerId, conversationId, requestId: transportEventId, document: resumeDocument, caption: message?.caption, pii: options.pii, onboard: options.onboard, download: options.downloadFile, extract: options.extract, logger: log });
+        const result: TelegramResult = { outcome: 'accepted', command: 'resume' };
+        cachedReplies.set(raw.update_id, { text: response, result, updateId: raw.update_id, requestId: transportEventId });
+        await reply(response); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);
+        log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'resume' });
+        return result;
+      }
       const onboardingResponse = await handleOnboardingTurn({ store, ownerId: options.ownerId, conversationId, text: message?.text, nonTextInput, onboard: options.onboard, logger: log });
       if (onboardingResponse) { const result: TelegramResult = { outcome: 'accepted', command: 'onboarding' }; cachedReplies.set(raw.update_id, { text: onboardingResponse, result, updateId: raw.update_id, requestId: transportEventId }); await reply(onboardingResponse); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id); log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'onboarding' }); return result; }
       if (!hasText) { log('warn', 'telegram.update.rejected', { updateId: raw.update_id, reason: 'invalid_message' }); return { outcome: 'rejected', reason: 'invalid_message' }; }
@@ -174,5 +299,5 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
     })().finally(() => { recoveryPromise = null; });
     return recoveryPromise;
   };
-  return { store, handleTelegramUpdate, recoverUnfinished, health: () => ({ configurationValid: Boolean(options.ownerId) && (options.ownerEnabled ?? true), databaseOpen: true, processorRunning: active }), close: async () => { if (!options.store) await store.close(); } };
+  return { store, handleTelegramUpdate, recoverUnfinished, health: () => ({ configurationValid: Boolean(options.ownerId) && (options.ownerEnabled ?? true), databaseOpen: true, processorRunning: active }), ingestionAvailable: () => Boolean(options.pii?.enabled && options.pii.ready), close: async () => { if (!options.store) await store.close(); } };
 }
