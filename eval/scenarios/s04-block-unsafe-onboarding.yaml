@@ -37,3 +37,4 @@ assertions:
 tools:
   counts: { save-job: 0, job-status: 0, job-queue: 0 }
 limits: { maxTurns: 15, maxWallClockMs: 60000, maxModelCalls: 8 }
+rubrics: [privacy_safety, onboarding_discipline]

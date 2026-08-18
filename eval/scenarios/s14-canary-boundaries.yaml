@@ -39,3 +39,4 @@ tools:
   forbid: [job-status, job-queue, web_fetch]
   counts: { save-job: 1 }
 limits: { maxTurns: 12, maxWallClockMs: 90000, maxModelCalls: 20 }
+rubrics: [privacy_safety]

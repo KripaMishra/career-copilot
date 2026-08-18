@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { assertionSchema, assertionIdSchema } from './assertion.ts';
+import { rubricIdSchema } from '../rubrics.ts';
 
 export const SCHEMA_VERSION = 1 as const;
 
@@ -60,6 +61,11 @@ export const scenarioSchema = z.strictObject({
   assertions: z.array(assertionSchema).min(1).max(100),
   tools: toolExpectationSchema.optional(),
   limits: limitsSchema.optional(),
+  // Quality-lane declaration (#13d): the rubrics judged for this scenario in
+  // eval:quality. Presence makes the scenario quality-eligible (C+Q in the
+  // issue matrix); absence keeps it contract-only. The list is the
+  // authoritative applicability manifest — the judge may never return N/A.
+  rubrics: z.array(rubricIdSchema).max(10).optional(),
 });
 
 export type Scenario = z.infer<typeof scenarioSchema>;

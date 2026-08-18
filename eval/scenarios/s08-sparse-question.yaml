@@ -24,3 +24,4 @@ tools:
   forbid: [save-job, web_fetch]
   counts: { save-job: 0 }
 limits: { maxTurns: 5, maxWallClockMs: 60000, maxModelCalls: 10 }
+rubrics: [task_completion, tool_selection, conversational_quality]

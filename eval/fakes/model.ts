@@ -29,11 +29,19 @@ export type ScriptedModelCall = {
   toolResultSeen: boolean;
   /** response emitted tool-call parts (the agent loop may cut off before the result is observed) */
   issuedToolCalls: boolean;
+  /** live-model only: provider-reported revision/snapshot (e.g. system_fingerprint) */
+  revision?: string | null;
+  /** live-model only: retries performed for this call */
+  retries?: number;
+  /** live-model only: estimated cost USD from the pricing table (null = unmetered) */
+  costUsd?: number | null;
+  /** live-model only: the logical call ultimately failed (no usage/cost) */
+  error?: string;
 };
 
 export type ScriptedModelLedger = { calls: ScriptedModelCall[] };
 
-function promptHasToolResult(prompt: unknown): boolean {
+export function promptHasToolResult(prompt: unknown): boolean {
   if (!Array.isArray(prompt)) return false;
   return prompt.some((message) => {
     if (typeof message === 'string') return false;

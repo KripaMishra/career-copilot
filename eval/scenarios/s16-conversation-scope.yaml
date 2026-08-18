@@ -29,3 +29,4 @@ tools:
   forbid: [save-job]
   counts: { job-status: 1, job-queue: 1 }
 limits: { maxTurns: 6, maxWallClockMs: 60000, maxModelCalls: 30 }
+rubrics: [memory_use, privacy_safety, onboarding_discipline]

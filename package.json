@@ -9,7 +9,8 @@
     "build": "mastra build --dir src/mastra",
     "start": "mastra start",
     "test": "node --experimental-strip-types --test test/*.test.ts",
-    "eval:test": "node --experimental-strip-types eval/cli.ts"
+    "eval:test": "node --experimental-strip-types eval/cli.ts",
+    "eval:quality": "node --experimental-strip-types eval/quality-cli.ts"
   },
   "keywords": [],
   "author": "",
