@@ -96,7 +96,7 @@ function onboardingStatusReply(status: Awaited<ReturnType<CareerStore['onboardin
 function resetReply(scope: 'onboarding' | 'profile' | 'all', counts: Record<string, number>) {
   if (scope === 'onboarding') return `Onboarding draft reset. ${counts.onboardingRows ?? 0} draft row(s) cleared.`;
   if (scope === 'profile') return `Profile reset. ${counts.profileDocuments ?? 0} profile document(s) and ${counts.onboardingRows ?? 0} onboarding row(s) cleared. Jobs and reports were preserved.`;
-  return `Complete reset committed. ${counts.jobs ?? 0} job(s), ${counts.reports ?? 0} report(s), ${counts.profileDocuments ?? 0} profile document(s), and ${counts.onboardingRows ?? 0} onboarding row(s) cleared.`;
+  return `Complete reset committed. ${counts.jobs ?? 0} job(s), ${counts.reports ?? 0} report(s), ${counts.profileDocuments ?? 0} profile document(s), and ${counts.onboardingRows ?? 0} onboarding row(s) cleared. Conversation history and task state are preserved.`;
 }
 const unavailableOnboardingReply = 'Resume, URL, and file ingestion are unavailable in V1. Please answer the current structured question instead.';
 const longOnboardingReply = 'That onboarding answer is too long (maximum 4000 characters). Please shorten it and try again.';

@@ -69,7 +69,7 @@ export const TELEGRAM_COMMANDS = [
   { command: 'onboarding_cancel', description: 'Cancel onboarding draft' },
   { command: 'reset_onboarding', description: 'Clear onboarding draft' },
   { command: 'reset_profile', description: 'Clear profile and drafts' },
-  { command: 'reset_all', description: 'Clear all Career Copilot data' },
+  { command: 'reset_all', description: 'Clear saved jobs, reports, profile, and onboarding drafts' },
 ] as const;
 
 export function createTelegramPollingTransport(token: string, handle: (update: unknown, reply: Reply) => Promise<unknown>, logger?: AppLogger) {

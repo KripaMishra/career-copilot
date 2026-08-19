@@ -534,6 +534,28 @@ test('CAREER_COPILOT_ALLOW_ALL_JOB_SITES relaxes the host allowlist but keeps ev
   } finally { if (prev === undefined) delete process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES; else process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = prev; }
 });
 
+test('off-site redirect to an unsupported host is classified as a bad redirect, not an unsupported site', async () => {
+  assert.throws(() => assertSameJobSite(new URL('https://linkedin.com/jobs/1'), 'https://evil.example.com/job'), /redirected to another site/);
+  // full acquisition path surfaces the redirect-specific message the save job tool maps to bad-redirect
+  await assert.rejects(() => acquireJobText('https://linkedin.com/jobs/1', { fetch: async () => new Response(null, { status: 302, headers: { location: 'https://evil.example.com/job' } }), resolve: async () => ['93.184.216.34'] }), /redirected to another site/);
+  // same-site redirects to a supported host still pass
+  assert.equal(assertSameJobSite(new URL('https://linkedin.com/jobs/1'), 'https://www.linkedin.com/jobs/2').href, 'https://www.linkedin.com/jobs/2');
+});
+
+test('CAREER_COPILOT_ALLOW_ALL_JOB_SITES parses strictly and rejects malformed values', () => {
+  const prev = process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES;
+  try {
+    for (const bad of ['yes', '1', 'on', 'tru', ' true-ish', 'enabled']) {
+      process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = bad;
+      assert.throws(() => jobSiteFor('www.usajobs.gov'), /CAREER_COPILOT_ALLOW_ALL_JOB_SITES/);
+    }
+    process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = ' false ';
+    assert.equal(jobSiteFor('www.usajobs.gov'), undefined, 'whitespace-padded false stays disabled');
+    process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = ' true ';
+    assert.equal(jobSiteFor('www.usajobs.gov'), 'usajobs.gov', 'whitespace-padded true is accepted');
+  } finally { if (prev === undefined) delete process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES; else process.env.CAREER_COPILOT_ALLOW_ALL_JOB_SITES = prev; }
+});
+
 test('Mastra registrations live in the mandated entrypoint', async () => {
   const source = await readFile(new URL('../src/mastra/index.ts', import.meta.url), 'utf8'); assert.match(source, /new Mastra\s*\(/);
 });
