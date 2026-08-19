@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { type BrowserDriver, BrowserGuardError, browserDriver } from '../src/browser/driver.ts';
+import { type BrowserDriver, BrowserGuardError, browserDriver, readSnapshotTree } from '../src/browser/driver.ts';
 import { BROWSER_MAX_MODEL_CHARS, createGuardedBrowserTool } from '../src/browser/guard.ts';
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -10,6 +10,7 @@ class FakeDriver implements BrowserDriver {
   cdpUrl = 'http://127.0.0.1:9222';
   calls: string[] = [];
   openFailures = 0;
+  navigateTransientFailures = 0;
   openError: Error | null = null;
   navigateError: Error | null = null;
   readError: Error | null = null;
@@ -31,13 +32,23 @@ class FakeDriver implements BrowserDriver {
   async navigateTo(url: string) {
     this.calls.push(`navigate:${url}`);
     this.active += 1; this.maxActive = Math.max(this.maxActive, this.active);
-    try { await sleep(2); if (this.navigateError) throw this.navigateError; return this.finalUrl; }
+    try {
+      await sleep(2);
+      if (this.navigateTransientFailures > 0) { this.navigateTransientFailures -= 1; throw new BrowserGuardError('transient', 'session_lost', '', 'Browser disconnected'); }
+      if (this.navigateError) throw this.navigateError;
+      return this.finalUrl;
+    }
     finally { this.active -= 1; }
   }
   async readSnapshot(maxChars: number) {
     this.calls.push('read');
     this.active += 1; this.maxActive = Math.max(this.maxActive, this.active);
-    try { await sleep(2); if (this.readError) throw this.readError; return (this.huge ? ''.padEnd(200_000, 'x') : this.snapshot).slice(0, maxChars); }
+    try {
+      await sleep(2);
+      if (this.readError) throw this.readError;
+      // huge deliberately ignores maxChars so only the tool's own slice bounds it
+      return this.huge ? ''.padEnd(200_000, 'x') : this.snapshot.slice(0, maxChars);
+    }
     finally { this.active -= 1; }
   }
   async close() { this.active = this.maxActive = 0; }
@@ -50,7 +61,7 @@ async function run(tool: ReturnType<typeof createGuardedBrowserTool>, url: strin
 test('forbidden host fails closed before any browser action', async () => {
   const driver = new FakeDriver();
   const tool = createGuardedBrowserTool(driver);
-  await assert.rejects(() => run(tool, 'https://example.com/'), (error: unknown) => error instanceof BrowserGuardError && error.kind === 'forbidden');
+  await assert.rejects(() => run(tool, 'https://example.com/'), (error: unknown) => error instanceof BrowserGuardError && error.kind === 'forbidden' && error.reason === 'unsupported_host');
   assert.deepEqual(driver.calls, []);
 });
 
@@ -89,9 +100,30 @@ test('redirect off the authorized site is blocked with redacted evidence', async
 
 test('snapshot text is bounded to the model char limit', async () => {
   const driver = new FakeDriver();
-  driver.huge = true; // ignores the maxChars arg on purpose
+  driver.huge = true; // returns unsliced 200k chars; only the tool may bound it
   const result = await run(createGuardedBrowserTool(driver), 'https://www.linkedin.com/jobs/view/1');
   assert.ok(result.text.length <= BROWSER_MAX_MODEL_CHARS);
+  assert.equal(result.text.length, BROWSER_MAX_MODEL_CHARS);
+});
+
+test('readSnapshotTree always takes a fresh snapshot, never a stale cache', async () => {
+  const source = {
+    getLastSnapshot: () => 'STALE previous page content',
+    getSnapshot: async () => ({ tree: 'FRESH current page content', refs: {} }),
+  };
+  const text = await readSnapshotTree(source as unknown as Parameters<typeof readSnapshotTree>[0], 1_000);
+  assert.match(text, /FRESH current page content/);
+  assert.doesNotMatch(text, /STALE/);
+});
+
+test('connection lost mid-navigate is reconnected and retried boundedly', async () => {
+  const driver = new FakeDriver();
+  driver.navigateTransientFailures = 1;
+  const result = await run(createGuardedBrowserTool(driver), 'https://www.linkedin.com/jobs/view/1');
+  assert.equal(result.url, driver.finalUrl);
+  assert.match(result.text, /Senior Platform Engineer/);
+  assert.equal(driver.calls.filter((c) => c === 'open').length, 2, 'reconnected after the drop');
+  assert.equal(driver.calls.filter((c) => c.startsWith('navigate:')).length, 2, 'navigation was retried');
 });
 
 test('transient connection failures retry boundedly then succeed', async () => {
@@ -151,6 +183,15 @@ test('mutex releases on error so the next read can proceed', async () => {
   driver.finalUrl = 'https://www.linkedin.com/jobs/view/2';
   const result = await run(tool, 'https://www.linkedin.com/jobs/view/2');
   assert.match(result.text, /Senior Platform Engineer/);
+});
+
+test('connection lost while reading becomes a blocker, next driver open can recover', async () => {
+  const driver = new FakeDriver();
+  driver.readError = new BrowserGuardError('transient', 'session_lost', '', 'Browser disconnected');
+  await assert.rejects(
+    () => run(createGuardedBrowserTool(driver), 'https://www.linkedin.com/jobs/view/1'),
+    (error: unknown) => error instanceof BrowserGuardError && error.kind === 'blocked' && error.reason === 'session_lost_on_read',
+  );
 });
 
 test('driver with no CDP URL refuses to open (forbidden)', async () => {

@@ -1,7 +1,7 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { assertJobUrl, jobSiteFor } from '../tools/job-url.ts';
-import { type BrowserDriver, BrowserGuardError, browserDriver } from './driver.ts';
+import { type BrowserDriver, BrowserGuardError, browserDriver, isConnectionLost } from './driver.ts';
 
 export const BROWSER_MAX_MODEL_CHARS = 60_000;
 export const BROWSER_CONNECT_ATTEMPTS = 3;
@@ -26,20 +26,16 @@ export function redactBrowserEvidence(value: string): string {
   return value.slice(0, MAX_REDACTED_EVIDENCE).replace(/\b\S{24,}\b/g, '[redacted]');
 }
 
-const TRANSIENT_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EAI_AGAIN', 'UND_ERR_CONNECT_TIMEOUT']);
-function transientConnect(error: unknown) {
-  const code = String((error as { code?: unknown })?.code ?? '');
-  const message = error instanceof Error ? error.message : '';
-  return TRANSIENT_CODES.has(code) || /failed to connect via cdp|connectovercdp|browser disconnected|socket hang up|target closed/i.test(message);
-}
-
 export function classifyBrowserFailure(error: unknown, phase: 'connect' | 'navigate' | 'read'): BrowserGuardError {
   if (error instanceof BrowserGuardError) return error;
   const message = error instanceof Error ? error.message : String(error);
-  if (phase === 'connect' && transientConnect(error)) return new BrowserGuardError('transient', 'connect_failed', redactBrowserEvidence(message), `Browser connection failed (transient).`);
-  if (phase === 'connect') return new BrowserGuardError('blocked', 'browser_unreachable', redactBrowserEvidence(message), `Browser session is not reachable.`);
-  // Navigate/read: timeouts, auth, CAPTCHA, MFA, consent, DOM ambiguity => blocked (never bypass, never auto-retry).
-  return new BrowserGuardError('blocked', phase === 'navigate' ? 'navigation_failed' : 'read_failed', redactBrowserEvidence(message), `Browser ${phase} stopped: ${message}`);
+  const evidence = redactBrowserEvidence(message);
+  if (phase === 'connect' && isConnectionLost(error)) return new BrowserGuardError('transient', 'connect_failed', evidence, 'Browser connection failed (transient).');
+  if (phase === 'connect') return new BrowserGuardError('blocked', 'browser_unreachable', evidence, 'Browser session is not reachable.');
+  // Navigate/read: timeouts, auth, CAPTCHA, MFA, consent, DOM ambiguity => blocked
+  // (never bypass, never auto-retry). The raw message goes only into redacted
+  // evidence — browser errors routinely embed token-bearing URLs.
+  return new BrowserGuardError('blocked', phase === 'navigate' ? 'navigation_failed' : 'read_failed', evidence, `Browser ${phase} stopped.`);
 }
 
 async function withConnectRetry(operation: () => Promise<void>): Promise<void> {
@@ -48,7 +44,7 @@ async function withConnectRetry(operation: () => Promise<void>): Promise<void> {
     catch (error) {
       const classified = classifyBrowserFailure(error, 'connect');
       if (classified.kind !== 'transient') throw classified;
-      if (attempt >= BROWSER_CONNECT_ATTEMPTS) throw new BrowserGuardError('blocked', 'connect_retries_exhausted', classified.evidence, `Browser connection failed after ${attempt} attempts.`);
+      if (attempt >= BROWSER_CONNECT_ATTEMPTS) throw new BrowserGuardError('blocked', 'connect_retries_exhausted', classified.evidence, 'Browser connection failed after repeated attempts.');
       await new Promise((resolve) => setTimeout(resolve, BROWSER_CONNECT_BASE_DELAY_MS * 2 ** (attempt - 1) + Math.floor(Math.random() * 40)));
     }
   }
@@ -56,7 +52,9 @@ async function withConnectRetry(operation: () => Promise<void>): Promise<void> {
 
 function toForbidden(error: unknown): BrowserGuardError {
   if (error instanceof BrowserGuardError) return error;
-  return new BrowserGuardError('forbidden', 'url_invalid', '', error instanceof Error ? error.message : 'Invalid URL.');
+  const message = error instanceof Error ? error.message : '';
+  if (/host is not supported/i.test(message)) return new BrowserGuardError('forbidden', 'unsupported_host', '', message);
+  return new BrowserGuardError('forbidden', 'url_invalid', '', message || 'Invalid URL.');
 }
 
 /**
@@ -68,24 +66,43 @@ export function createGuardedBrowserTool(driver: BrowserDriver = browserDriver()
   return createTool({
     id: 'browser_read',
     description:
-      'Read bounded content from an authorized job board through a guarded, shared authenticated browser. Read-only: it navigates and reads the page accessibility tree; it never submits forms, types text, or runs scripts. Rejects unsupported or non-HTTPS hosts, and stops (without retry or bypass) on auth, CAPTCHA, consent, redirects off-site, timeouts, or DOM ambiguity.',
-    inputSchema: z.object({ url: z.string().url() }).strict(),
-    outputSchema: z.object({ url: z.string(), text: z.string() }).strict(),
+      'Read bounded content from an authorized job board through a guarded, shared authenticated browser. Read-only: it navigates and reads the page accessibility tree; it never submits forms, types text, or runs scripts. Rejects unsupported or non-HTTPS hosts, and stops (without retry or bypass) on auth, CAPTCHA, consent, redirects off-site, timeouts, or DOM ambiguity. Transient connection losses are reconnected and retried boundedly.',
+    inputSchema: z.object({ url: z.string().url() }),
+    outputSchema: z.object({ url: z.string(), text: z.string() }),
     execute: async ({ url }) =>
       browserMutex.run(async () => {
         let expected: URL;
         try { expected = assertJobUrl(url); } catch (error) { throw toForbidden(error); }
         const site = jobSiteFor(expected.hostname);
         if (!site) throw new BrowserGuardError('forbidden', 'unsupported_host', '', `Host ${expected.hostname} is not an authorized job site.`);
-        await withConnectRetry(async () => driver.open());
         let finalUrl: string;
-        try { finalUrl = await driver.navigateTo(expected.href); }
-        catch (error) { throw classifyBrowserFailure(error, 'navigate'); }
-        const finalSite = jobSiteFor(new URL(finalUrl).hostname);
+        for (let attempt = 1; ; attempt++) {
+          try {
+            await withConnectRetry(async () => driver.open());
+            finalUrl = await driver.navigateTo(expected.href);
+            break;
+          } catch (error) {
+            const classified = classifyBrowserFailure(error, 'navigate');
+            if (classified.kind === 'transient' && attempt < BROWSER_CONNECT_ATTEMPTS) {
+              // Connection lost mid-navigate: loop reconnects via open() and retries.
+              continue;
+            }
+            if (classified.kind === 'transient') throw new BrowserGuardError('blocked', 'session_lost_after_retries', classified.evidence, 'Browser connection kept dropping during navigation.');
+            throw classified;
+          }
+        }
+        let finalHost: string;
+        try { finalHost = new URL(finalUrl).hostname; }
+        catch { throw new BrowserGuardError('blocked', 'invalid_final_url', redactBrowserEvidence(finalUrl), 'Browser returned an invalid final URL.'); }
+        const finalSite = jobSiteFor(finalHost);
         if (!finalSite || finalSite !== site) throw new BrowserGuardError('blocked', 'redirect_off_site', redactBrowserEvidence(finalUrl), `Browser redirect left the authorized site (${site}).`);
         let text: string;
         try { text = await driver.readSnapshot(BROWSER_MAX_MODEL_CHARS); }
-        catch (error) { throw classifyBrowserFailure(error, 'read'); }
+        catch (error) {
+          const classified = classifyBrowserFailure(error, 'read');
+          if (classified.kind === 'transient') throw new BrowserGuardError('blocked', 'session_lost_on_read', classified.evidence, 'Browser connection was lost while reading the page.');
+          throw classified;
+        }
         return { url: finalUrl, text: text.slice(0, BROWSER_MAX_MODEL_CHARS) };
       }),
   });

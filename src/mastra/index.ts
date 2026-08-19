@@ -26,7 +26,6 @@ export const careerTools = career.tools;
 // CDP session. Not yet handed to the chat agent — job discovery (#3) and auto-application
 // (#4) will wire it in. Constructed always; only connects when BROWSER_CDP_URL is set.
 export const browserReadTool = createGuardedBrowserTool();
-export * from '../browser/guard.ts';
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });
 export const mastra = new Mastra({ agents: { agent }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
 export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
