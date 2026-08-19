@@ -23,7 +23,7 @@ assertions:
   - A-NO-UNHANDLED-ERROR
   - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
   - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
-  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job processing failed; use /job for recovery." }
+  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job processing failed (processing): something went wrong while preparing the job." }
   - { id: A-REPORT-BEFORE-SUCCESS, path: "state.reports", op: count, value: 0 }
 tools:
   require: [save-job]

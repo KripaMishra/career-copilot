@@ -23,7 +23,7 @@ assertions:
   - A-NO-UNHANDLED-ERROR
   - { id: A-JOB-STATE, path: "state.jobs", op: count, value: 1 }
   - { id: A-JOB-STATE, path: "state.jobs[0].status", op: eq, value: failed }
-  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job content could not be fetched safely." }
+  - { id: A-SAFE-ERROR, path: "state.jobs[0].safeError", op: eq, value: "Job fetch failed (bad-redirect): the page redirected to another site." }
 tools:
   require: [save-job]
   counts: { save-job: 1 }

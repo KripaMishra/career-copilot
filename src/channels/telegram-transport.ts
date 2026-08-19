@@ -59,8 +59,21 @@ export function createTelegramFileDownloader(token: string, logger?: AppLogger):
   };
 }
 
+export const TELEGRAM_COMMANDS = [
+  { command: 'save', description: 'Save a job URL' },
+  { command: 'job', description: 'Show a job status' },
+  { command: 'queue', description: 'List saved jobs' },
+  { command: 'onboarding', description: 'Start or resume onboarding' },
+  { command: 'onboarding_status', description: 'Show onboarding status' },
+  { command: 'onboarding_restart', description: 'Restart onboarding draft' },
+  { command: 'onboarding_cancel', description: 'Cancel onboarding draft' },
+  { command: 'reset_onboarding', description: 'Clear onboarding draft' },
+  { command: 'reset_profile', description: 'Clear profile and drafts' },
+  { command: 'reset_all', description: 'Clear saved jobs, reports, profile, and onboarding drafts' },
+] as const;
+
 export function createTelegramPollingTransport(token: string, handle: (update: unknown, reply: Reply) => Promise<unknown>, logger?: AppLogger) {
-  let stopped = false; let offset = 0; let pollController: AbortController | null = null;
+  let stopped = false; let offset = 0; let pollController: AbortController | null = null; let commandController: AbortController | null = null; let commandsRegistered = false;
   const log: AppLogger = (level, event, data) => { try { logger?.(level, event, data); } catch { /* logging cannot stop polling */ } };
   const call = async <T>(method: string, body: Record<string, unknown> = {}, signal: AbortSignal = AbortSignal.timeout(15_000)): Promise<T> => {
     const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body), signal });
@@ -76,8 +89,21 @@ export function createTelegramPollingTransport(token: string, handle: (update: u
       log('info', 'telegram.reply.sent', { ...data, chunkCount, durationMs: Date.now() - started });
     } catch (error) { log('error', 'telegram.reply.failed', { ...data, chunkCount, durationMs: Date.now() - started, errorName: error instanceof Error ? error.name : 'UnknownError' }); throw error; }
   };
+  const registerCommands = async () => {
+    if (commandsRegistered || !token || stopped) return;
+    commandController = new AbortController();
+    try {
+      await call('setMyCommands', { commands: TELEGRAM_COMMANDS }, AbortSignal.any([commandController.signal, AbortSignal.timeout(15_000)]));
+      commandsRegistered = true;
+      log('info', 'telegram.commands.registered', { commandCount: TELEGRAM_COMMANDS.length });
+    } catch (error) {
+      if (!stopped) log('error', 'telegram.commands.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' });
+    } finally { commandController = null; }
+  };
   const start = async () => {
     if (!token) return;
+    await registerCommands();
+    if (stopped) return;
     log('info', 'telegram.poll.started');
     while (!stopped) {
       try {
@@ -102,5 +128,5 @@ export function createTelegramPollingTransport(token: string, handle: (update: u
     }
     log('info', 'telegram.poll.stopped');
   };
-  return { start, sendMessage, stop: () => { stopped = true; pollController?.abort(); }, downloadFile };
+  return { start, sendMessage, stop: () => { stopped = true; commandController?.abort(); pollController?.abort(); }, downloadFile };
 }

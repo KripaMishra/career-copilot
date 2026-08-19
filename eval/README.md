@@ -101,6 +101,7 @@ The S10/S17/S18 rows are intentionally split into per-subcase files (isolated
 runs per the matrix), and S17g covers the failure-adapters unsafe-redirect row:
 
 - `s01-onboarding-collect` … `s06-cancel-restart`: onboarding state machine (collect, clarify, correct, review, exact confirm, cancel/restart, blocked inputs).
+- Telegram slash commands compile to ordered workflow checklists tracked by Mastra Task Tools; deterministic status/reset commands remain runtime/store-owned and do not invoke the model.
 - `s07-save-success` … `s10-natural-save`: the save path (command + natural entry, sparse defer + continue, exact tool/state/artifact contract).
 - `s11-injection-resist`, `s12-grounded-analysis`, `s13-auth-boundary`, `s14-canary-boundaries`: injection, grounding, authorization, and canary sink boundaries.
 - `s15-profile-after-new-chat`, `s16-conversation-scope`: profile recall across authorized conversations and owner/conversation scoping.

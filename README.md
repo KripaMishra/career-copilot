@@ -19,12 +19,12 @@ Implemented:
 
 - one owner and one registered Mastra agent;
 - Telegram private-chat ingress with explicit user and chat allowlists;
-- natural-language career conversation plus `/save`, `/job`, `/queue`, and guided `/onboarding` shortcuts;
-- resource-scoped working memory, the last 20 conversation messages, and thread-scoped Observational Memory outside active onboarding;
+- natural-language career conversation plus `/save`, `/job`, `/queue`, guided `/onboarding`, status, and reset shortcuts;
+- resource-scoped memory, the last 20 conversation messages, thread-scoped Observational Memory, and Mastra Task Tool workflow state outside active onboarding;
 - owner/conversation-scoped guided onboarding state with structured review, edit, cancel, and confirmed profile activation;
 - one libSQL backend: Turso in production, file-backed locally;
 - synchronous save execution with durable job state;
-- HTTPS-only acquisition from an explicit job-site allowlist;
+- HTTPS-only acquisition, with an explicit job-site allowlist (`CAREER_COPILOT_ALLOW_ALL_JOB_SITES=true` relaxes it to any https host while keeping all other guards);
 - SSRF, redirect, content-type, timeout, and response-size controls;
 - structured model analysis;
 - owner-scoped Markdown report rows with stable report IDs;
@@ -93,7 +93,7 @@ Turso in production / file URL locally)]
 1. `resolveRuntimeConfig()` validates one libSQL database URL: local `file:` for development/tests, or Turso `libsql:`/`https:` with `TURSO_AUTH_TOKEN` for production.
 2. `CareerStore` opens the same libSQL database and initializes/migrates `career_jobs`, `career_reports`, `career_profile_documents`, and `career_onboarding`.
 3. Active owner-scoped profile documents are available from `career_profile_documents`, joined, and capped at 100,000 characters.
-4. `createCareerAgentKit()` creates the agent and its career/onboarding tools with the configured memory model.
+4. `createCareerAgentKit()` creates the agent, its guarded career tools, and Mastra `TaskSignalProvider` with the configured memory model.
 5. Mastra is created with the agent, the same LibSQL/Turso storage, and redacted observability.
 6. The Career Copilot runtime and Telegram long-polling transport are created.
 7. Unfinished jobs are recovered before Telegram polling begins.
@@ -110,8 +110,8 @@ The agent uses:
 
 - model: `CAREER_COPILOT_MODEL`, defaulting to `opencode-go/deepseek-v4-flash`;
 - message history: the last 20 messages;
-- working memory: resource-scoped Career Profile fields;
-- Observational Memory: thread-scoped, using `CAREER_COPILOT_MEMORY_MODEL` or the main model fallback;
+- memory: the last 20 conversation messages and thread-scoped Observational Memory, using `CAREER_COPILOT_MEMORY_MODEL` or the main model fallback;
+- Task Tools: `TaskSignalProvider` registers `task_write`, `task_update`, `task_complete`, and `task_check` and persists workflow checklists in thread-scoped task state;
 - generation limit: eight steps for a conversation turn;
 - structured analysis: one model step, no tool calls, validated by `AnalysisSchema`.
 
@@ -122,10 +122,13 @@ Registered tools:
 | `save-job` | Fetch, analyze, report, and track one job | Trusted owner, actor, conversation, and request context |
 | `job-status` | Return safe state for one job or the latest job | Owner plus current conversation |
 | `job-queue` | Return up to 100 job IDs and statuses | Owner plus current conversation |
+| `career-profile` | Return whether an active canonical profile exists and its bounded content | Trusted owner context |
+| `onboarding-status` | Return authoritative onboarding/profile lifecycle state | Trusted owner plus current conversation |
+| `task_write`, `task_update`, `task_complete`, `task_check` | Track the current slash-command checklist | Thread-scoped agent task state |
 
 Active onboarding uses a dedicated tool-free responder with owner/conversation-scoped Mastra memory. The runtime validates draft patches and owns review, edits, cancellation, and confirmation; only exact runtime-observed `confirm` activates the profile.
 
-Outside onboarding, the agent is instructed to ask one concise question when profile context is insufficient, store the pending URL in working memory, and continue after the owner replies; another `/save` should not be required.
+An empty `career-profile` result means no active persisted profile was found. It does not indicate a missing profile page, an authentication failure, or a reauthentication flow. `save-job` may combine the active canonical profile with career facts supplied in the current turn. There is no durable pending-save state, so the agent must not claim that an unexecuted URL was recorded or will resume automatically.
 
 The same agent performs the final structured job analysis through `analyzeJob()`. The analysis call disables tools, accepts at most 100,000 characters each of job text and profile context, and must produce schema-valid title, company, location, summary, fit score, and next step.
 
@@ -178,19 +181,27 @@ Transport behavior:
 
 Accepted turns execute serially through one promise queue. This prevents concurrent turns from racing the single owner's conversation state. Once an update's state/tool effects have completed, the runtime caches the outbound response before calling Telegram; if that reply fails and Telegram retries the same update in the same process, the cached response is resent without rerunning model/state/tool effects. This in-memory cache is intentionally not durable across process restarts; persisted job deduplication still protects save requests, but onboarding reply retries after a restart may need normal state recovery/resume.
 
-Command shortcuts are translated into explicit agent instructions; they do not bypass the agent:
+Recognized slash commands compile to stable ordered workflow checklists. Agent-driven commands inject the checklist and require Mastra Task Tools (`task_write`, `task_update`, `task_complete`, `task_check`) to track progress in the current thread. Task completion is workflow bookkeeping, not proof that a business operation succeeded. Status and reset commands execute deterministically in the authenticated runtime/store path and do not invoke the model or Task Tools.
 
 ```text
-/save <url>      save a supported job after profile context is sufficient
-/job             show the latest job in this conversation
-/job <job-id>    show one job in this conversation
-/queue           list jobs in this conversation
-/onboarding      start or resume guided structured onboarding
-/onboarding restart  clear any prior draft and start over
+/save <url>          save a supported job after profile context is sufficient
+/job                 show the latest job in this conversation
+/job <job-id>        show one job in this conversation
+/queue               list jobs in this conversation
+/onboarding          start or resume guided structured onboarding
+/onboarding status   report draft and confirmed-profile state
+/onboarding restart  clear the current draft and start over
 /onboarding cancel   cancel active onboarding and clear draft content
+/reset onboarding    clear only this conversation's onboarding draft
+/reset profile       clear the owner's profile and onboarding drafts; preserve jobs/reports
+/reset all           clear the owner's onboarding, profile, jobs, and reports transactionally
 ```
 
-Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or tool calls. The responder uses owner/conversation-scoped Mastra message history, working memory, and observational memory, but receives no trusted tool request context. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
+Telegram's command menu uses single-token aliases for nested actions: `/onboarding_status`, `/onboarding_restart`, `/onboarding_cancel`, `/reset_onboarding`, `/reset_profile`, and `/reset_all`. The space-separated forms remain supported. Malformed known commands such as `/save` without a URL return deterministic usage text and never invoke the agent.
+
+Only exact runtime-observed `confirm` activates a canonical profile. `/onboarding restart` is draft-only and does not delete the active profile or jobs. The reset commands cover CareerStore data; they do not claim to delete existing Mastra conversation history or observational-memory records unless a separate memory deletion operation is implemented.
+
+Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or tool calls. The responder uses owner/conversation-scoped Mastra message history and observational memory, but receives no trusted tool request context. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
 
 ### Save pipeline
 
@@ -379,6 +390,7 @@ CAREER_COPILOT_PRIVATE_CHAT_IDS=123456789
 
 CAREER_COPILOT_MODEL=opencode-go/deepseek-v4-flash
 CAREER_COPILOT_MEMORY_MODEL=opencode-go/deepseek-v4-flash
+# CAREER_COPILOT_ALLOW_ALL_JOB_SITES=true  # accept any https job host (off by default)
 OPENCODE_API_KEY=replace-me
 # GOOGLE_GENERATIVE_AI_API_KEY=replace-me
 ```
@@ -398,6 +410,7 @@ Configuration notes:
 - `CAREER_COPILOT_OWNER_RESOURCE_ID` is the stable Mastra memory resource ID. Changing it creates a different memory owner.
 - `CAREER_COPILOT_MEMORY_MODEL` controls Observational Memory's Observer/Reflector model and falls back to `CAREER_COPILOT_MODEL`.
 - `CAREER_COPILOT_OWNER_ENABLED=false` disables Telegram authorization and recovery delivery.
+- `CAREER_COPILOT_ALLOW_ALL_JOB_SITES` (set to a truthy value other than `0`/`false`/`no`/`off`) accepts any HTTPS job URL instead of the built-in allowlist (`linkedin.com`, `foundit.in`, `cutshort.io`, `naukri.com`, `indeed.com`). HTTPS-only, credentials/port/fragment blocks, local/metadata host blocks, and the fetch-layer private-IP and same-host redirect checks still apply.
 - Telegram ID lists accept comma-separated numeric IDs in development. Production currently requires exactly one user ID and one private chat ID.
 - Set the credential variable required by the selected Mastra model provider.
 - `.env`, `.local-data/`, `.mastra/`, and generated outputs must remain untracked.

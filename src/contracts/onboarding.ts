@@ -6,6 +6,15 @@ import { z } from 'zod';
 export const OnboardingStatusSchema = z.enum(['collecting', 'review', 'completed', 'cancelled']);
 export type OnboardingStatus = z.infer<typeof OnboardingStatusSchema>;
 
+export const OnboardingStatusProjectionSchema = z.object({
+  found: z.boolean(),
+  status: OnboardingStatusSchema.nullable(),
+  version: z.number().int().nullable(),
+  missingFields: z.array(z.string()),
+  profileFound: z.boolean(),
+}).strict();
+export type OnboardingStatusProjection = z.infer<typeof OnboardingStatusProjectionSchema>;
+
 const answer = z.string().trim().min(1).max(4000);
 export const OnboardingDraftSchema = z.object({
   currentStatus: answer.optional(),
