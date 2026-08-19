@@ -390,6 +390,10 @@ CAREER_COPILOT_PRIVATE_CHAT_IDS=123456789
 
 CAREER_COPILOT_MODEL=opencode-go/deepseek-v4-flash
 CAREER_COPILOT_MEMORY_MODEL=opencode-go/deepseek-v4-flash
+# #24 guarded browser foundation — attach to your locally running authenticated Chrome
+# (e.g. launched with --remote-debugging-port=9222 and your logged-in profile).
+# Optional; the browser tool exists but returns `browser_not_configured` when absent.
+# BROWSER_CDP_URL=http://127.0.0.1:9222
 # CAREER_COPILOT_ALLOW_ALL_JOB_SITES=true  # accept any https job host (off by default)
 OPENCODE_API_KEY=replace-me
 # GOOGLE_GENERATIVE_AI_API_KEY=replace-me
@@ -411,6 +415,7 @@ Configuration notes:
 - `CAREER_COPILOT_MEMORY_MODEL` controls Observational Memory's Observer/Reflector model and falls back to `CAREER_COPILOT_MODEL`.
 - `CAREER_COPILOT_OWNER_ENABLED=false` disables Telegram authorization and recovery delivery.
 - `CAREER_COPILOT_ALLOW_ALL_JOB_SITES` (set to a truthy value other than `0`/`false`/`no`/`off`) accepts any HTTPS job URL instead of the built-in allowlist (`linkedin.com`, `foundit.in`, `cutshort.io`, `naukri.com`, `indeed.com`). HTTPS-only, credentials/port/fragment blocks, local/metadata host blocks, and the fetch-layer private-IP and same-host redirect checks still apply.
+- `BROWSER_CDP_URL` connects the guarded read-only browser tool (#24) to an externally launched authenticated Chrome via CDP (e.g. `--remote-debugging-port=9222` with your logged-in profile). When absent the tool fails closed with `browser_not_configured`. Credentials, cookies, and CDP session data are never persisted by Career Copilot, and no local Chromium binary is installed for the CDP path.
 - Telegram ID lists accept comma-separated numeric IDs in development. Production currently requires exactly one user ID and one private chat ID.
 - Set the credential variable required by the selected Mastra model provider.
 - `.env`, `.local-data/`, `.mastra/`, and generated outputs must remain untracked.
