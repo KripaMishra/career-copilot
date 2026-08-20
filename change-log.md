@@ -2,6 +2,18 @@
 
 This log summarizes the five most recent pull requests merged into `master`. Entries describe the shipped product or engineering outcome, not individual file changes.
 
+## 2026-08-20 — [PR #26](https://github.com/KripaMishra/career-copilot/pull/26)
+
+### Scheduled multi-site job discovery
+
+Added a daily code-driven `jobDiscovery` workflow (12:00 PM owner-timezone, guarded read-only browser, strict site order, durable run lease with crash expiry) that persists per-site state and sends one digest. New `/discovery` control commands and `/explore_jobs` on-demand search auto-save qualifying roles through the existing evidence pipeline. Blocked sites fail closed with redacted evidence; qualification is model-reasoned against the canonical profile with no fixed thresholds.
+
+## 2026-08-20 — [PR #25](https://github.com/KripaMishra/career-copilot/pull/25)
+
+### Guarded browser integration MVP
+
+Added a single read-only `browser_read` tool over a shared authenticated Chrome via CDP, with a global mutex, site allowlist, failure classification (transient/blocked/forbidden), bounded connect retry, and redacted evidence. The full AgentBrowser toolset is never exposed to the agent; unsupported hosts and blocked sites fail closed with no bypass and no auto-retry, and no credentials or CDP data are written.
+
 ## 2026-08-18 — [PR #19](https://github.com/KripaMishra/career-copilot/pull/19)
 
 ### Bounded resume ingestion and PII protection
@@ -19,15 +31,3 @@ Moved the application to a database-only persistence model with transactional jo
 ### Deterministic evaluation and replay coverage
 
 Strengthened the evaluation harness so it proves tool-call behavior, save-path replay, notification delivery, recovery, timeout handling, fixture isolation, and privacy/security assertions. Contract scenarios now exercise the important runtime boundaries without relying on live providers or network access.
-
-## 2026-08-10 — [PR #14](https://github.com/KripaMishra/career-copilot/pull/14)
-
-### Guided onboarding and profile activation
-
-Shipped the guided onboarding flow as a separate stateful path from normal agent conversations. It supports structured career-draft collection, review and explicit confirmation, optimistic persistence, cancellation and restart, and activation of a versioned canonical profile.
-
-## 2026-08-09 — [PR #12](https://github.com/KripaMishra/career-copilot/pull/12)
-
-### PII integration roadmap update
-
-Updated the privacy roadmap and onboarding specification to use the separately published `mastra-pii` package for future resume redaction. This PR established the integration direction and fail-closed requirements; the bounded resume implementation shipped later in PR #19.
