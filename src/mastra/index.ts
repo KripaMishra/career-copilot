@@ -10,6 +10,10 @@ import { createAgentResponder, createCareerCopilotRuntime, createOnboardingRespo
 import { createPiiService } from '../services/pii.ts';
 import { createTelegramFileDownloader, createTelegramPollingTransport } from '../channels/telegram-transport.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
+import { createDiscoveryCommandHandler } from '../discovery/commands.ts';
+import { ensureJobDiscoverySchedule } from '../discovery/schedule.ts';
+import type { DiscoveryDigestSender } from '../discovery/run.ts';
+import { createJobDiscoveryWorkflow } from './workflows/discovery.ts';
 
 const config = resolveRuntimeConfig({ requireDeployment: process.env.NODE_ENV === 'production' });
 const storageConfig = { id: 'mastra-storage', url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) };
@@ -27,11 +31,21 @@ export const careerTools = career.tools;
 // (#4) will wire it in. Constructed always; only connects when BROWSER_CDP_URL is set.
 export const browserReadTool = createGuardedBrowserTool();
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });
-export const mastra = new Mastra({ agents: { agent }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
-export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
+// digest sender is bound once the polling transport exists (created below the
+// runtime); the workflow step only needs it when a run actually completes
+let digestSend: DiscoveryDigestSender = async () => {};
+export const jobDiscovery = createJobDiscoveryWorkflow({ store, send: (text) => digestSend(text) });
+export const mastra = new Mastra({ agents: { agent }, workflows: { jobDiscovery }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
+// schedule registration on startup, idempotent (create-or-update); the row is
+// persisted in the app's LibSQL store and follows the captured owner timezone
+void ensureJobDiscoverySchedule({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger }).catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); });
+const discoveryCommand = createDiscoveryCommandHandler({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger });
+export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), discovery: discoveryCommand, pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
 logger('info', 'runtime.ready', { status: 'ready' });
 export const telegramIngress = careerCopilotRuntime.handleTelegramUpdate;
 export const telegramTransport = createTelegramPollingTransport(config.telegram.botToken, telegramIngress, logger);
+const digestChatId = [...config.telegram.privateChatIds][0];
+digestSend = digestChatId ? (text) => telegramTransport.sendMessage(digestChatId, text) : async () => {};
 export const startupRecovery = config.telegram.botToken
   ? careerCopilotRuntime.recoverUnfinished((text, chatId) => chatId ? telegramTransport.sendMessage(chatId, text) : Promise.reject(new Error('Recovered job has no Telegram chat.')))
   : careerCopilotRuntime.recoverUnfinished(async () => {}, { notify: false });
