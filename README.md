@@ -203,6 +203,26 @@ Only exact runtime-observed `confirm` activates a canonical profile. `/onboardin
 
 Active onboarding text is routed to the hybrid onboarding flow instead of normal `/save`, `/job`, `/queue`, or tool calls. The responder uses owner/conversation-scoped Mastra message history and observational memory, but receives no trusted tool request context. A narrow deterministic trust-boundary guard rejects obvious direct identifiers such as email, phone, legal-name phrases, exact birth-date phrases, government/financial IDs, and credential values before model calls or draft persistence; it is not a general redactor. Natural-language requests such as “save this job” use the normal agent and tools only outside onboarding.
 
+### Scheduled job discovery
+
+A code-driven `jobDiscovery` workflow runs daily (cron `0 12 * * *`), fires at **12:00 PM in the owner's timezone** — captured via the optional onboarding timezone/city question, defaulting to `Asia/Kolkata` — walks the five supported job sites in strict order (LinkedIn → Foundit → Cutshort → Naukri → Indeed) through the guarded read-only browser, and sends exactly one digest to the owner's private chat with per-site added / duplicate / non-qualifying / blocked / error counts. An overlapping fire (the previous run still owns the lease) is skipped with no digest; a crashed run's lease is auto-expired after 48h so discovery can never be silently disabled.
+
+Control surface (no run-now, no extra alerts):
+
+```text
+/discovery          or /discovery status — schedule state, next fire in your timezone, last run summary
+/discovery on       resume the daily schedule
+/discovery off      pause the daily schedule
+```
+
+Sites that block the read (auth/CAPTCHA/MFA/consent/redirect/timeout/DOM ambiguity) are reported in the digest with redacted evidence, stopped for that run only, and never retried or bypassed. With no browser configured (`BROWSER_CDP_URL` unset) the run fails closed per site — nothing is invented as saved.
+
+**Dev-only manual trigger** (not a Telegram command): to run discovery now without waiting for 12:00, boot the app and fire the workflow directly:
+
+```sh
+node --experimental-strip-types -e "const m = await import('./src/mastra/index.ts'); await m.triggerDiscoveryRun();"
+```
+
 ### Save pipeline
 
 `src/tools/save-job-tool.ts` executes the current save pipeline in order:

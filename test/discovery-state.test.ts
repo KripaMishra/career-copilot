@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { CareerStore, type DiscoveryCounts } from '../src/storage/career-store.ts';
+import { CareerStore, STALE_DISCOVERY_RUN_MS, type DiscoveryCounts } from '../src/storage/career-store.ts';
 
 const zeroCounts: DiscoveryCounts = { added: 0, duplicate: 0, nonQualifying: 0, blocked: 0, error: 0 };
 
@@ -22,6 +22,24 @@ test('discovery run lease refuses overlap and is freed by finish', async () => {
     assert.equal(await secondStore.activeDiscoveryRun(), null);
     assert.equal((await secondStore.createDiscoveryRun()).outcome, 'started');
   } finally { await firstStore.close(); await secondStore.close(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('a crashed run lease is expired so the next fire can start instead of skipping forever', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'career-discovery-stale-')); const url = `file:${path.join(dir, 'jobs.db')}`; let now = 1000;
+  const store = new CareerStore(url, { clock: () => now });
+  try {
+    const crashed = await store.createDiscoveryRun(); assert.equal(crashed.outcome, 'started');
+    // within the threshold the lease is still honored
+    now = 2000;
+    assert.equal((await store.createDiscoveryRun()).outcome, 'skipped_overlap');
+    // beyond the stale threshold the crashed lease is expired and a new run starts
+    now = 1000 + STALE_DISCOVERY_RUN_MS + 60_000;
+    const takeover = await store.createDiscoveryRun();
+    assert.equal(takeover.outcome, 'started');
+    assert.equal((await store.getDiscoveryRun(crashed.run.runId))?.status, 'failed');
+    assert.equal((await store.getDiscoveryRun(crashed.run.runId))?.finishedAt, now);
+    assert.equal((await store.activeDiscoveryRun())?.runId, takeover.run.runId);
+  } finally { await store.close(); await rm(dir, { recursive: true, force: true }); }
 });
 
 test('discovery site cursor, counts, and redacted blocked state survive restart', async () => {

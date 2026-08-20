@@ -35,6 +35,8 @@ function sumCounts(sites: { counts: DiscoveryCounts }[]): DiscoveryCounts {
 export async function runDiscoveryAndDigest(options: DiscoveryRunOptions): Promise<DiscoveryRunOutcome> {
   const log: AppLogger = (level, event, data) => { try { options.logger?.(level, event, data); } catch { /* logging cannot break a run */ } };
   const { store, siteStep, send } = options;
+  // createDiscoveryRun also expires crashed leases older than 48h, so
+  // `skipped_overlap` here means a genuinely active (or concurrent) run.
   const created = await store.createDiscoveryRun();
   if (created.outcome === 'skipped_overlap') {
     log('info', 'discovery.run.skipped_overlap', {});

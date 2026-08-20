@@ -5,6 +5,7 @@ import { createClient, type Client, type InStatement, type Row } from '@libsql/c
 import { JobInputSchema, JobStatusSchema, SafeResultSchema, safeErrorMessage, type Job, type JobInput, type JobStatus, type SafeResult } from '../contracts/v0.ts';
 import { OnboardingDraftSchema, OnboardingStatusProjectionSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus, type OnboardingStatusProjection } from '../contracts/onboarding.ts';
 import { redactBrowserEvidence } from '../browser/guard.ts';
+import type { AppLogger } from '../observability.ts';
 
 export type LibsqlConnectionConfig = { url: string; authToken?: string };
 export type DiscoveryRunStatus = 'running' | 'succeeded' | 'failed';
@@ -13,6 +14,11 @@ export type DiscoveryCounts = { added: number; duplicate: number; nonQualifying:
 export type DiscoveryRun = { runId: string; startedAt: number; status: DiscoveryRunStatus; finishedAt: number | null; counts: DiscoveryCounts };
 export type DiscoverySite = { runId: string; site: string; status: DiscoverySiteStatus; cursor: string | null; counts: DiscoveryCounts; blockedReason: string | null; blockedEvidence: string | null; blockedSince: number | null; updatedAt: number };
 export type DiscoverySiteInput = { runId: string; site: string; status: DiscoverySiteStatus; cursor?: string | null; counts: DiscoveryCounts; blockedReason?: string | null; blockedEvidence?: string | null; blockedSince?: number | null };
+
+/** A discovery run that has not finished this long after starting is a crashed
+ * lease (max run duration is minutes; 48h is impossibly long). createDiscoveryRun
+ * expires such rows so a crashed process can never silently disable the schedule. */
+export const STALE_DISCOVERY_RUN_MS = 48 * 60 * 60 * 1000;
 
 /** Redaction revalidation seam (D6): resume-derived candidates re-run local
  * redaction at the write boundary; byte-for-byte equality is required before
@@ -195,11 +201,13 @@ export class CareerStore {
   readonly #url: string;
   readonly #clock: () => number;
   readonly #piiRevalidator: PiiRevalidator | undefined;
+  readonly #logger: AppLogger | undefined;
   #ready: Promise<void>;
 
-  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number; piiRevalidator?: PiiRevalidator } = {}) {
+  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number; piiRevalidator?: PiiRevalidator; logger?: AppLogger } = {}) {
     this.#clock = options.clock ?? Date.now;
     this.#piiRevalidator = options.piiRevalidator;
+    this.#logger = options.logger;
     if (typeof config === 'string') { const safe = validateDirectConnectionConfig({ url: config }); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
     else if ('execute' in config) { this.#url = ''; this.#client = config; this.#ownsClient = false; }
     else { const safe = validateDirectConnectionConfig(config); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
@@ -272,12 +280,19 @@ export class CareerStore {
   async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [this.#clock(), this.#clock(), jobId] }); return this.get(jobId); }
   async unfinished() { return (await this.list()).filter((job) => job.status === 'queued' || job.status === 'running'); }
 
+  /** Atomic lease acquisition (spec D2): inserts a running run only when no
+   * other running row exists. Crashed leases older than STALE_DISCOVERY_RUN_MS
+   * are expired to failed first, so a kill mid-run can never silently disable
+   * discovery forever; expiry is logged so the skip is at least visible. */
   async createDiscoveryRun(): Promise<{ outcome: 'started'; run: DiscoveryRun } | { outcome: 'skipped_overlap' }> {
     await this.#ready; const runId = randomUUID(); const startedAt = this.#clock();
+    const expired = await this.#client.execute({ sql: "UPDATE discovery_runs SET status='failed', finished_at=? WHERE status='running' AND started_at < ?", args: [startedAt, startedAt - STALE_DISCOVERY_RUN_MS] });
+    if (Number(expired.rowsAffected ?? 0) > 0) { try { this.#logger?.('error', 'discovery.run.lease.expired', { expiredRuns: Number(expired.rowsAffected) }); } catch { /* logging cannot break leasing */ } }
     const inserted = await this.#client.execute({ sql: "INSERT INTO discovery_runs (run_id,started_at,status) SELECT ?,?,'running' WHERE NOT EXISTS (SELECT 1 FROM discovery_runs WHERE status='running')", args: [runId, startedAt] });
     if (inserted.rowsAffected === 0) return { outcome: 'skipped_overlap' };
     return { outcome: 'started', run: { runId, startedAt, status: 'running', finishedAt: null, counts: { added: 0, duplicate: 0, nonQualifying: 0, blocked: 0, error: 0 } } };
   }
+  async getDiscoveryRun(runId: string): Promise<DiscoveryRun | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs WHERE run_id=?', args: [runId] })).rows[0]; return row ? rowToDiscoveryRun(row) : null; }
   async activeDiscoveryRun(): Promise<DiscoveryRun | null> { await this.#ready; const row = (await this.#client.execute("SELECT * FROM discovery_runs WHERE status='running' LIMIT 1")).rows[0]; return row ? rowToDiscoveryRun(row) : null; }
   async finishDiscoveryRun(input: { runId: string; status: Exclude<DiscoveryRunStatus, 'running'>; counts: DiscoveryCounts }): Promise<DiscoveryRun> {
     await this.#ready; const counts = assertDiscoveryCounts(input.counts); const finishedAt = this.#clock();

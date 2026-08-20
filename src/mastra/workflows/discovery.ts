@@ -2,10 +2,10 @@ import { createStep, createWorkflow } from '@mastra/core/workflows';
 import { z } from 'zod';
 import { runDiscoveryAndDigest, type DiscoveryDigestSender } from '../../discovery/run.ts';
 import { stubDiscoverySiteStep, type DiscoverySiteStep } from '../../discovery/sites.ts';
+import { JOB_DISCOVERY_WORKFLOW_ID } from '../../discovery/schedule.ts';
 import type { CareerStore } from '../../storage/career-store.ts';
 
-/** Workflow id kept in lock-step with the schedule row (spec D1). */
-export const JOB_DISCOVERY_WORKFLOW_ID = 'jobDiscovery';
+export { JOB_DISCOVERY_WORKFLOW_ID };
 export const runInputSchema = z.object({ runId: z.string().optional() });
 const runOutputSchema = z.object({ runId: z.string(), digest: z.string() });
 

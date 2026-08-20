@@ -11,16 +11,16 @@ import { createPiiService } from '../services/pii.ts';
 import { createTelegramFileDownloader, createTelegramPollingTransport } from '../channels/telegram-transport.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
 import { createDiscoveryCommandHandler } from '../discovery/commands.ts';
-import { ensureJobDiscoverySchedule } from '../discovery/schedule.ts';
+import { ensureJobDiscoverySchedule, JOB_DISCOVERY_WORKFLOW_ID } from '../discovery/schedule.ts';
 import type { DiscoveryDigestSender } from '../discovery/run.ts';
 import { createJobDiscoveryWorkflow } from './workflows/discovery.ts';
 
 const config = resolveRuntimeConfig({ requireDeployment: process.env.NODE_ENV === 'production' });
 const storageConfig = { id: 'mastra-storage', url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) };
 const pii = createPiiService(config.pii);
-const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) }, pii.enabled ? { piiRevalidator: { redactText: (text) => pii.redactText(text), redactDocument: (value) => pii.redactDocument(value) } } : {});
-await store.ready();
 const logger = createTerminalAppLogger();
+const store = new CareerStore({ url: config.databaseUrl, ...(config.databaseAuthToken ? { authToken: config.databaseAuthToken } : {}) }, { logger, ...(pii.enabled ? { piiRevalidator: { redactText: (text) => pii.redactText(text), redactDocument: (value) => pii.redactDocument(value) } } : {}) });
+await store.ready();
 try { await pii.warmup(); } catch (error) { logger('error', 'pii.warmup.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }
 
 const career = createCareerAgentKit({ store, logger, memoryModel: config.memoryModel, ...(pii.enabled ? { processors: { input: [pii.processor], output: [pii.processor] } } : {}) });
@@ -33,20 +33,32 @@ export const browserReadTool = createGuardedBrowserTool();
 export const observability = new Observability({ configs: { default: { serviceName: 'career-copilot', exporters: [createTraceStorageExporter()], spanOutputProcessors: [redactTracePayloads], logging: { enabled: false } } } });
 // digest sender is bound once the polling transport exists (created below the
 // runtime); the workflow step only needs it when a run actually completes
+const digestChatId = [...config.telegram.privateChatIds][0];
+if (!digestChatId) logger('warn', 'discovery.digest.disabled', { reason: 'no_private_chat' });
 let digestSend: DiscoveryDigestSender = async () => {};
 export const jobDiscovery = createJobDiscoveryWorkflow({ store, send: (text) => digestSend(text) });
-export const mastra = new Mastra({ agents: { agent }, workflows: { jobDiscovery }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
+export const mastra = new Mastra({ agents: { agent }, workflows: { [JOB_DISCOVERY_WORKFLOW_ID]: jobDiscovery }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
 // schedule registration on startup, idempotent (create-or-update); the row is
 // persisted in the app's LibSQL store and follows the captured owner timezone
-void ensureJobDiscoverySchedule({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger }).catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); });
+const registerDiscoverySchedule = () => ensureJobDiscoverySchedule({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger });
+void registerDiscoverySchedule().catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); });
 const discoveryCommand = createDiscoveryCommandHandler({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger });
-export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), discovery: discoveryCommand, pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
+export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), discovery: discoveryCommand, onOnboardingComplete: () => { void registerDiscoverySchedule().catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }); }, pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
 logger('info', 'runtime.ready', { status: 'ready' });
 export const telegramIngress = careerCopilotRuntime.handleTelegramUpdate;
 export const telegramTransport = createTelegramPollingTransport(config.telegram.botToken, telegramIngress, logger);
-const digestChatId = [...config.telegram.privateChatIds][0];
 digestSend = digestChatId ? (text) => telegramTransport.sendMessage(digestChatId, text) : async () => {};
 export const startupRecovery = config.telegram.botToken
   ? careerCopilotRuntime.recoverUnfinished((text, chatId) => chatId ? telegramTransport.sendMessage(chatId, text) : Promise.reject(new Error('Recovered job has no Telegram chat.')))
   : careerCopilotRuntime.recoverUnfinished(async () => {}, { notify: false });
 if (config.telegram.botToken) void startupRecovery.then(() => { logger('info', 'startup.recovery.completed'); return telegramTransport.start(); }).catch((error) => { logger('error', 'startup.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); });
+
+/** Dev-only manual trigger (P3, documented in README): start a job discovery
+ * run immediately instead of waiting for the 12:00 cron. Not a Telegram command
+ * (owner confirmed no run-now). Boots the app and fires the workflow in-process:
+ *   node --experimental-strip-types -e "const m = await import('./src/mastra/index.ts'); await m.triggerDiscoveryRun();"
+ */
+export async function triggerDiscoveryRun(input: Record<string, unknown> = {}) {
+  const run = await jobDiscovery.createRun();
+  return run.start({ inputData: input as never });
+}

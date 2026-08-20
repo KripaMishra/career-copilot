@@ -272,7 +272,7 @@ async function applyOnboardingDecision(input: { store: CareerStore; ownerId: str
   }
 }
 
-export async function handleOnboardingTurn(input: { store: CareerStore; ownerId: string; conversationId: string; text?: string; nonTextInput?: boolean; onboard?: OnboardingResponder; logger?: AppLogger; documentText?: string; documentPageCount?: number }) {
+export async function handleOnboardingTurn(input: { store: CareerStore; ownerId: string; conversationId: string; text?: string; nonTextInput?: boolean; onboard?: OnboardingResponder; logger?: AppLogger; documentText?: string; documentPageCount?: number; onOnboardingComplete?: () => void | Promise<void> }) {
   const log: AppLogger = (level, event, data) => { try { input.logger?.(level, event, data); } catch { /* logging cannot break work */ } };
   const documentTurn = input.documentText !== undefined;
   const command = parseCommand(input.text);
@@ -301,6 +301,9 @@ export async function handleOnboardingTurn(input: { store: CareerStore; ownerId:
       try {
         await input.store.completeOnboarding({ ownerId: input.ownerId, conversationId: input.conversationId, expectedVersion: state.version });
         log('info', 'onboarding.completed', { status: 'completed', version: state.version });
+        // D9: the schedule follows the captured timezone — re-register now so
+        // the next fire is 12:00 PM local without waiting for a restart.
+        try { await input.onOnboardingComplete?.(); } catch (error) { log('error', 'onboarding.schedule.reregister.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }
         return 'Onboarding complete. Your confirmed profile is active now.';
       } catch (error) {
         if (error instanceof ResumeRevalidationError) { log('warn', 'onboarding.input.blocked', { reason: 'resume_revalidation', status: state.status }); return 'Your resume content could not be saved safely. Please share the details as text instead.'; }
@@ -330,7 +333,7 @@ export function createAgentResponder(agent: { generate: (text: string, options: 
   };
 }
 
-export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; pii?: PiiService; downloadFile?: TelegramFileDownload; extract?: typeof extractPdfText; discovery?: DiscoveryCommandHandler; logger?: AppLogger };
+export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; pii?: PiiService; downloadFile?: TelegramFileDownload; extract?: typeof extractPdfText; discovery?: DiscoveryCommandHandler; onOnboardingComplete?: () => void | Promise<void>; logger?: AppLogger };
 export type TelegramResult = { outcome: 'rejected'; reason: string } | { outcome: 'accepted'; command: string };
 type RecoveryReply = (text: string, chatId?: string) => Promise<void>;
 type CachedTelegramReply = { text: string; result: TelegramResult; updateId: number; requestId: string; notifyJobId?: string };
@@ -380,7 +383,7 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
         log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'resume' });
         return result;
       }
-      const onboardingResponse = await handleOnboardingTurn({ store, ownerId: options.ownerId, conversationId, text: message?.text, nonTextInput, onboard: options.onboard, logger: log });
+      const onboardingResponse = await handleOnboardingTurn({ store, ownerId: options.ownerId, conversationId, text: message?.text, nonTextInput, onboard: options.onboard, onOnboardingComplete: options.onOnboardingComplete, logger: log });
       if (onboardingResponse) { const result: TelegramResult = { outcome: 'accepted', command: 'onboarding' }; cachedReplies.set(raw.update_id, { text: onboardingResponse, result, updateId: raw.update_id, requestId: transportEventId }); await reply(onboardingResponse); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id); log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'onboarding' }); return result; }
       if (command?.kind === 'discovery') {
         const response = options.discovery ? await options.discovery(command) : 'Discovery commands are unavailable.';
