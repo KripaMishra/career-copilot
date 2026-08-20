@@ -25,3 +25,4 @@ src/mastra/public/
 eval/results/
 eval/artifacts/
 .commandcode/
+AGENTS.md
