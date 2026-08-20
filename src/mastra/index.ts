@@ -3,15 +3,18 @@ import { createGuardedBrowserTool } from '../browser/guard.ts';
 import { MastraCompositeStore } from '@mastra/core/storage';
 import { Observability } from '@mastra/observability';
 import { LibSQLStore } from '@mastra/libsql';
-import { createCareerAgentKit } from '../agents/agent.ts';
+import { createCareerAgentKit, analyzeJob } from '../agents/agent.ts';
 import { resolveRuntimeConfig } from '../config/runtime.ts';
 import { CareerStore } from '../storage/career-store.ts';
 import { createAgentResponder, createCareerCopilotRuntime, createOnboardingResponder } from '../services/career-runtime.ts';
 import { createPiiService } from '../services/pii.ts';
 import { createTelegramFileDownloader, createTelegramPollingTransport } from '../channels/telegram-transport.ts';
+import { executeSaveJob } from '../tools/save-job-tool.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
 import { createDiscoveryCommandHandler } from '../discovery/commands.ts';
 import { ensureJobDiscoverySchedule, JOB_DISCOVERY_WORKFLOW_ID } from '../discovery/schedule.ts';
+import { createDiscoverySiteStep } from '../discovery/site-step.ts';
+import { qualifyDiscoveredCandidates } from '../discovery/qualify.ts';
 import type { DiscoveryDigestSender } from '../discovery/run.ts';
 import { createJobDiscoveryWorkflow } from './workflows/discovery.ts';
 
@@ -36,7 +39,22 @@ export const observability = new Observability({ configs: { default: { serviceNa
 const digestChatId = [...config.telegram.privateChatIds][0];
 if (!digestChatId) logger('warn', 'discovery.digest.disabled', { reason: 'no_private_chat' });
 let digestSend: DiscoveryDigestSender = async () => {};
-export const jobDiscovery = createJobDiscoveryWorkflow({ store, send: (text) => digestSend(text) });
+// real per-site discovery (discovery-sites ticket): reads the landing through
+// the guarded read-only browser, qualifies against the stored profile, and
+// saves qualifying roles via the #1 evidence pipeline with the synthetic
+// scheduled context (D4). Without BROWSER_CDP_URL each site fails closed.
+const discoverySiteStep = createDiscoverySiteStep({
+  store,
+  // the guarded tool's execute carries the framework's (input, context) shape;
+  // our read needs only the input — same cast the browser-guard tests use
+  browserRead: (url) => (browserReadTool.execute as unknown as (input: { url: string }) => Promise<{ url: string; text: string }>)({ url }),
+  ownerId: config.owner.resourceId,
+  chatId: digestChatId ?? config.owner.resourceId,
+  qualify: (candidates, profile) => qualifyDiscoveredCandidates(agent, candidates, profile),
+  saveJob: (input) => executeSaveJob({ store, analyze: (text, profile) => analyzeJob(agent, text, profile), logger, input }),
+  logger,
+});
+export const jobDiscovery = createJobDiscoveryWorkflow({ store, siteStep: discoverySiteStep, send: (text) => digestSend(text) });
 export const mastra = new Mastra({ agents: { agent }, workflows: { [JOB_DISCOVERY_WORKFLOW_ID]: jobDiscovery }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
 // schedule registration on startup, idempotent (create-or-update); the row is
 // persisted in the app's LibSQL store and follows the captured owner timezone
