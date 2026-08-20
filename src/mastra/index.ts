@@ -10,11 +10,13 @@ import { createAgentResponder, createCareerCopilotRuntime, createOnboardingRespo
 import { createPiiService } from '../services/pii.ts';
 import { createTelegramFileDownloader, createTelegramPollingTransport } from '../channels/telegram-transport.ts';
 import { executeSaveJob } from '../tools/save-job-tool.ts';
+import type { JobInput } from '../contracts/v0.ts';
 import { createTerminalAppLogger, createTraceStorageExporter, redactTracePayloads } from '../observability.ts';
 import { createDiscoveryCommandHandler } from '../discovery/commands.ts';
 import { ensureJobDiscoverySchedule, JOB_DISCOVERY_WORKFLOW_ID } from '../discovery/schedule.ts';
-import { createDiscoverySiteStep } from '../discovery/site-step.ts';
+import { createDiscoverySiteStep, type DiscoveryCandidate } from '../discovery/site-step.ts';
 import { qualifyDiscoveredCandidates } from '../discovery/qualify.ts';
+import { createExploreJobsHandler } from '../discovery/on-demand.ts';
 import type { DiscoveryDigestSender } from '../discovery/run.ts';
 import { createJobDiscoveryWorkflow } from './workflows/discovery.ts';
 
@@ -39,21 +41,15 @@ export const observability = new Observability({ configs: { default: { serviceNa
 const digestChatId = [...config.telegram.privateChatIds][0];
 if (!digestChatId) logger('warn', 'discovery.digest.disabled', { reason: 'no_private_chat' });
 let digestSend: DiscoveryDigestSender = async () => {};
-// real per-site discovery (discovery-sites ticket): reads the landing through
-// the guarded read-only browser, qualifies against the stored profile, and
-// saves qualifying roles via the #1 evidence pipeline with the synthetic
-// scheduled context (D4). Without BROWSER_CDP_URL each site fails closed.
-const discoverySiteStep = createDiscoverySiteStep({
-  store,
-  // the guarded tool's execute carries the framework's (input, context) shape;
-  // our read needs only the input — same cast the browser-guard tests use
-  browserRead: (url) => (browserReadTool.execute as unknown as (input: { url: string }) => Promise<{ url: string; text: string }>)({ url }),
-  ownerId: config.owner.resourceId,
-  chatId: digestChatId ?? config.owner.resourceId,
-  qualify: (candidates, profile) => qualifyDiscoveredCandidates(agent, candidates, profile),
-  saveJob: (input) => executeSaveJob({ store, analyze: (text, profile) => analyzeJob(agent, text, profile), logger, input }),
-  logger,
-});
+// discovery engine shared by the scheduled run and /explore_jobs: guarded
+// browser read, batched qualification via the career agent, and evidence-only
+// D4 synthetic-context saves. Without BROWSER_CDP_URL each site fails closed.
+const discoveryBrowse = (url: string) => (browserReadTool.execute as unknown as (input: { url: string }) => Promise<{ url: string; text: string }>)({ url });
+const discoveryQualify = (candidates: DiscoveryCandidate[], profile: string, query?: string) => qualifyDiscoveredCandidates(agent, candidates, profile, query, logger);
+const discoverySaveJob = (input: JobInput) => executeSaveJob({ store, analyze: (text, profile) => analyzeJob(agent, text, profile), logger, input });
+const discoveryChatId = digestChatId ?? config.owner.resourceId;
+const discoverySiteStep = createDiscoverySiteStep({ store, browserRead: discoveryBrowse, ownerId: config.owner.resourceId, chatId: discoveryChatId, qualify: discoveryQualify, saveJob: discoverySaveJob, logger });
+const exploreJobsHandler = createExploreJobsHandler({ store, browserRead: discoveryBrowse, ownerId: config.owner.resourceId, chatId: discoveryChatId, qualify: discoveryQualify, saveJob: discoverySaveJob, logger });
 export const jobDiscovery = createJobDiscoveryWorkflow({ store, siteStep: discoverySiteStep, send: (text) => digestSend(text) });
 export const mastra = new Mastra({ agents: { agent }, workflows: { [JOB_DISCOVERY_WORKFLOW_ID]: jobDiscovery }, storage: new MastraCompositeStore({ id: 'career-copilot-storage', default: new LibSQLStore(storageConfig) }), observability });
 // schedule registration on startup, idempotent (create-or-update); the row is
@@ -61,7 +57,7 @@ export const mastra = new Mastra({ agents: { agent }, workflows: { [JOB_DISCOVER
 const registerDiscoverySchedule = () => ensureJobDiscoverySchedule({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger });
 void registerDiscoverySchedule().catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); });
 const discoveryCommand = createDiscoveryCommandHandler({ schedules: mastra.schedules, store, ownerId: config.owner.resourceId, logger });
-export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), discovery: discoveryCommand, onOnboardingComplete: () => { void registerDiscoverySchedule().catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }); }, pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
+export const careerCopilotRuntime = createCareerCopilotRuntime({ ownerId: config.owner.resourceId, ownerEnabled: config.owner.enabled, allowedUserIds: config.telegram.allowedUserIds, privateChatIds: config.telegram.privateChatIds, store, logger, respond: createAgentResponder(agent, config.owner.resourceId, logger), onboard: createOnboardingResponder(agent), discovery: discoveryCommand, exploreJobs: exploreJobsHandler, onOnboardingComplete: () => { void registerDiscoverySchedule().catch((error) => { logger('error', 'discovery.schedule.registration.failed', { errorName: error instanceof Error ? error.name : 'UnknownError' }); }); }, pii, downloadFile: createTelegramFileDownloader(config.telegram.botToken, logger) });
 logger('info', 'runtime.ready', { status: 'ready' });
 export const telegramIngress = careerCopilotRuntime.handleTelegramUpdate;
 export const telegramTransport = createTelegramPollingTransport(config.telegram.botToken, telegramIngress, logger);

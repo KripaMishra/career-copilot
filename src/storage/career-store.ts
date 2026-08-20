@@ -195,6 +195,17 @@ function safeBlockedReason(reason: string) {
   return value;
 }
 
+/** Column values (site..updated_at) for a discovery_sites row, normalized once
+ * for both the lease-guarded upsert and the lease-free pass writer: blocked
+ * rows carry a stable reason, redacted bounded evidence, and blocked_since. */
+function discoverySiteRowValues(input: DiscoverySiteInput, now: number): unknown[] {
+  const site = safeDiscoverySite(input.site); const counts = assertDiscoveryCounts(input.counts);
+  const blockedReason = input.status === 'blocked' ? safeBlockedReason(input.blockedReason ?? '') : null;
+  const blockedEvidence = input.status === 'blocked' ? redactBrowserEvidence(input.blockedEvidence ?? '') : null;
+  const blockedSince = input.status === 'blocked' ? input.blockedSince ?? now : null;
+  return [site, input.status, input.cursor ?? null, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error, blockedReason, blockedEvidence, blockedSince, now];
+}
+
 export class CareerStore {
   readonly #client: Client;
   readonly #ownsClient: boolean;
@@ -303,15 +314,32 @@ export class CareerStore {
     return rowToDiscoveryRun(row!);
   }
   async upsertDiscoverySite(input: DiscoverySiteInput): Promise<DiscoverySite> {
-    await this.#ready; const site = safeDiscoverySite(input.site); const counts = assertDiscoveryCounts(input.counts); const now = this.#clock();
-    const blockedReason = input.status === 'blocked' ? safeBlockedReason(input.blockedReason ?? '') : null;
-    const blockedEvidence = input.status === 'blocked' ? redactBrowserEvidence(input.blockedEvidence ?? '') : null;
-    const blockedSince = input.status === 'blocked' ? input.blockedSince ?? now : null;
+    await this.#ready; const values = discoverySiteRowValues(input, this.#clock());
     const updated = await this.#client.execute({ sql: `INSERT INTO discovery_sites (run_id,site,status,cursor,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count,blocked_reason,blocked_evidence,blocked_since,updated_at)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? FROM discovery_runs WHERE run_id=? AND status='running'
-      ON CONFLICT(run_id,site) DO UPDATE SET status=excluded.status,cursor=excluded.cursor,added_count=excluded.added_count,duplicate_count=excluded.duplicate_count,non_qualifying_count=excluded.non_qualifying_count,blocked_count=excluded.blocked_count,error_count=excluded.error_count,blocked_reason=excluded.blocked_reason,blocked_evidence=excluded.blocked_evidence,blocked_since=excluded.blocked_since,updated_at=excluded.updated_at`, args: [input.runId, site, input.status, input.cursor ?? null, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error, blockedReason, blockedEvidence, blockedSince, now, input.runId] });
+      ON CONFLICT(run_id,site) DO UPDATE SET status=excluded.status,cursor=excluded.cursor,added_count=excluded.added_count,duplicate_count=excluded.duplicate_count,non_qualifying_count=excluded.non_qualifying_count,blocked_count=excluded.blocked_count,error_count=excluded.error_count,blocked_reason=excluded.blocked_reason,blocked_evidence=excluded.blocked_evidence,blocked_since=excluded.blocked_since,updated_at=excluded.updated_at`, args: [input.runId, ...values, input.runId] });
     if (updated.rowsAffected !== 1) throw new Error('Discovery site can only be written for an active run.');
-    return (await this.getDiscoverySite(input.runId, site))!;
+    return (await this.getDiscoverySite(input.runId, input.site))!;
+  }
+  /** Persist a non-lease discovery pass (e.g. an on-demand /explore_jobs pass):
+   * inserts a finished discovery_runs row plus its per-site rows atomically,
+   * never holding the running lease — so it can never block a scheduled fire. */
+  async recordDiscoveryPass(input: { runId: string; status: Exclude<DiscoveryRunStatus, 'running'>; counts: DiscoveryCounts; sites: DiscoverySiteInput[] }): Promise<DiscoveryRun> {
+    await this.#ready; const counts = assertDiscoveryCounts(input.counts); const now = this.#clock();
+    if (input.status !== 'succeeded' && input.status !== 'failed') throw new Error('Discovery pass must finish as succeeded or failed.');
+    let committed = false;
+    const transaction = await this.#client.transaction('write');
+    try {
+      await transaction.execute({ sql: `INSERT INTO discovery_runs (run_id,started_at,status,finished_at,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count) VALUES (?,?,?,?,?,?,?,?,?)`, args: [input.runId, now, input.status, now, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error] });
+      for (const site of input.sites) await transaction.execute({ sql: `INSERT INTO discovery_sites (run_id,site,status,cursor,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count,blocked_reason,blocked_evidence,blocked_since,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [input.runId, ...discoverySiteRowValues(site, now)] });
+      await transaction.commit(); committed = true;
+    } catch (error) {
+      if (!committed) try { await transaction.rollback(); } catch { /* best effort */ }
+      throw error;
+    } finally { transaction.close(); }
+    const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs WHERE run_id=?', args: [input.runId] })).rows[0];
+    if (!row) throw new Error('Persisted discovery pass could not be read.');
+    return rowToDiscoveryRun(row);
   }
   async getDiscoverySite(runId: string, site: string): Promise<DiscoverySite | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_sites WHERE run_id=? AND site=?', args: [runId, safeDiscoverySite(site)] })).rows[0]; return row ? rowToDiscoverySite(row) : null; }
   async listDiscoverySites(runId: string): Promise<DiscoverySite[]> { await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT * FROM discovery_sites WHERE run_id=? ORDER BY rowid', args: [runId] })).rows; return rows.map(rowToDiscoverySite); }

@@ -68,6 +68,7 @@ export const TELEGRAM_COMMANDS = [
   { command: 'onboarding_restart', description: 'Restart onboarding draft' },
   { command: 'onboarding_cancel', description: 'Cancel onboarding draft' },
   { command: 'discovery', description: 'Daily discovery: status, on, or off' },
+  { command: 'explore_jobs', description: 'On-demand job search (optional query)' },
   { command: 'reset_onboarding', description: 'Clear onboarding draft' },
   { command: 'reset_profile', description: 'Clear profile and drafts' },
   { command: 'reset_all', description: 'Clear saved jobs, reports, profile, and onboarding drafts' },

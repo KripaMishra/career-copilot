@@ -192,12 +192,15 @@ Recognized slash commands compile to stable ordered workflow checklists. Agent-d
 /onboarding status   report draft and confirmed-profile state
 /onboarding restart  clear the current draft and start over
 /onboarding cancel   cancel active onboarding and clear draft content
+/explore_jobs        run an on-demand job search now (optional "inline query")
 /reset onboarding    clear only this conversation's onboarding draft
 /reset profile       clear the owner's profile and onboarding drafts; preserve jobs/reports
 /reset all           clear the owner's onboarding, profile, jobs, and reports transactionally
 ```
 
 Telegram's command menu uses single-token aliases for nested actions: `/onboarding_status`, `/onboarding_restart`, `/onboarding_cancel`, `/reset_onboarding`, `/reset_profile`, and `/reset_all`. The space-separated forms remain supported. Malformed known commands such as `/save` without a URL return deterministic usage text and never invoke the agent.
+
+`/explore_jobs` runs an immediate discovery pass (all five sites, profile criteria optionally narrowed by an inline query such as `/explore_jobs "LLM engineer"`) and replies with one per-site summary, auto-saving qualifying roles through the same evidence pipeline as the daily run (≤4 per site; duplicates are previously-seen and consume no quota). It reuses the same guarded browser step, is serialized through the same mutex, works whether or not the daily schedule is enabled, and never holds the run lease (it can run concurrently with the schedule).
 
 Only exact runtime-observed `confirm` activates a canonical profile. `/onboarding restart` is draft-only and does not delete the active profile or jobs. The reset commands cover CareerStore data; they do not claim to delete existing Mastra conversation history or observational-memory records unless a separate memory deletion operation is implemented.
 
@@ -216,6 +219,8 @@ Control surface (no run-now, no extra alerts):
 ```
 
 Sites that block the read (auth/CAPTCHA/MFA/consent/redirect/timeout/DOM ambiguity) are reported in the digest with redacted evidence, stopped for that run only, and never retried or bypassed. With no browser configured (`BROWSER_CDP_URL` unset) the run fails closed per site — nothing is invented as saved.
+
+`/discovery status` also shows the latest pass (scheduled run or on-demand `ondemand-` pass) as the last-run summary.
 
 **Dev-only manual trigger** (not a Telegram command): to run discovery now without waiting for 12:00, boot the app and fire the workflow directly:
 

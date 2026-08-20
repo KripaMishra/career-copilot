@@ -55,8 +55,13 @@ export type DiscoverySiteStepDeps = {
   ownerId: string;
   /** Digest target chat used as the synthetic scheduled save context (D4). */
   chatId: string;
-  qualify: (candidates: DiscoveryCandidate[], profile: string) => Promise<DiscoveryQualifiedCandidate[]>;
+  qualify: (candidates: DiscoveryCandidate[], profile: string, query?: string) => Promise<DiscoveryQualifiedCandidate[]>;
   saveJob: (input: JobInput) => Promise<unknown>;
+  /** Override the per-site entry URL (e.g. a site-search URL for an inline
+   * on-demand query). Defaults to the conservative landings. */
+  landingUrl?: (site: string) => string;
+  /** Optional inline narrow query threaded into qualification (on-demand). */
+  query?: string;
   logger?: AppLogger;
 };
 
@@ -73,8 +78,9 @@ function failCounts(kind: 'blocked' | 'error'): DiscoveryCounts {
 export function createDiscoverySiteStep(deps: DiscoverySiteStepDeps): DiscoverySiteStep {
   const log: AppLogger = (level, event, data) => { try { deps.logger?.(level, event, data); } catch { /* logging cannot break discovery */ } };
   const zero: DiscoveryCounts = { added: 0, duplicate: 0, nonQualifying: 0, blocked: 0, error: 0 };
+  const landingUrl = deps.landingUrl ?? ((site: string) => DISCOVERY_SITE_LANDINGS[site]);
   return async ({ runId, site, cursor, addedCount }) => {
-    const landing = DISCOVERY_SITE_LANDINGS[site];
+    const landing = landingUrl(site);
     if (!landing) return { status: 'error', counts: failCounts('error') };
     let read: { url: string; text: string };
     try {
@@ -108,7 +114,7 @@ export function createDiscoverySiteStep(deps: DiscoverySiteStepDeps): DiscoveryS
     const profile = await deps.store.profileText(deps.ownerId);
     let verdicts: DiscoveryQualifiedCandidate[] = [];
     if (profile.trim()) {
-      try { verdicts = await deps.qualify(fresh, profile); }
+      try { verdicts = await deps.qualify(fresh, profile, deps.query); }
       catch (error) {
         log('error', 'discovery.site.qualification.failed', { site, errorName: error instanceof Error ? error.name : 'UnknownError' });
         counts.error += 1;

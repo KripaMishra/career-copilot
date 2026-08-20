@@ -8,8 +8,9 @@ import type { AppLogger } from '../observability.ts';
 import { extractPdfText, type PdfRejectionReason } from '../integrations/pdf-text.ts';
 import type { PiiService } from './pii.ts';
 import type { DiscoveryCommandHandler } from '../discovery/commands.ts';
+import type { ExploreJobsHandler } from '../discovery/on-demand.ts';
 
-export type Command = { kind: 'save'; url: string } | { kind: 'job'; jobId?: string } | { kind: 'queue' } | { kind: 'onboarding'; action: 'start' | 'restart' | 'cancel' | 'status' } | { kind: 'reset'; scope: 'onboarding' | 'profile' | 'all' } | { kind: 'discovery'; action: 'status' | 'on' | 'off' };
+export type Command = { kind: 'save'; url: string } | { kind: 'job'; jobId?: string } | { kind: 'queue' } | { kind: 'onboarding'; action: 'start' | 'restart' | 'cancel' | 'status' } | { kind: 'reset'; scope: 'onboarding' | 'profile' | 'all' } | { kind: 'discovery'; action: 'status' | 'on' | 'off' } | { kind: 'exploreJobs'; query?: string };
 export type WorkflowTask = { id: string; content: string; status: 'pending'; activeForm: string };
 export type CommandWorkflow = { id: string; tasks: WorkflowTask[] };
 
@@ -73,7 +74,7 @@ function workflowFor(command: Command | null): CommandWorkflow | null {
   if (command.kind === 'job') return workflows.job_status;
   if (command.kind === 'queue') return workflows.job_queue;
   if (command.kind === 'onboarding') return workflows[command.action === 'start' ? 'onboarding' : `onboarding_${command.action}`];
-  if (command.kind === 'discovery') return null;
+  if (command.kind === 'discovery' || command.kind === 'exploreJobs') return null;
   return workflows[`reset_${command.scope}`];
 }
 
@@ -202,7 +203,7 @@ export function parseCommand(text: string | undefined): Command | null {
   if (!text) return null; const trimmed = text.trim();
   const onboarding = trimmed.match(/^\/(?:onboarding(?:[ \t]+(restart|cancel|status|start))?|onboarding_(restart|cancel|status))$/i); if (onboarding) { const action = (onboarding[1] ?? onboarding[2])?.toLowerCase(); return { kind: 'onboarding', action: action === 'restart' ? 'restart' : action === 'cancel' ? 'cancel' : action === 'status' ? 'status' : 'start' }; }
   const reset = trimmed.match(/^\/(?:reset[ \t]+(onboarding|profile|all)|reset_(onboarding|profile|all))$/i); if (reset) return { kind: 'reset', scope: ((reset[1] ?? reset[2]).toLowerCase()) as 'onboarding' | 'profile' | 'all' };
-  const save = trimmed.match(/^\/save[ \t]+(\S+)$/); if (save) return { kind: 'save', url: save[1] }; const job = trimmed.match(/^\/job(?:[ \t]+(\S+))?$/); if (job) return { kind: 'job', ...(job[1] ? { jobId: job[1] } : {}) }; if (trimmed === '/queue') return { kind: 'queue' }; const discovery = trimmed.match(/^\/discovery(?:[ \t]+(status|on|off))?$/i); if (discovery) { return { kind: 'discovery', action: ((discovery[1] ?? 'status').toLowerCase()) as 'status' | 'on' | 'off' }; } return null;
+  const save = trimmed.match(/^\/save[ \t]+(\S+)$/); if (save) return { kind: 'save', url: save[1] }; const job = trimmed.match(/^\/job(?:[ \t]+(\S+))?$/); if (job) return { kind: 'job', ...(job[1] ? { jobId: job[1] } : {}) }; if (trimmed === '/queue') return { kind: 'queue' }; const discovery = trimmed.match(/^\/discovery(?:[ \t]+(status|on|off))?$/i); if (discovery) { return { kind: 'discovery', action: ((discovery[1] ?? 'status').toLowerCase()) as 'status' | 'on' | 'off' }; } const explore = trimmed.match(/^\/explore[_ -]?jobs(?:[ \t]+(.+))?$/i); if (explore) { const raw = explore[1]?.trim(); const query = raw ? raw.replace(/^("|')(.*)\1$/s, '$2').trim() : undefined; return { kind: 'exploreJobs', ...(query ? { query } : {}) }; } return null;
 }
 
 export function parseCommandError(text: string | undefined) {
@@ -212,11 +213,12 @@ export function parseCommandError(text: string | undefined) {
   if (/^\/queue(?:[ \t]|$)/i.test(trimmed)) return 'Usage: /queue.';
   if (/^\/onboarding(?:[ \t]|_|$)/i.test(trimmed)) return 'Usage: /onboarding, /onboarding status, /onboarding restart, or /onboarding cancel.';
   if (/^\/discovery(?:[ \t]|$)/i.test(trimmed)) return 'Usage: /discovery status, /discovery on, or /discovery off.';
+  if (/^\/explore(?:[_ -]?jobs)?(?:[ \t]|$)/i.test(trimmed) && !/^\/explore[_ -]?jobs(?:[ \t]+.+)?$/i.test(trimmed)) return 'Usage: /explore_jobs [inline query, optional].';
   if (/^\/reset(?:[ \t]|_|$)/i.test(trimmed)) return 'Unknown reset command. Use /reset_onboarding, /reset_profile, or /reset_all.';
   return null;
 }
 
-export function injectCommand(text: string) { const command = parseCommand(text); if (command?.kind === 'onboarding' || command?.kind === 'reset' || command?.kind === 'discovery') throw new Error('This command is handled by runtime routing, not normal memory injection.'); if (command?.kind === 'save') return `Save this job now: ${command.url}. ${workflowInstruction(command)}`; if (command?.kind === 'job') return `Report the status of ${command.jobId ? `job ${command.jobId}` : 'the latest job'} using the job-status tool. ${workflowInstruction(command)}`; if (command?.kind === 'queue') return `List my saved jobs using the job-queue tool. ${workflowInstruction(command)}`; return text; }
+export function injectCommand(text: string) { const command = parseCommand(text); if (command?.kind === 'onboarding' || command?.kind === 'reset' || command?.kind === 'discovery' || command?.kind === 'exploreJobs') throw new Error('This command is handled by runtime routing, not normal memory injection.'); if (command?.kind === 'save') return `Save this job now: ${command.url}. ${workflowInstruction(command)}`; if (command?.kind === 'job') return `Report the status of ${command.jobId ? `job ${command.jobId}` : 'the latest job'} using the job-status tool. ${workflowInstruction(command)}`; if (command?.kind === 'queue') return `List my saved jobs using the job-queue tool. ${workflowInstruction(command)}`; return text; }
 
 const onboardingReply = (state: Awaited<ReturnType<CareerStore['loadOnboarding']>>) => state?.status === 'review' ? onboardingReviewText(state.draft) : `Let's build your career profile. ${nextOnboardingQuestion(state?.draft ?? {}) ?? 'Share any final preference, or say ready to review.'}`;
 
@@ -333,7 +335,7 @@ export function createAgentResponder(agent: { generate: (text: string, options: 
   };
 }
 
-export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; pii?: PiiService; downloadFile?: TelegramFileDownload; extract?: typeof extractPdfText; discovery?: DiscoveryCommandHandler; onOnboardingComplete?: () => void | Promise<void>; logger?: AppLogger };
+export type RuntimeOptions = { ownerId: string; ownerEnabled?: boolean; allowedUserIds: ReadonlySet<string>; privateChatIds: ReadonlySet<string>; databaseUrl?: string; store?: CareerStore; respond: (turn: AgentTurn) => Promise<string>; onboard?: OnboardingResponder; pii?: PiiService; downloadFile?: TelegramFileDownload; extract?: typeof extractPdfText; discovery?: DiscoveryCommandHandler; exploreJobs?: ExploreJobsHandler; onOnboardingComplete?: () => void | Promise<void>; logger?: AppLogger };
 export type TelegramResult = { outcome: 'rejected'; reason: string } | { outcome: 'accepted'; command: string };
 type RecoveryReply = (text: string, chatId?: string) => Promise<void>;
 type CachedTelegramReply = { text: string; result: TelegramResult; updateId: number; requestId: string; notifyJobId?: string };
@@ -391,6 +393,14 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
         cachedReplies.set(raw.update_id, { text: response, result, updateId: raw.update_id, requestId: transportEventId });
         await reply(response); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);
         log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'discovery' });
+        return result;
+      }
+      if (command?.kind === 'exploreJobs') {
+        const response = options.exploreJobs ? await options.exploreJobs(command) : 'On-demand job search is unavailable.';
+        const result: TelegramResult = { outcome: 'accepted', command: 'explore_jobs' };
+        cachedReplies.set(raw.update_id, { text: response, result, updateId: raw.update_id, requestId: transportEventId });
+        await reply(response); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);
+        log('info', 'telegram.update.accepted', { updateId: raw.update_id, requestId: transportEventId, command: 'explore_jobs' });
         return result;
       }
       if (!hasText) { log('warn', 'telegram.update.rejected', { updateId: raw.update_id, reason: 'invalid_message' }); return { outcome: 'rejected', reason: 'invalid_message' }; }
