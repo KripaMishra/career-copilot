@@ -31,6 +31,9 @@ export const OnboardingDraftSchema = z.object({
   motivators: answer.optional(),
   careerGoals: answer.optional(),
   exampleJob: answer.optional(),
+  // D9: owner timezone/city for the daily discovery schedule (12:00 PM local).
+  // Optional — the schedule falls back to Asia/Kolkata until captured.
+  timezone: answer.optional(),
 }).strict();
 export type OnboardingDraft = z.infer<typeof OnboardingDraftSchema>;
 export type OnboardingField = keyof OnboardingDraft;
@@ -57,6 +60,7 @@ export const onboardingFields: Array<{ key: OnboardingField; label: string; ques
   { key: 'motivators', label: 'Strengths and preferences', question: 'What strengths, growth areas, likes, dislikes, or deal-breakers matter?', required: true },
   { key: 'careerGoals', label: 'Career goals', question: 'What career goals should guide recommendations?', required: true },
   { key: 'exampleJob', label: 'Example job', question: 'Optional: describe an example desired job. Reply skip if none.', required: false },
+  { key: 'timezone', label: 'Timezone', question: 'Optional: what timezone or city should the daily discovery schedule use (e.g. Asia/Kolkata)? The run fires at 12:00 PM your time. Reply skip to keep the default.', required: false },
 ];
 
 export function onboardingMissingFields(draft: OnboardingDraft) {

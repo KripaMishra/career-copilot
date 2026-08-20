@@ -1,11 +1,24 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createClient, type Client, type InStatement, type Row } from '@libsql/client';
+import { createClient, type Client, type InStatement, type InValue, type Row } from '@libsql/client';
 import { JobInputSchema, JobStatusSchema, SafeResultSchema, safeErrorMessage, type Job, type JobInput, type JobStatus, type SafeResult } from '../contracts/v0.ts';
 import { OnboardingDraftSchema, OnboardingStatusProjectionSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus, type OnboardingStatusProjection } from '../contracts/onboarding.ts';
+import { redactBrowserEvidence } from '../browser/guard.ts';
+import type { AppLogger } from '../observability.ts';
 
 export type LibsqlConnectionConfig = { url: string; authToken?: string };
+export type DiscoveryRunStatus = 'running' | 'succeeded' | 'failed';
+export type DiscoverySiteStatus = 'pending' | 'ok' | 'blocked' | 'error';
+export type DiscoveryCounts = { added: number; duplicate: number; nonQualifying: number; blocked: number; error: number };
+export type DiscoveryRun = { runId: string; startedAt: number; status: DiscoveryRunStatus; finishedAt: number | null; counts: DiscoveryCounts };
+export type DiscoverySite = { runId: string; site: string; status: DiscoverySiteStatus; cursor: string | null; counts: DiscoveryCounts; blockedReason: string | null; blockedEvidence: string | null; blockedSince: number | null; updatedAt: number };
+export type DiscoverySiteInput = { runId: string; site: string; status: DiscoverySiteStatus; cursor?: string | null; counts: DiscoveryCounts; blockedReason?: string | null; blockedEvidence?: string | null; blockedSince?: number | null };
+
+/** A discovery run that has not finished this long after starting is a crashed
+ * lease (max run duration is minutes; 48h is impossibly long). createDiscoveryRun
+ * expires such rows so a crashed process can never silently disable the schedule. */
+export const STALE_DISCOVERY_RUN_MS = 48 * 60 * 60 * 1000;
 
 /** Redaction revalidation seam (D6): resume-derived candidates re-run local
  * redaction at the write boundary; byte-for-byte equality is required before
@@ -51,6 +64,18 @@ function rowToOnboarding(row: Row): OnboardingRecord {
     ownerId: String(row.owner_id), conversationId: String(row.conversation_id), status: OnboardingStatusSchema.parse(row.status),
     draft: OnboardingDraftSchema.parse(JSON.parse(String(row.draft_json || '{}'))), version: Number(row.version), resumeDerived: Number(row.resume_derived ?? 0) === 1, createdAt: Number(row.created_at), updatedAt: Number(row.updated_at),
   };
+}
+
+function rowToDiscoveryCounts(row: Row): DiscoveryCounts {
+  return { added: Number(row.added_count), duplicate: Number(row.duplicate_count), nonQualifying: Number(row.non_qualifying_count), blocked: Number(row.blocked_count), error: Number(row.error_count) };
+}
+
+function rowToDiscoveryRun(row: Row): DiscoveryRun {
+  return { runId: String(row.run_id), startedAt: Number(row.started_at), status: String(row.status) as DiscoveryRunStatus, finishedAt: row.finished_at === null ? null : Number(row.finished_at), counts: rowToDiscoveryCounts(row) };
+}
+
+function rowToDiscoverySite(row: Row): DiscoverySite {
+  return { runId: String(row.run_id), site: String(row.site), status: String(row.status) as DiscoverySiteStatus, cursor: row.cursor === null ? null : String(row.cursor), counts: rowToDiscoveryCounts(row), blockedReason: row.blocked_reason === null ? null : String(row.blocked_reason), blockedEvidence: row.blocked_evidence === null ? null : String(row.blocked_evidence), blockedSince: row.blocked_since === null ? null : Number(row.blocked_since), updatedAt: Number(row.updated_at) };
 }
 
 const createSchema: InStatement[] = [
@@ -105,10 +130,39 @@ const createSchema: InStatement[] = [
     updated_at INTEGER NOT NULL,
     PRIMARY KEY(owner_id, conversation_id)
   ) STRICT`,
+  `CREATE TABLE IF NOT EXISTS discovery_runs (
+    run_id TEXT PRIMARY KEY,
+    started_at INTEGER NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running','succeeded','failed')),
+    finished_at INTEGER,
+    added_count INTEGER NOT NULL DEFAULT 0 CHECK (added_count >= 0),
+    duplicate_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_count >= 0),
+    non_qualifying_count INTEGER NOT NULL DEFAULT 0 CHECK (non_qualifying_count >= 0),
+    blocked_count INTEGER NOT NULL DEFAULT 0 CHECK (blocked_count >= 0),
+    error_count INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0)
+  ) STRICT`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS one_running_discovery ON discovery_runs(status) WHERE status='running'`,
+  `CREATE TABLE IF NOT EXISTS discovery_sites (
+    run_id TEXT NOT NULL,
+    site TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending','ok','blocked','error')),
+    cursor TEXT,
+    added_count INTEGER NOT NULL DEFAULT 0 CHECK (added_count >= 0),
+    duplicate_count INTEGER NOT NULL DEFAULT 0 CHECK (duplicate_count >= 0),
+    non_qualifying_count INTEGER NOT NULL DEFAULT 0 CHECK (non_qualifying_count >= 0),
+    blocked_count INTEGER NOT NULL DEFAULT 0 CHECK (blocked_count >= 0),
+    error_count INTEGER NOT NULL DEFAULT 0 CHECK (error_count >= 0),
+    blocked_reason TEXT,
+    blocked_evidence TEXT,
+    blocked_since INTEGER,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY(run_id, site)
+  ) STRICT`,
 ];
 
 function hash(content: string) { return createHash('sha256').update(content).digest('hex'); }
 function bytes(content: string) { return Buffer.byteLength(content, 'utf8'); }
+const ONBOARDING_PROFILE_DOCUMENT = 'onboarding.md';
 export function safeDocumentName(name: string) { const trimmed = name.trim(); if (!trimmed || trimmed.length > 200 || /credential|secret|private|token|password|passwd|api[_-]?key|id[_-]?rsa/i.test(trimmed)) throw new Error('unsafe profile document name is rejected.'); return trimmed; }
 export function assertSafeTextContent(content: string) { if (/-----BEGIN [^-]+-----|(?:api[_ -]?key|password|secret|token)\s*[:=]/i.test(content)) throw new Error('unsafe text content is rejected.'); }
 function assertSafeProfileContent(content: string) { try { assertSafeTextContent(content); } catch { throw new Error('unsafe profile content is rejected.'); } }
@@ -124,17 +178,47 @@ function validateDirectConnectionConfig(config: LibsqlConnectionConfig): LibsqlC
   return config;
 }
 
+function assertDiscoveryCounts(counts: DiscoveryCounts): DiscoveryCounts {
+  for (const value of Object.values(counts)) if (!Number.isSafeInteger(value) || value < 0) throw new Error('Discovery counts must be non-negative safe integers.');
+  return counts;
+}
+
+function safeDiscoverySite(site: string) {
+  const value = site.trim();
+  if (!value || value.length > 100) throw new Error('Discovery site must be between 1 and 100 characters.');
+  return value;
+}
+
+function safeBlockedReason(reason: string) {
+  const value = reason.trim();
+  if (!/^[a-z0-9_]{1,100}$/.test(value)) throw new Error('Discovery blocked reason must be a stable reason code.');
+  return value;
+}
+
+/** Column values (site..updated_at) for a discovery_sites row, normalized once
+ * for both the lease-guarded upsert and the lease-free pass writer: blocked
+ * rows carry a stable reason, redacted bounded evidence, and blocked_since. */
+function discoverySiteRowValues(input: DiscoverySiteInput, now: number): InValue[] {
+  const site = safeDiscoverySite(input.site); const counts = assertDiscoveryCounts(input.counts);
+  const blockedReason = input.status === 'blocked' ? safeBlockedReason(input.blockedReason ?? '') : null;
+  const blockedEvidence = input.status === 'blocked' ? redactBrowserEvidence(input.blockedEvidence ?? '') : null;
+  const blockedSince = input.status === 'blocked' ? input.blockedSince ?? now : null;
+  return [site, input.status, input.cursor ?? null, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error, blockedReason, blockedEvidence, blockedSince, now];
+}
+
 export class CareerStore {
   readonly #client: Client;
   readonly #ownsClient: boolean;
   readonly #url: string;
   readonly #clock: () => number;
   readonly #piiRevalidator: PiiRevalidator | undefined;
+  readonly #logger: AppLogger | undefined;
   #ready: Promise<void>;
 
-  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number; piiRevalidator?: PiiRevalidator } = {}) {
+  constructor(config: string | LibsqlConnectionConfig | Client, options: { clock?: () => number; piiRevalidator?: PiiRevalidator; logger?: AppLogger } = {}) {
     this.#clock = options.clock ?? Date.now;
     this.#piiRevalidator = options.piiRevalidator;
+    this.#logger = options.logger;
     if (typeof config === 'string') { const safe = validateDirectConnectionConfig({ url: config }); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
     else if ('execute' in config) { this.#url = ''; this.#client = config; this.#ownsClient = false; }
     else { const safe = validateDirectConnectionConfig(config); this.#url = safe.url; prepareLocalDatabaseFile(safe.url); this.#client = createClient(safe); this.#ownsClient = true; }
@@ -168,6 +252,7 @@ export class CareerStore {
   }
   async get(jobId: string): Promise<Job | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_jobs WHERE job_id = ?', args: [jobId] })).rows[0]; return row ? rowToJob(row) : null; }
   async getByTransportEventId(transportEventId: string): Promise<Job | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_jobs WHERE transport_event_id = ?', args: [transportEventId] })).rows[0]; return row ? rowToJob(row) : null; }
+  async byCanonicalUrl(canonicalUrl: string): Promise<Job | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_jobs WHERE canonical_url = ? ORDER BY created_at LIMIT 1', args: [canonicalUrl] })).rows[0]; return row ? rowToJob(row) : null; }
   async assertRunningInput(input: JobInput): Promise<Job> {
     const value = JobInputSchema.parse(input); const job = await this.get(value.jobId);
     if (!job || job.status !== 'running'
@@ -205,6 +290,69 @@ export class CareerStore {
   async fail(jobId: string, error: unknown) { await this.#ready; await this.#client.execute({ sql: "UPDATE career_jobs SET status='failed', safe_result=NULL, safe_error=?, updated_at=? WHERE job_id=? AND status IN ('queued','running')", args: [safeErrorMessage(error), this.#clock(), jobId] }); return this.get(jobId); }
   async markNotified(jobId: string) { await this.#ready; await this.#client.execute({ sql: 'UPDATE career_jobs SET notified_at=?, updated_at=? WHERE job_id=?', args: [this.#clock(), this.#clock(), jobId] }); return this.get(jobId); }
   async unfinished() { return (await this.list()).filter((job) => job.status === 'queued' || job.status === 'running'); }
+
+  /** Atomic lease acquisition (spec D2): inserts a running run only when no
+   * other running row exists. Crashed leases older than STALE_DISCOVERY_RUN_MS
+   * are expired to failed first, so a kill mid-run can never silently disable
+   * discovery forever; expiry is logged so the skip is at least visible. */
+  async createDiscoveryRun(): Promise<{ outcome: 'started'; run: DiscoveryRun } | { outcome: 'skipped_overlap' }> {
+    await this.#ready; const runId = randomUUID(); const startedAt = this.#clock();
+    const expired = await this.#client.execute({ sql: "UPDATE discovery_runs SET status='failed', finished_at=? WHERE status='running' AND started_at < ?", args: [startedAt, startedAt - STALE_DISCOVERY_RUN_MS] });
+    if (Number(expired.rowsAffected ?? 0) > 0) { try { this.#logger?.('error', 'discovery.run.lease.expired', { expiredRuns: Number(expired.rowsAffected) }); } catch { /* logging cannot break leasing */ } }
+    const inserted = await this.#client.execute({ sql: "INSERT INTO discovery_runs (run_id,started_at,status) SELECT ?,?,'running' WHERE NOT EXISTS (SELECT 1 FROM discovery_runs WHERE status='running')", args: [runId, startedAt] });
+    if (inserted.rowsAffected === 0) return { outcome: 'skipped_overlap' };
+    return { outcome: 'started', run: { runId, startedAt, status: 'running', finishedAt: null, counts: { added: 0, duplicate: 0, nonQualifying: 0, blocked: 0, error: 0 } } };
+  }
+  async getDiscoveryRun(runId: string): Promise<DiscoveryRun | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs WHERE run_id=?', args: [runId] })).rows[0]; return row ? rowToDiscoveryRun(row) : null; }
+  async activeDiscoveryRun(): Promise<DiscoveryRun | null> { await this.#ready; const row = (await this.#client.execute("SELECT * FROM discovery_runs WHERE status='running' LIMIT 1")).rows[0]; return row ? rowToDiscoveryRun(row) : null; }
+  async finishDiscoveryRun(input: { runId: string; status: Exclude<DiscoveryRunStatus, 'running'>; counts: DiscoveryCounts }): Promise<DiscoveryRun> {
+    await this.#ready; const counts = assertDiscoveryCounts(input.counts); const finishedAt = this.#clock();
+    if (input.status !== 'succeeded' && input.status !== 'failed') throw new Error('Discovery run must finish as succeeded or failed.');
+    const updated = await this.#client.execute({ sql: "UPDATE discovery_runs SET status=?, finished_at=?, added_count=?, duplicate_count=?, non_qualifying_count=?, blocked_count=?, error_count=? WHERE run_id=? AND status='running'", args: [input.status, finishedAt, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error, input.runId] });
+    if (updated.rowsAffected !== 1) throw new Error('Discovery run is not active.');
+    const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs WHERE run_id=?', args: [input.runId] })).rows[0];
+    return rowToDiscoveryRun(row!);
+  }
+  async upsertDiscoverySite(input: DiscoverySiteInput): Promise<DiscoverySite> {
+    await this.#ready; const values = discoverySiteRowValues(input, this.#clock());
+    const updated = await this.#client.execute({ sql: `INSERT INTO discovery_sites (run_id,site,status,cursor,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count,blocked_reason,blocked_evidence,blocked_since,updated_at)
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,?,? FROM discovery_runs WHERE run_id=? AND status='running'
+      ON CONFLICT(run_id,site) DO UPDATE SET status=excluded.status,cursor=excluded.cursor,added_count=excluded.added_count,duplicate_count=excluded.duplicate_count,non_qualifying_count=excluded.non_qualifying_count,blocked_count=excluded.blocked_count,error_count=excluded.error_count,blocked_reason=excluded.blocked_reason,blocked_evidence=excluded.blocked_evidence,blocked_since=excluded.blocked_since,updated_at=excluded.updated_at`, args: [input.runId, ...values, input.runId] });
+    if (updated.rowsAffected !== 1) throw new Error('Discovery site can only be written for an active run.');
+    return (await this.getDiscoverySite(input.runId, input.site))!;
+  }
+  /** Persist a non-lease discovery pass (e.g. an on-demand /explore_jobs pass):
+   * inserts a finished discovery_runs row plus its per-site rows atomically,
+   * never holding the running lease — so it can never block a scheduled fire. */
+  async recordDiscoveryPass(input: { runId: string; status: Exclude<DiscoveryRunStatus, 'running'>; counts: DiscoveryCounts; sites: DiscoverySiteInput[] }): Promise<DiscoveryRun> {
+    await this.#ready; const counts = assertDiscoveryCounts(input.counts); const now = this.#clock();
+    if (input.status !== 'succeeded' && input.status !== 'failed') throw new Error('Discovery pass must finish as succeeded or failed.');
+    let committed = false;
+    const transaction = await this.#client.transaction('write');
+    try {
+      await transaction.execute({ sql: `INSERT INTO discovery_runs (run_id,started_at,status,finished_at,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count) VALUES (?,?,?,?,?,?,?,?,?)`, args: [input.runId, now, input.status, now, counts.added, counts.duplicate, counts.nonQualifying, counts.blocked, counts.error] });
+      for (const site of input.sites) await transaction.execute({ sql: `INSERT INTO discovery_sites (run_id,site,status,cursor,added_count,duplicate_count,non_qualifying_count,blocked_count,error_count,blocked_reason,blocked_evidence,blocked_since,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`, args: [input.runId, ...discoverySiteRowValues(site, now)] });
+      await transaction.commit(); committed = true;
+    } catch (error) {
+      if (!committed) try { await transaction.rollback(); } catch { /* best effort */ }
+      throw error;
+    } finally { transaction.close(); }
+    const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs WHERE run_id=?', args: [input.runId] })).rows[0];
+    if (!row) throw new Error('Persisted discovery pass could not be read.');
+    return rowToDiscoveryRun(row);
+  }
+  async getDiscoverySite(runId: string, site: string): Promise<DiscoverySite | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_sites WHERE run_id=? AND site=?', args: [runId, safeDiscoverySite(site)] })).rows[0]; return row ? rowToDiscoverySite(row) : null; }
+  async listDiscoverySites(runId: string): Promise<DiscoverySite[]> { await this.#ready; const rows = (await this.#client.execute({ sql: 'SELECT * FROM discovery_sites WHERE run_id=? ORDER BY rowid', args: [runId] })).rows; return rows.map(rowToDiscoverySite); }
+  async latestDiscoveryRun(): Promise<DiscoveryRun | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM discovery_runs ORDER BY started_at DESC, run_id DESC LIMIT 1' })).rows[0]; return row ? rowToDiscoveryRun(row) : null; }
+  async capturedTimezone(ownerId: string): Promise<string | null> {
+    await this.#ready;
+    const row = (await this.#client.execute({ sql: `SELECT content FROM career_profile_documents WHERE owner_id=? AND name=? AND active=1 ORDER BY version DESC LIMIT 1`, args: [ownerId, ONBOARDING_PROFILE_DOCUMENT] })).rows[0];
+    if (!row) return null;
+    const value = String(row.content).match(/^Timezone:\s*(.+)$/m)?.[1]?.trim();
+    return value || null;
+  }
+  async latestDiscoverySite(site: string): Promise<DiscoverySite | null> { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT s.* FROM discovery_sites s JOIN discovery_runs r ON r.run_id=s.run_id WHERE s.site=? ORDER BY r.started_at DESC, r.run_id DESC LIMIT 1', args: [safeDiscoverySite(site)] })).rows[0]; return row ? rowToDiscoverySite(row) : null; }
+  async discoverySiteAddedCount(runId: string, site: string) { return (await this.getDiscoverySite(runId, site))?.counts.added ?? 0; }
 
   async getReport(reportId: string, ownerId: string) { await this.#ready; const row = (await this.#client.execute({ sql: 'SELECT * FROM career_reports WHERE report_id = ? AND owner_id = ?', args: [reportId, ownerId] })).rows[0]; return row ? { reportId: String(row.report_id), ownerId: String(row.owner_id), jobId: String(row.job_id), content: String(row.content), sha256: String(row.sha256), byteSize: Number(row.byte_size), createdAt: Number(row.created_at) } : null; }
   async saveProfileDocument(input: { ownerId: string; name: string; content: string; active?: boolean }) {
@@ -261,7 +409,7 @@ export class CareerStore {
     return (await this.loadOnboarding(input.ownerId, input.conversationId))!;
   }
   async completeOnboarding(input: { ownerId: string; conversationId: string; expectedVersion: number }) {
-    await this.#ready; const name = 'onboarding.md'; const now = this.#clock(); let committed = false;
+    await this.#ready; const name = ONBOARDING_PROFILE_DOCUMENT; const now = this.#clock(); let committed = false;
     const transaction = await this.#client.transaction('write');
     try {
       const row = (await transaction.execute({ sql: 'SELECT * FROM career_onboarding WHERE owner_id=? AND conversation_id=?', args: [input.ownerId, input.conversationId] })).rows[0];
