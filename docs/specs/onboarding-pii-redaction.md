@@ -4,8 +4,7 @@
 **Priority:** P0
 **Onboarding issue:** [career-copilot #10](https://github.com/KripaMishra/career-copilot/issues/10)
 **Package issue:** [mastra-pii #1](https://github.com/KripaMishra/mastra-pii/issues/1) (closed; consumed prerelease `@kripamishra/mastra-pii@0.2.0-alpha.5`)
-**Target app branch:** `feat/onboarding-v0`
-**Target app worktree:** `/home/kripa/Personal/projects/mastra-demo`
+**Implementation baseline:** current `master` branch of Career Copilot
 **Package repository:** [KripaMishra/mastra-pii](https://github.com/KripaMishra/mastra-pii)
 **Local package checkout:** `/home/kripa/Personal/projects/mastra-pii`
 **npm package:** `@kripamishra/mastra-pii` (`0.2.0-alpha.5` reviewed and pinned)
@@ -14,10 +13,10 @@
 
 Deliver two independently schedulable features:
 
-1. a guided Career Copilot `/onboarding` flow that collects structured career context without resume ingestion and can ship now;
-2. a reusable TypeScript package that extends Mastra PII processing, then enables a later resume text/PDF ingestion phase.
+1. a guided Career Copilot `/onboarding` flow that collects structured career context and activates an owner-confirmed profile;
+2. a reusable TypeScript package that extends Mastra PII processing and supports the bounded resume text/PDF ingestion path.
 
-The package benchmark is not a blocker for guided onboarding. Plain structured career text, including text headed "Resume," is accepted after direct-identifier checks. Resume file/upload ingestion remains disabled until the reviewed local engine can run before document content reaches the ordinary agent, memory, traces, or Turso profile storage.
+Plain structured career text, including text headed "Resume," is accepted after direct-identifier checks. Authorized text-based PDFs are accepted during active onboarding when the PII service is enabled and ready; image files, DOCX, OCR/scanned PDFs, and arbitrary files remain unsupported. Raw document content must be redacted before it reaches the responder, memory, traces, or Turso profile storage.
 
 The shipped package is an adapter with two analyzers behind one interface:
 
@@ -290,7 +289,7 @@ stateDiagram-v2
 2. blocks URLs, file/upload requests, non-text/overlength input, obvious direct identifiers, and unrelated commands before any model call while accepting plain structured career text;
 3. sends active collection turns to a dedicated onboarding responder using one structured-output generation with owner/conversation-scoped memory, no trusted request context, `toolChoice: 'none'`, and `maxSteps: 1`;
 4. validates and persists only the responder's schema-valid `draftPatch`, allowing clarification replies with no draft mutation and one answer to populate multiple clearly stated fields;
-5. accepts plain structured career text but never requests or accepts URLs, PDFs, images, DOCX, or arbitrary files in the initial guided-onboarding phase;
+5. accepts plain structured career text and authorized text-based PDF resumes during active onboarding, while rejecting URLs, images, DOCX, OCR/scanned PDFs, and arbitrary files;
 6. shows a structured review summary when required fields are complete and the responder marks the draft ready, including ready-with-empty-patch turns;
 7. keeps review conversational for non-command text by calling the same memory-enabled, tool-free responder, while exact `confirm`, `cancel`, and deterministic `edit <field>: <value>` remain runtime-owned;
 8. completes only after runtime-observed exact `confirm` owner confirmation;
@@ -359,7 +358,7 @@ Add narrow `CareerStore` methods rather than a generic repository abstraction.
 
 The composition root injects a dedicated responder around the existing agent/model. The runtime supplies only current structured draft JSON, allowed field definitions, missing fields, state, and the current text. The responder schema contains exactly `reply`, `draftPatch`, and `readyForReview`; it has no tools or confirmation, authorization, activation, owner, chat, user, or memory fields.
 
-The runtime owns authorization and activation. Initial guided onboarding persists only strictly validated structured career fields from plain text and does not accept resume files/uploads. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. After `mastra-pii` integration, rerun local-engine `redactText()`/`redactDocument()` over every resume-derived draft/profile candidate and require byte-for-byte equality before persistence.
+The runtime owns authorization and activation. Active onboarding persists only strictly validated structured career fields from plain text or the sanitized output of the bounded PDF path. Keep `CareerStore.assertSafeTextContent()` as the existing secret boundary. Resume-derived draft/profile candidates are rerun through `redactText()`/`redactDocument()` and must remain byte-for-byte equal before persistence.
 
 After completion, profile context must be available immediately. Do not depend on the unused startup `profileText` snapshot. The save path reads current owner-scoped profile text at request time.
 
@@ -367,7 +366,7 @@ After completion, profile context must be available immediately. Do not depend o
 
 While onboarding state is `collecting`, route text through the hybrid onboarding state machine and dedicated structured responder instead of normal agent generation. Pass the trusted owner ID as the Mastra memory resource and the scoped conversation ID as the thread so message history, working memory, and Observational Memory remain enabled. While state is `review`, runtime-only exact confirm/cancel/deterministic edit handling applies first; all other review text goes through the same memory-enabled responder for conversational clarification or natural-language corrections while remaining in review. The durable structured onboarding row remains authoritative until confirmation.
 
-After confirmation, write the active profile document and explicitly refresh approved profile context for subsequent normal turns. Accept plain structured career text, but reject resume file/upload and unrelated file input until the PII integration phase. Reject or safely route unrelated commands according to explicit tests.
+After confirmation, write the active profile document and explicitly refresh approved profile context for subsequent normal turns. Accept plain structured career text and authorized text-based PDF input during active onboarding, but reject unsupported document types and unrelated file input. Reject or safely route unrelated commands according to explicit tests.
 
 ### Reply-failure idempotency
 
@@ -379,9 +378,9 @@ For accepted Telegram updates, cache the completed outbound response/result in m
 
 Required useful events include runtime/startup, Telegram polling/update/reply, normal agent turns, commands, protected tool invocation, job fetch/analysis/report/completion/failure, recovery/notification, and onboarding model/draft/review/completion. Cap allowed string and array-item values before writing terminal JSON. Do not log empty Telegram polls or intentional stop aborts as failures.
 
-### Deferred resume/PDF ingestion
+### Resume/PDF ingestion (shipped)
 
-Resume file/upload and PDF extraction are intentionally unavailable in the initial guided-onboarding release; plain structured career text is accepted. After the package benchmark and reviewed prerelease, the integration phase supports text-based PDFs only:
+Plain structured career text remains supported. The integrated path also accepts authorized text-based PDFs during active onboarding. The implementation:
 
 1. authorize the Telegram update before calling `getFile` or downloading bytes;
 2. accept only Telegram documents with PDF MIME type, `.pdf` name, and `%PDF-` signature;

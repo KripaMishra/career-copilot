@@ -120,7 +120,7 @@ Why a different model family? Because a model grading its own family is a cheerl
 
 ## What the scenarios cover
 
-The corpus is 27 scenario files built around 18 numbered user stories and the personas behind them: a new owner starting onboarding, a returning owner who must not re-onboard, a user pasting a hostile job page, an unauthorized user in a group chat, a save interrupted by a crash and resumed after restart.
+The live contract corpus is 27 scenario files built around the original 18 numbered user stories plus three S19 resume-ingestion scenarios. It covers a new owner starting onboarding, a returning owner who must not re-onboard, a user pasting a hostile job page, an unauthorized user in a group chat, a save interrupted by a crash and resumed after restart, and bounded PDF privacy failures. S19a–c are contract-only and are not eligible for the live-model quality lane.
 
 ```mermaid
 flowchart LR

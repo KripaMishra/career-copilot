@@ -1,7 +1,7 @@
 {
   "name": "career-copilot",
   "version": "1.0.0",
-  "description": "A personal career assistant for job discovery, resume personalization, and browser-assisted applications.",
+  "description": "A local-first career assistant for job saving, analysis, onboarding, and guarded read-only job discovery.",
   "main": "index.js",
   "private": true,
   "scripts": {
