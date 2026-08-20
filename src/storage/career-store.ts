@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, openSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createClient, type Client, type InStatement, type Row } from '@libsql/client';
+import { createClient, type Client, type InStatement, type InValue, type Row } from '@libsql/client';
 import { JobInputSchema, JobStatusSchema, SafeResultSchema, safeErrorMessage, type Job, type JobInput, type JobStatus, type SafeResult } from '../contracts/v0.ts';
 import { OnboardingDraftSchema, OnboardingStatusProjectionSchema, OnboardingStatusSchema, assertSafeOnboardingDraft, buildOnboardingProfileText, onboardingMissingFields, type OnboardingDraft, type OnboardingRecord, type OnboardingStatus, type OnboardingStatusProjection } from '../contracts/onboarding.ts';
 import { redactBrowserEvidence } from '../browser/guard.ts';
@@ -198,7 +198,7 @@ function safeBlockedReason(reason: string) {
 /** Column values (site..updated_at) for a discovery_sites row, normalized once
  * for both the lease-guarded upsert and the lease-free pass writer: blocked
  * rows carry a stable reason, redacted bounded evidence, and blocked_since. */
-function discoverySiteRowValues(input: DiscoverySiteInput, now: number): unknown[] {
+function discoverySiteRowValues(input: DiscoverySiteInput, now: number): InValue[] {
   const site = safeDiscoverySite(input.site); const counts = assertDiscoveryCounts(input.counts);
   const blockedReason = input.status === 'blocked' ? safeBlockedReason(input.blockedReason ?? '') : null;
   const blockedEvidence = input.status === 'blocked' ? redactBrowserEvidence(input.blockedEvidence ?? '') : null;

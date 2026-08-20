@@ -396,7 +396,13 @@ export function createCareerCopilotRuntime(options: RuntimeOptions) {
         return result;
       }
       if (command?.kind === 'exploreJobs') {
-        const response = options.exploreJobs ? await options.exploreJobs(command) : 'On-demand job search is unavailable.';
+        // a pass-finalize failure (e.g. recordDiscoveryPass) must never reject
+        // through the poll loop: that would re-deliver the same update and
+        // re-save with fresh disc- ids — reply the error instead (P4).
+        let response: string;
+        try {
+          response = options.exploreJobs ? await options.exploreJobs(command) : 'On-demand job search is unavailable.';
+        } catch (error) { log('error', 'explore_jobs.failed', { updateId: raw.update_id, errorName: error instanceof Error ? error.name : 'UnknownError' }); response = 'The on-demand job search failed. Please try again.'; }
         const result: TelegramResult = { outcome: 'accepted', command: 'explore_jobs' };
         cachedReplies.set(raw.update_id, { text: response, result, updateId: raw.update_id, requestId: transportEventId });
         await reply(response); seenUpdates.add(raw.update_id); cachedReplies.delete(raw.update_id);

@@ -82,14 +82,54 @@ test('an on-demand pass never holds the running lease, so a scheduled fire can s
   const pass = await runOnDemandDiscovery({
     store, browserRead: async (url) => ({ url, text: listingFor('indeed.com', 1) }), ownerId: 'owner', chatId: '2',
     qualify: async (candidates) => candidates.map((candidate) => ({ url: candidate.url, label: candidate.label, qualified: true, reason: 'ok' })),
-    saveJob: async (input) => { await store.enqueue({ jobId: input.jobId, userId: input.userId, ownerId: input.ownerId, chatId: input.chatId, transportEventId: input.transportEventId, originalUrl: input.originalUrl, canonicalUrl: input.canonicalUrl }); return { jobId: input.jobId }; },
+    saveJob: async (input) => {
+      await store.enqueue({ jobId: input.jobId, userId: input.userId, ownerId: input.ownerId, chatId: input.chatId, transportEventId: input.transportEventId, originalUrl: input.originalUrl, canonicalUrl: input.canonicalUrl });
+      await store.markRunning(input.jobId, 'ondemand');
+      await store.completeWithReport({ jobId: input.jobId, ownerId: input.ownerId, content: `# ${input.canonicalUrl}\n`, summary: `Saved ${input.canonicalUrl}` });
+      return { jobId: input.jobId };
+    },
   });
-  // the pass persisted jobs (real enqueue) and recorded rows; the saved-role section lists them
+  // the pass persisted jobs (real enqueue + completion) and recorded rows; the saved-role section lists them
   assert.ok(pass.summary.includes('Saved roles:'));
   // ...but the daily lease is free: a scheduled fire can still start
   const next = await store.createDiscoveryRun();
   assert.equal(next.outcome, 'started');
   await store.finishDiscoveryRun({ runId: next.run.runId, status: 'succeeded', counts: { added: 0, duplicate: 0, nonQualifying: 0, blocked: 0, error: 0 } });
+}));
+
+test('Saved roles lists only roles that actually succeeded, never a failed sibling', async () => withStore(async (store) => {
+  await store.saveProfileDocument({ ownerId: 'owner', name: 'profile.md', content: 'Staff AI engineer.' });
+  const pass = await runOnDemandDiscovery({
+    store, browserRead: async (url) => ({ url, text: listingFor('indeed.com', 1) }), ownerId: 'owner', chatId: '2',
+    qualify: async (candidates) => candidates.map((candidate) => ({ url: candidate.url, label: candidate.label, qualified: true, reason: 'ok' })),
+    saveJob: async (input) => {
+      await store.enqueue({ jobId: input.jobId, userId: input.userId, ownerId: input.ownerId, chatId: input.chatId, transportEventId: input.transportEventId, originalUrl: input.originalUrl, canonicalUrl: input.canonicalUrl });
+      await store.markRunning(input.jobId, 'ondemand');
+      await store.completeWithReport({ jobId: input.jobId, ownerId: input.ownerId, content: `# ${input.canonicalUrl}\n`, summary: `Saved ${input.canonicalUrl}` });
+      // a same-site sibling that enqueued but then failed — present during the pass
+      await store.enqueue({ jobId: 'failed-role', userId: input.userId, ownerId: input.ownerId, chatId: input.chatId, transportEventId: input.transportEventId.replace(/-0$/, '-555'), originalUrl: 'https://www.indeed.com/viewjob?jk=failed', canonicalUrl: 'https://www.indeed.com/viewjob?jk=failed' });
+      await store.markRunning('failed-role', 'ondemand');
+      await store.fail('failed-role', new Error('analysis failed'));
+    },
+  });
+  assert.ok(pass.summary.includes('Saved roles:'));
+  assert.match(pass.summary, /Saved https:\/\/www\.indeed\.com\/job\/indeed-com-0/);
+  assert.ok(!pass.summary.includes('jk=failed')); // the failed sibling is not reported as saved
+}));
+
+test('runtime catches an exploreJobs handler throw and replies instead of rejecting', async () => withStore(async (store) => {
+  let agentCalls = 0;
+  const replies: string[] = [];
+  const runtime = createCareerCopilotRuntime({
+    ownerId: 'owner', allowedUserIds: new Set(['1']), privateChatIds: new Set(['2']), store,
+    exploreJobs: async () => { throw new Error('boom'); },
+    respond: async () => { agentCalls++; return 'agent'; },
+  });
+  const result = await runtime.handleTelegramUpdate(update(920, '/explore_jobs'), async (text) => { replies.push(text); });
+  assert.equal(result.outcome, 'accepted'); // never rejects through the poll loop
+  assert.equal(agentCalls, 0);
+  assert.match(replies[0], /failed/i);
+  await runtime.close();
 }));
 
 test('blocked sites are reported for that site only and never retried in the pass', async () => withStore(async (store) => {

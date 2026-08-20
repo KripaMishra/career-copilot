@@ -81,7 +81,7 @@ export async function runOnDemandDiscovery(options: OnDemandDiscoveryDeps): Prom
 
 async function savedRoleSummaries(store: CareerStore, ownerId: string, transportPrefix: string): Promise<string[]> {
   const jobs = await store.list();
-  return jobs.filter((job) => job.ownerId === ownerId && job.transportEventId.startsWith(transportPrefix)).map((job) => job.safeResult?.summary ?? job.canonicalUrl);
+  return jobs.filter((job) => job.ownerId === ownerId && job.status === 'succeeded' && job.transportEventId.startsWith(transportPrefix)).map((job) => job.safeResult?.summary ?? job.canonicalUrl);
 }
 
 export type ExploreJobsCommand = { kind: 'exploreJobs'; query?: string };
