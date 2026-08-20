@@ -1,7 +1,7 @@
 # Career Copilot Evaluation Harness (`eval/`)
 
 Implementation of issue #13: contracts/seams (`#13a`), hermetic runner (`#13b`),
-the S01–S18 contract scenario corpus (`#13c`), and the manual quality lane
+the live contract scenario corpus (`#13c`), and the manual quality lane
 (`#13d`). Compare/pin (`#13e`) and CI wiring (`#13f`) land separately.
 
 ## Commands
@@ -15,9 +15,10 @@ npm run eval:quality -- [--scenario ID ...] [--allow-unmetered] [--keep-artifact
   set is printed in the manifest. Filtered runs are never comparable/pinnable.
 - `--keep-artifacts`: retain the per-scenario temp dir (mode 0700) and record
   its path in `redaction.rawArtifactPath`. Default: everything is deleted.
-- Exit 0 only for a documented successful terminal status. The live corpus is
-  the 24 contract scenarios (`s01-*` … `s18-*`); a fully clean run is required
-  before quality runs or pinning.
+- Exit 0 only for a documented successful terminal status. The live contract
+  corpus currently contains 27 scenario files: the S01–S18 scenarios plus
+  S19a–S19c for bounded resume ingestion. A fully clean contract run is
+  required before quality runs or pinning.
 - Run artifacts (redacted aggregates) go to `eval/results/` (gitignored).
 
 Contract runs are keyless and network-free: no live model, no Telegram, no
@@ -50,7 +51,9 @@ scenario, in strict order:
    the SUT and judge families match (opencode / opencode-go are one family).
 
 Which scenarios are quality-eligible: any scenario declaring `rubrics:`
-(S01–S12, S14–S18 per the issue matrix; s13 and s19a–c stay contract-only).
+(S01–S12, S14–S18 per the issue matrix). S13 and S19a–c stay contract-only;
+S19 verifies resume authorization, bounded extraction, redaction, and safe
+failure behavior without a live-model quality lane.
 Failure-injection scenarios (e.g. s17c) will fail their own quality replay —
 their deterministic gates require scripted failure injection a real model
 cannot reproduce; that is the documented, expected outcome.
@@ -94,9 +97,12 @@ least one resolvable evidence reference (claim ids / `profile:active` /
 rationale distinguishing it from 3; a critical failure forces score 1 and
 fails the scenario. Deterministic critical failures override all scores.
 
-## Scenario corpus (S01–S18)
+## Scenario corpus (S01–S19)
 
-`eval/scenarios/*.yaml` implements the issue #13 matrix as 24 scenario files.
+`eval/scenarios/*.yaml` implements the issue #13 matrix as 27 live contract
+scenario files. S01–S18 cover the original onboarding, save, authorization,
+privacy, failure, and recovery matrix; S19a–c cover bounded resume ingestion
+and remain contract-only in the quality lane.
 The S10/S17/S18 rows are intentionally split into per-subcase files (isolated
 runs per the matrix), and S17g covers the failure-adapters unsafe-redirect row:
 

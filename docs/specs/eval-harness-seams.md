@@ -1,11 +1,12 @@
 # Career Copilot Evaluation Harness — Seam & Decision Report
 
-Status: verified against installed dependencies (2026-08-12). This is the contract for the
-S01–S18 corpus work (#13c): every seam named here was exercised or type-checked against the
-installed Mastra/Node versions, and every gap is a deliberate, documented boundary.
+Status: historical seam report, updated with the current contract corpus. Every seam named here
+was exercised or type-checked against the installed Mastra/Node versions at the time, and every
+gap is a deliberate, documented boundary.
 
-Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault plan:
-`Projects/mastra-demo/plans/implementation/2026-08-10 Career Copilot Evaluation Harness Plan.md`.
+Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). The maintained corpus is
+S01–S18 plus S19a–c; see the [evaluation harness guide](../eval-harness-guide.md) for current
+commands and scope.
 
 ## Verified seams (present in production code)
 
@@ -86,7 +87,7 @@ Canonical requirements: GitHub issue #13 (KripaMishra/career-copilot). Vault pla
 
 ## #13c corpus update (2026-08-14)
 
-S01–S18 landed as 27 scenario files (`eval/scenarios/`) over the shared
+S01–S18 plus S19a–c are maintained as 27 live contract scenario files (`eval/scenarios/`) over the shared
 fixtures (`eval/fixtures/`). Additions beyond the seams report above:
 
 - **Startup recovery seam (runner):** fixture jobs in `queued`/`running` resume
@@ -110,6 +111,6 @@ fixtures (`eval/fixtures/`). Additions beyond the seams report above:
   HTTP-status fetch failures and the "not supported" host-policy message
   (was generic) — regression test in `test/minimal-v0.test.ts`.
 
-Verification: 27/27 contract scenarios pass on `eval:test`; `npm test` 106/106;
+Verification at the time of this report: 27/27 contract scenarios pass on `eval:test`; `npm test` 106/106;
 strict tsc; Mastra build; `git diff --check` clean. #13c complete; #13d
 (quality lane), #13e (compare/pin), #13f (ops/CI) remain.
