@@ -24,6 +24,11 @@ export function privateAddress(address: string) { const type = isIP(address); re
 export function validateJobUrl(value: string) { return assertJobUrl(value); }
 export function normalizeResponseStatus(value: number | undefined) { return typeof value === 'number' && Number.isInteger(value) && value >= 200 && value <= 599 ? value : 502; }
 type FetchDeps = { fetch?: typeof globalThis.fetch; resolve?: (host: string) => Promise<string[]>; maxDecodedBytes?: number; timeoutMs?: number; signal?: AbortSignal };
+function timeoutSignal(ms: number) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('Job fetch timed out.')), ms);
+  return { signal: controller.signal, clear: () => clearTimeout(timer) };
+}
 function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const abort = () => reject(new Error('Job fetch timed out.'));
@@ -63,15 +68,19 @@ async function bodyText(response: Response, limit: number, signal: AbortSignal) 
 }
 export async function acquireJobText(value: string, deps: FetchDeps = {}) {
   const fetcher = deps.fetch; const resolve = deps.resolve ?? (async (host: string) => (await lookup(host, { all: true })).map((entry) => entry.address));
-  let url = assertJobUrl(value); const original = url; const limit = deps.maxDecodedBytes ?? MAX_DECODED_BYTES; const timeoutMs = deps.timeoutMs ?? 15_000; const signal = deps.signal ?? AbortSignal.timeout(timeoutMs);
-  for (let redirectCount = 0; redirectCount <= 3; redirectCount++) {
-    const addresses = await publicAddresses(url.hostname, resolve, signal);
-    const response = fetcher ? await fetcher(url, { redirect: 'manual', headers: requestHeaders, signal }) : await pinnedFetch(url, addresses[0], limit, timeoutMs, signal);
-    if ([301, 302, 303, 307, 308].includes(response.status)) { const location = response.headers.get('location'); if (!location) throw new Error('Redirect response has no location.'); url = assertSameJobSite(original, new URL(location, url).href); continue; }
-    if (!response.ok) throw Object.assign(new Error(`Job fetch failed (${response.status}).`), { status: response.status });
-    const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase(); if (!allowedTypes.has(contentType)) throw new Error('Job response content type is not supported.');
-    const text = await bodyText(response, limit, signal); return { url: url.href, contentType, text: text.slice(0, MAX_MODEL_CHARS) };
+  let url = assertJobUrl(value); const original = url; const limit = deps.maxDecodedBytes ?? MAX_DECODED_BYTES; const timeoutMs = deps.timeoutMs ?? 15_000; const timeout = deps.signal ? null : timeoutSignal(timeoutMs); const signal = deps.signal ?? timeout!.signal;
+  try {
+    for (let redirectCount = 0; redirectCount <= 3; redirectCount++) {
+      const addresses = await publicAddresses(url.hostname, resolve, signal);
+      const response = fetcher ? await fetcher(url, { redirect: 'manual', headers: requestHeaders, signal }) : await pinnedFetch(url, addresses[0], limit, timeoutMs, signal);
+      if ([301, 302, 303, 307, 308].includes(response.status)) { const location = response.headers.get('location'); if (!location) throw new Error('Redirect response has no location.'); url = assertSameJobSite(original, new URL(location, url).href); continue; }
+      if (!response.ok) throw Object.assign(new Error(`Job fetch failed (${response.status}).`), { status: response.status });
+      const contentType = (response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase(); if (!allowedTypes.has(contentType)) throw new Error('Job response content type is not supported.');
+      const text = await bodyText(response, limit, signal); return { url: url.href, contentType, text: text.slice(0, MAX_MODEL_CHARS) };
+    }
+    throw new Error('Too many redirects.');
+  } finally {
+    timeout?.clear();
   }
-  throw new Error('Too many redirects.');
 }
 export const webFetchTool = createTool({ id: 'web_fetch', description: 'Fetch bounded text from an approved job URL.', inputSchema: z.object({ url: z.string().url() }), outputSchema: z.object({ url: z.string(), contentType: z.string(), text: z.string() }), execute: async ({ url }) => acquireJobText(url) });
